@@ -1,6 +1,11 @@
 .env
 .venv
-
+venv/
 .vscode
-
-__pycache__
+__pycache__/
+*.py[cod]
+*.egg-info/
+media/
+staticfiles/
+*.log
+.DS_Store

@@ -1,0 +1,118 @@
+"""HRMS routes (api.md §11)."""
+from django.urls import include, path
+from rest_framework.routers import DefaultRouter
+
+from . import views
+
+router = DefaultRouter(trailing_slash=True)
+router.register("employees", views.EmployeeViewSet, basename="hrms-employees")
+router.register("departments", views.HrmsDepartmentViewSet, basename="hrms-departments")
+router.register("designations", views.DesignationViewSet, basename="hrms-designations")
+router.register("locations", views.HrmsLocationViewSet, basename="hrms-locations")
+
+router.register("attendance", views.AttendanceViewSet, basename="hrms-attendance")
+router.register(
+    "attendance/regularizations",
+    views.RegularizationViewSet,
+    basename="hrms-regularizations",
+)
+
+router.register("leave", views.LeaveRequestViewSet, basename="hrms-leave")
+router.register("leave/types", views.LeaveTypeViewSet, basename="hrms-leave-types")
+router.register("leave/balances", views.LeaveBalanceViewSet, basename="hrms-leave-balances")
+router.register(
+    "leave/encashments", views.LeaveEncashmentViewSet, basename="hrms-leave-encashments"
+)
+router.register("comp-offs", views.CompOffViewSet, basename="hrms-comp-offs")
+
+router.register("payroll", views.PayslipViewSet, basename="hrms-payroll")
+router.register(
+    "payroll/salary-structures",
+    views.SalaryStructureViewSet,
+    basename="hrms-salary-structures",
+)
+router.register(
+    "payroll/advances", views.SalaryAdvanceViewSet, basename="hrms-salary-advances"
+)
+
+router.register("jobs", views.JobViewSet, basename="hrms-jobs")
+router.register("candidates", views.CandidateViewSet, basename="hrms-candidates")
+router.register("applications", views.ApplicationViewSet, basename="hrms-applications")
+router.register("interviews", views.InterviewViewSet, basename="hrms-interviews")
+router.register("offers", views.OfferViewSet, basename="hrms-offers")
+router.register("onboarding", views.OnboardingViewSet, basename="hrms-onboarding")
+router.register(
+    "recruitment/questions",
+    views.ScreeningQuestionViewSet,
+    basename="hrms-screening-questions",
+)
+
+router.register(
+    "performance/cycles", views.AppraisalCycleViewSet, basename="hrms-appraisal-cycles"
+)
+router.register(
+    "performance/indicators",
+    views.PerformanceIndicatorViewSet,
+    basename="hrms-performance-indicators",
+)
+router.register("performance/kpis", views.KpiViewSet, basename="hrms-kpis")
+router.register(
+    "performance/appraisals", views.AppraisalViewSet, basename="hrms-appraisals"
+)
+router.register("performance/goals", views.GoalViewSet, basename="hrms-goals")
+
+router.register("trainings", views.TrainingViewSet, basename="hrms-trainings")
+router.register("trainers", views.TrainerViewSet, basename="hrms-trainers")
+
+router.register("assets", views.AssetViewSet, basename="hrms-assets")
+router.register(
+    "asset-categories", views.AssetCategoryViewSet, basename="hrms-asset-categories"
+)
+router.register("asset-requests", views.AssetRequestViewSet, basename="hrms-asset-requests")
+
+router.register("documents", views.HrDocumentViewSet, basename="hrms-documents")
+router.register("policies", views.PolicyViewSet, basename="hrms-policies")
+router.register(
+    "policy-categories", views.PolicyCategoryViewSet, basename="hrms-policy-categories"
+)
+router.register(
+    "calendar/events", views.CalendarEventViewSet, basename="hrms-calendar-events"
+)
+router.register("holidays", views.HolidayViewSet, basename="hrms-holidays")
+
+router.register("teams", views.TeamViewSet, basename="hrms-teams")
+router.register(
+    "approval-chains", views.ApprovalChainViewSet, basename="hrms-approval-chains"
+)
+router.register("terminations", views.TerminationViewSet, basename="hrms-terminations")
+router.register("resignations", views.ResignationViewSet, basename="hrms-resignations")
+router.register("complaints", views.ComplaintViewSet, basename="hrms-complaints")
+
+urlpatterns = [
+    path("org-chart/", views.OrgChartView.as_view(), name="hrms-org-chart"),
+    path("dashboard/", views.HrmsDashboardView.as_view(), name="hrms-dashboard"),
+    path(
+        "attendance/flexibility/",
+        views.FlexibilityPolicyView.as_view(),
+        name="hrms-attendance-flexibility",
+    ),
+    path(
+        "recruitment/funnel/",
+        views.RecruitmentFunnelView.as_view(),
+        {"section": "funnel"},
+        name="hrms-recruitment-funnel",
+    ),
+    path(
+        "recruitment/dashboard/",
+        views.RecruitmentFunnelView.as_view(),
+        name="hrms-recruitment-dashboard",
+    ),
+    path(
+        "performance/dashboard/",
+        views.PerformanceDashboardView.as_view(),
+        name="hrms-performance-dashboard",
+    ),
+    path("working-days/", views.WorkingDayView.as_view(), name="hrms-working-days"),
+    path("settings/", views.HrmsSettingsView.as_view(), name="hrms-settings"),
+    path("", include(router.urls)),
+]
