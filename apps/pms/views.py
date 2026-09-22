@@ -567,9 +567,18 @@ class ProjectViewSet(TenantModelViewSet):
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        order = SalesOrder.objects.filter(
-            pk=data["salesOrderId"], client_id=request.client_id, deleted_at__isnull=True
-        ).first()
+        target_id = data["salesOrderId"]
+        order = None
+        try:
+            order = SalesOrder.objects.filter(
+                pk=target_id, client_id=request.client_id, deleted_at__isnull=True
+            ).first()
+        except (ValueError, TypeError, Exception):
+            order = None
+        if order is None:
+            order = SalesOrder.objects.filter(
+                order_number=target_id, client_id=request.client_id, deleted_at__isnull=True
+            ).first()
         if order is None:
             raise NotFound("That sales order no longer exists.")
         if order.pms_project_id:

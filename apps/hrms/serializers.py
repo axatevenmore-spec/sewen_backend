@@ -179,6 +179,36 @@ class AttendanceSerializer(BaseModelSerializer):
         # policy, applied server-side (api.md §11.2).
         read_only_fields = ["hours", "source", "leave_request", "created_at", "updated_at"]
 
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        work_date = data.get("date") or data.get("work_date")
+        if work_date:
+            for time_field in ("checkIn", "check_in"):
+                val = data.get(time_field)
+                if val and isinstance(val, str) and len(val) <= 8 and ":" in val:
+                    data[time_field] = f"{work_date}T{val}:00" if len(val) == 5 else f"{work_date}T{val}"
+            for time_field in ("checkOut", "check_out"):
+                val = data.get(time_field)
+                if val and isinstance(val, str) and len(val) <= 8 and ":" in val:
+                    data[time_field] = f"{work_date}T{val}:00" if len(val) == 5 else f"{work_date}T{val}"
+
+        emp_id = data.get("employeeId") or data.get("employee_id")
+        if emp_id and isinstance(emp_id, str):
+            import uuid
+            try:
+                uuid.UUID(emp_id)
+            except ValueError:
+                from apps.hrms.models import Employee
+                request = self.context.get("request")
+                client_id = getattr(request, "client_id", None) or (request.user.client_id if request and hasattr(request, "user") else None)
+                if client_id:
+                    emp = Employee.objects.filter(
+                        employee_code=emp_id, client_id=client_id, deleted_at__isnull=True
+                    ).first()
+                    if emp:
+                        data["employeeId"] = str(emp.id)
+        return super().to_internal_value(data)
+
 
 class BulkAttendanceSerializer(BaseSerializer):
     date = serializers.DateField(required=False)

@@ -412,12 +412,16 @@ class DealSerializer(BaseModelSerializer):
         source="lead", model="crm.Lead", required=False, allow_null=True
     )
 
+    expectedCloseDate = serializers.DateField(
+        source="expected_close_date", required=False, allow_null=True
+    )
+
     class Meta:
         model = Deal
         fields = [
             "id", "deal_number", "title", "leadId", "customerId", "customerName",
             "ownerId", "ownerName", "stage", "value", "probability",
-            "expected_close_date", "closed_at", "lost_reason", "quotation",
+            "expected_close_date", "expectedCloseDate", "closed_at", "lost_reason", "quotation",
             "crm_project", "created_at", "updated_at",
         ]
         read_only_fields = ["deal_number", "closed_at", "created_at", "updated_at"]

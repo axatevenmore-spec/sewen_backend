@@ -515,7 +515,9 @@ class CompleteProjectSerializer(BaseSerializer):
 
 
 class FromOrderSerializer(BaseSerializer):
-    salesOrderId = serializers.CharField()
+    salesOrderId = serializers.CharField(required=False, allow_null=True)
+    orderId = serializers.CharField(required=False, allow_null=True)
+    orderNumber = serializers.CharField(required=False, allow_null=True)
     projectManagerId = serializers.CharField(required=False, allow_null=True)
     priority = serializers.ChoiceField(
         choices=["Low", "Medium", "High", "Urgent"], required=False, default="Medium"
@@ -527,6 +529,14 @@ class FromOrderSerializer(BaseSerializer):
     stages = serializers.ListField(
         child=serializers.DictField(), required=False, default=list
     )
+
+    def validate(self, attrs):
+        if not attrs.get("salesOrderId"):
+            order_id = attrs.get("orderId") or attrs.get("orderNumber")
+            if not order_id:
+                raise serializers.ValidationError({"salesOrderId": "A sales order id is required."})
+            attrs["salesOrderId"] = order_id
+        return attrs
 
 
 class StagePercentagesSerializer(BaseSerializer):

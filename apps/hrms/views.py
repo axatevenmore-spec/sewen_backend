@@ -426,10 +426,18 @@ class AttendanceViewSet(TenantModelViewSet):
         work_date = data.get("date") or timezone.localdate()
         written = 0
         for record in data.get("records", []):
-            employee_id = record.get("employeeId") or record.get("employee_id")
-            employee = Employee.objects.filter(
-                pk=employee_id, client_id=request.client_id, deleted_at__isnull=True
-            ).first()
+            employee_id = record.get("employeeId") or record.get("employee_id") or record.get("id")
+            employee = None
+            try:
+                employee = Employee.objects.filter(
+                    pk=employee_id, client_id=request.client_id, deleted_at__isnull=True
+                ).first()
+            except (ValueError, TypeError, Exception):
+                employee = None
+            if employee is None and employee_id:
+                employee = Employee.objects.filter(
+                    employee_code=employee_id, client_id=request.client_id, deleted_at__isnull=True
+                ).first()
             if employee is None:
                 continue
             services.mark_attendance(
