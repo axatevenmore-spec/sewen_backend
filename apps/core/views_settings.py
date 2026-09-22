@@ -45,7 +45,7 @@ class CompanyProfileSerializer(BaseModelSerializer):
         model = CompanyProfile
         fields = [
             "legal_name", "trade_name", "gstin", "pan", "cin", "address", "state",
-            "state_code", "phone", "email", "website", "logo", "signature",
+            "state_code", "currency", "phone", "email", "website", "logo", "signature",
             "logoFileId", "signatureFileId", "bankAccountId", "updated_at",
         ]
 

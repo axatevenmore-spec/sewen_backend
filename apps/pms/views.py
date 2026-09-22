@@ -3,11 +3,13 @@ import hashlib
 import secrets
 from datetime import timedelta
 
+from decimal import Decimal
 from django.db import transaction
 from django.db.models import Count, Q
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -58,6 +60,7 @@ from .serializers import (
     RequestApprovalSerializer,
     ShareProofSerializer,
     StageConfigSerializer,
+    StagePercentagesSerializer,
     StageStatusSerializer,
     TaskSerializer,
 )
@@ -288,7 +291,7 @@ class PmsSettingsView(APIView):
 # Projects (api.md §10.2)
 # ---------------------------------------------------------------------------
 def create_project_from_order(order, *, project_manager_id=None, priority="Medium",
-                              stage_config_ids=None, user=None):
+                              stage_config_ids=None, stage_weights=None, user=None):
     """``POST /pms/projects/from-order/`` -- pulls customer + product from the order."""
     first_line = order.line_items.filter(deleted_at__isnull=True).order_by("line_no").first()
 
@@ -311,7 +314,9 @@ def create_project_from_order(order, *, project_manager_id=None, priority="Mediu
     order.save(update_fields=["pms_project", "updated_at"])
 
     if stage_config_ids:
-        apply_stage_template(project, stage_config_ids, user=user)
+        apply_stage_template(
+            project, stage_config_ids, stage_weights=stage_weights, user=user
+        )
 
     record_audit(
         client=order.client_id,
@@ -326,7 +331,7 @@ def create_project_from_order(order, *, project_manager_id=None, priority="Mediu
 
 
 @transaction.atomic
-def apply_stage_template(project, config_ids, *, user=None):
+def apply_stage_template(project, config_ids, *, stage_weights=None, user=None):
     """Instantiate stages from templates, copying the fields that matter.
 
     db.md §10.2: configs are copied, not referenced, for name, gates and
@@ -344,6 +349,21 @@ def apply_stage_template(project, config_ids, *, user=None):
             field_errors={"configIds": ["Unknown stage template ids."]},
         )
 
+    if stage_weights:
+        total_w = sum(
+            float(stage_weights.get(str(c.id)) or stage_weights.get(c.name) or 0)
+            for c in configs
+        )
+        if round(total_w, 2) != 100.0:
+            raise ValidationFailed(
+                f"Total stage percentage must equal 100% (currently {round(total_w, 2)}%).",
+                field_errors={
+                    "stageWeights": [
+                        f"Total stage percentage must equal 100% (currently {round(total_w, 2)}%)."
+                    ]
+                },
+            )
+
     start_sequence = (
         ProjectStage.objects.filter(project=project, deleted_at__isnull=True)
         .order_by("-sequence")
@@ -353,7 +373,20 @@ def apply_stage_template(project, config_ids, *, user=None):
     )
 
     created = []
+    num_configs = len(configs)
+    equal_pct = round(100.0 / num_configs, 2) if num_configs > 0 else 0
+
     for offset, config in enumerate(configs, start=1):
+        if stage_weights:
+            weight_val = stage_weights.get(str(config.id)) or stage_weights.get(config.name) or 0
+            weight = Decimal(str(weight_val))
+        else:
+            # Distribute 100% equally with rounding adjustment on the final stage
+            if offset == num_configs:
+                weight = Decimal(str(round(100.0 - equal_pct * (num_configs - 1), 2)))
+            else:
+                weight = Decimal(str(equal_pct))
+
         created.append(
             ProjectStage.objects.create(
                 client_id=project.client_id,
@@ -366,6 +399,7 @@ def apply_stage_template(project, config_ids, *, user=None):
                 duration_unit=config.duration_unit,
                 required_approval=config.required_approval,
                 required_document=config.required_document,
+                weight_pct=weight,
                 status="Not Started",
                 created_by=user if getattr(user, "is_authenticated", False) else None,
             )
@@ -545,11 +579,22 @@ class ProjectViewSet(TenantModelViewSet):
                 payload={"projectId": str(order.pms_project_id)},
             )
 
+        stage_weights = data.get("stageWeights") or {}
+        if not stage_weights and data.get("stages"):
+            for s in data["stages"]:
+                cid = s.get("configId") or s.get("stageConfigId") or s.get("id")
+                pct = s.get("percentage")
+                if pct is None:
+                    pct = s.get("weightPct") or s.get("weight") or 0
+                if cid:
+                    stage_weights[str(cid)] = pct
+
         project = create_project_from_order(
             order,
             project_manager_id=data.get("projectManagerId"),
             priority=data.get("priority", "Medium"),
-            stage_config_ids=data.get("stageConfigIds") or [],
+            stage_config_ids=data.get("stageConfigIds") or list(stage_weights.keys()),
+            stage_weights=stage_weights or None,
             user=request.user,
         )
         return Response(
@@ -562,7 +607,60 @@ class ProjectViewSet(TenantModelViewSet):
         project = self.get_object()
         serializer = ApplyTemplateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        apply_stage_template(project, serializer.validated_data["configIds"], user=request.user)
+        apply_stage_template(
+            project,
+            serializer.validated_data["configIds"],
+            stage_weights=serializer.validated_data.get("stageWeights"),
+            user=request.user,
+        )
+        project.refresh_from_db()
+        return Response(
+            ProjectDetailSerializer(project, context=self._detail_context(project)).data
+        )
+
+    @action(detail=True, methods=["post", "patch"], url_path="stage-percentages")
+    @transaction.atomic
+    def stage_percentages(self, request, pk=None):
+        project = self.get_object()
+
+        # Permission gate: Only the project creator (or superuser) can modify stage percentages
+        if (
+            getattr(request.user, "is_authenticated", False)
+            and not getattr(request.user, "is_superuser", False)
+            and project.created_by_id is not None
+            and project.created_by_id != request.user.id
+        ):
+            raise PermissionDenied("Only the project creator can modify stage percentages.")
+
+        serializer = StagePercentagesSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        stage_items = serializer.validated_data["stages"]
+
+        active_stages = {
+            str(s.id): s
+            for s in project.stages.filter(deleted_at__isnull=True)
+        }
+
+        for item in stage_items:
+            sid = str(item.get("id") or item.get("stageId"))
+            pct = item.get("percentage")
+            if pct is None:
+                pct = item.get("weightPct") or item.get("weight") or 0
+            if sid in active_stages:
+                stage = active_stages[sid]
+                stage.weight_pct = Decimal(str(pct))
+                stage.save(update_fields=["weight_pct", "updated_at"])
+
+        services.recalculate_project(project)
+        record_audit(
+            client=project.client_id,
+            actor=request.user,
+            action="STAGES_CONFIGURED",
+            entity_type="PmsProject",
+            entity_id=project.id,
+            entity_label=project.code,
+            description="Stage percentages updated",
+        )
         project.refresh_from_db()
         return Response(
             ProjectDetailSerializer(project, context=self._detail_context(project)).data
@@ -649,18 +747,58 @@ class ProjectViewSet(TenantModelViewSet):
                 )
             )
 
+        # Permission check: Only project creator can add dynamic stages
+        if (
+            getattr(request.user, "is_authenticated", False)
+            and not getattr(request.user, "is_superuser", False)
+            and project.created_by_id is not None
+            and project.created_by_id != request.user.id
+        ):
+            raise PermissionDenied("Only the project creator can add stages to this project.")
+
         serializer = ProjectStageSerializer(
             data=request.data, context=self.get_serializer_context()
         )
         serializer.is_valid(raise_exception=True)
         last = project.stages.order_by("-sequence").values_list("sequence", flat=True).first()
+        weight_val = (
+            request.data.get("percentage")
+            or request.data.get("weightPct")
+            or request.data.get("weight")
+            or 0
+        )
         stage = serializer.save(
             client_id=request.client_id,
             project=project,
             sequence=(last or 0) + 1,
+            weight_pct=Decimal(str(weight_val)),
             created_by=request.user,
         )
+
+        stage_weights = request.data.get("stagePercentages") or request.data.get("stageWeights")
+        if stage_weights:
+            for s in project.stages.filter(deleted_at__isnull=True).exclude(pk=stage.id):
+                sid = str(s.id)
+                if sid in stage_weights:
+                    s.weight_pct = Decimal(str(stage_weights[sid]))
+                    s.save(update_fields=["weight_pct", "updated_at"])
+
+        if project.current_stage_id is None:
+            project.current_stage = stage
+            project.current_department = stage.department
+            project.status = "In Progress" if project.status == "Draft" else project.status
+            project.save(update_fields=["current_stage", "current_department", "status", "updated_at"])
+
         services.recalculate_project(project)
+        record_audit(
+            client=project.client_id,
+            actor=request.user,
+            action="STAGES_CONFIGURED",
+            entity_type="PmsProject",
+            entity_id=project.id,
+            entity_label=project.code,
+            description=f"Dynamic stage '{stage.name}' added with {stage.weight_pct}% weight",
+        )
         return Response(
             ProjectStageSerializer(stage, context=self.get_serializer_context()).data,
             status=status.HTTP_201_CREATED,
@@ -670,11 +808,26 @@ class ProjectViewSet(TenantModelViewSet):
     def stage_detail(self, request, pk=None, stage_id=None):
         project = self.get_object()
         stage = self._get_stage(project, stage_id)
+
+        # If modifying percentage, gate on project creator
+        if any(k in request.data for k in ("percentage", "weightPct", "weight", "weight_pct")):
+            if (
+                getattr(request.user, "is_authenticated", False)
+                and not getattr(request.user, "is_superuser", False)
+                and project.created_by_id is not None
+                and project.created_by_id != request.user.id
+            ):
+                raise PermissionDenied("Only the project creator can modify stage percentages.")
+
         serializer = ProjectStageSerializer(
             stage, data=request.data, partial=True, context=self.get_serializer_context()
         )
         serializer.is_valid(raise_exception=True)
         serializer.save()
+
+        if any(k in request.data for k in ("percentage", "weightPct", "weight", "weight_pct")):
+            services.recalculate_project(project)
+
         return Response(serializer.data)
 
     @action(detail=True, methods=["post"], url_path=r"stages/(?P<stage_id>[^/.]+)/assign")

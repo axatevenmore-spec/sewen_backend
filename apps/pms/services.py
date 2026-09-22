@@ -84,13 +84,30 @@ def recalculate_stage(stage):
 
 @transaction.atomic
 def recalculate_project(project):
-    """A project's ``overall_completion_pct`` is the rollup of its stages."""
-    rows = ProjectStage.objects.filter(
-        project=project, deleted_at__isnull=True
-    ).aggregate(count=Count("id"), average=Avg("completion_pct"))
-    project.overall_completion_pct = (
-        int(round(rows["average"] or 0)) if rows["count"] else 0
+    """A project's ``overall_completion_pct`` is the rollup of its stages.
+
+    Uses configured stage percentage weights (total 100%) when configured;
+    falls back safely to unweighted average for projects without weights.
+    """
+    stages = list(
+        ProjectStage.objects.filter(project=project, deleted_at__isnull=True)
     )
+    if not stages:
+        project.overall_completion_pct = 0
+    else:
+        total_weight = sum(s.weight_pct for s in stages)
+        if total_weight > 0:
+            weighted_sum = sum(
+                (s.completion_pct or 0) * (s.weight_pct or 0) for s in stages
+            )
+            project.overall_completion_pct = int(
+                round(float(weighted_sum) / float(total_weight))
+            )
+        else:
+            project.overall_completion_pct = int(
+                round(sum(s.completion_pct or 0 for s in stages) / len(stages))
+            )
+
     project.status = derive_project_status(project)
     project.save(update_fields=["overall_completion_pct", "status", "updated_at"])
     return project

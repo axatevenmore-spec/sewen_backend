@@ -4,8 +4,15 @@ Django + DRF + PostgreSQL implementation of [api.md](api.md) (HTTP contract),
 [db.md](db.md) (schema) and [api-integration.md](api-integration.md) (what the
 React app expects of the server).
 
-The frontend in `Evenmore-ERP/` is unchanged and unreferenced by this project —
-it is the contract, not a dependency.
+The React app in `Evenmore-ERP/app` now talks to this server. Its side of the
+wiring is `src/services/backendSync.js` (the field mapping, one entry per
+entity) plus the `persist*` helpers in `src/context/ERPContext.jsx`, which push
+every create/update/delete and replace the optimistic record with the server's
+copy. The contract is still api.md — the app conforms to it, not the reverse.
+
+Run both: `python manage.py runserver` here, `npm run dev` in `Evenmore-ERP/app`.
+The Vite proxy sends `/api` to `http://127.0.0.1:8000`, so `VITE_API_URL` stays
+relative and there is no CORS hop in development.
 
 ---
 
@@ -160,6 +167,31 @@ The backend satisfies the blockers listed in api-integration.md §2:
 
 Point the Vite dev proxy at `http://localhost:8000` and leave `VITE_API_URL`
 relative, per api-integration.md §3.2.
+
+**What the app reads and writes.** `backendSync.js` covers parties (and their
+customer/vendor projections), categories, units, locations, items, the seven
+sales documents, the three purchase documents, payments in and out, and
+expenses. Everything else in `ERPContext` — PMS, HRMS, CRM stores, stock
+transfers, journal entries, warranties — is still local state; the endpoints
+exist, the mapping does not yet.
+
+Three contract bugs surfaced while wiring it up and were fixed here, not
+worked around in the client:
+
+- `code` was required on party, category and location creates, so nothing the
+  wizards posted could be accepted. The server allocates `CUST-`/`VEND-`
+  (§1.7); category and location codes are derived from the name when omitted.
+- `PurchaseOrder`/`PurchaseBill`/`PurchaseReturn` declared `vendorId` *over*
+  the base serializer's `partyId`, both writable on the same source, so DRF
+  demanded both. `partyId` is now a read-only mirror.
+- The challan and stock-transfer viewsets had an `@action` named `dispatch`,
+  which shadows `APIView.dispatch` and broke every request to those endpoints
+  with a 500. Renamed, URL unchanged.
+
+Plus two additions the client needed: `companyProfile.currency` (api.md §1.6
+refers to it; the profile did not expose it) and the payment-mode enum widened
+to the strings the UI's `<select>` actually emits (`Bank Transfer`, `Bank
+Wire`, `ACH`, `Corporate Card`).
 
 ---
 

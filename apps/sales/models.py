@@ -36,7 +36,13 @@ PAYMENT_STATUSES = ["Unpaid", "Partially Paid", "Paid"]
 PROFORMA_STATUSES = ["Draft", "Sent", "Accepted", "Converted", "Expired", "Cancelled"]
 CHALLAN_STATUSES = ["Draft", "Dispatched", "In Transit", "Delivered", "Cancelled"]
 INVOICE_STATUSES = ["Draft", "Unpaid", "Partially Paid", "Paid", "Cancelled"]
-PAYMENT_MODES = ["Cash", "Bank", "UPI", "Cheque", "Card"]
+# The strings the UI's <select> actually emits (api.md §0: where code and
+# spec disagree, the frontend code is the fact). PaymentInPage, PaymentOutPage,
+# PurchaseBillsPage and SalesInvoicesView between them offer all of these.
+PAYMENT_MODES = [
+    "Cash", "Bank", "UPI", "Cheque", "Card",
+    "Bank Transfer", "Bank Wire", "ACH", "Corporate Card",
+]
 
 
 def choices(values):
