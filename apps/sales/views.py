@@ -692,8 +692,11 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
             challan.refresh_from_db()
         return challan
 
-    @action(detail=True, methods=["post"])
-    def dispatch(self, request, pk=None):
+    # ``dispatch`` is APIView's own entry point: a method of that name here
+    # shadows it and breaks every request to this viewset. Keep the URL,
+    # rename the method.
+    @action(detail=True, methods=["post"], url_path="dispatch", url_name="dispatch")
+    def dispatch_action(self, request, pk=None):
         challan = services.dispatch_challan(self.get_object(), user=request.user)
         self.write_audit("dispatch", challan, description="Challan dispatched")
         return Response(self.get_serializer(challan).data)

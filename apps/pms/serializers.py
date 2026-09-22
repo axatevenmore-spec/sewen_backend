@@ -224,6 +224,10 @@ class ProjectStageSerializer(BaseModelSerializer):
         source="actual_completion_datetime", read_only=True
     )
     completionPct = serializers.IntegerField(source="completion_pct", read_only=True)
+    percentage = serializers.DecimalField(
+        source="weight_pct", max_digits=5, decimal_places=2,
+        coerce_to_string=False, required=False,
+    )
     requiredApproval = serializers.BooleanField(source="required_approval", required=False)
     requiredDocument = serializers.BooleanField(source="required_document", required=False)
 
@@ -241,7 +245,7 @@ class ProjectStageSerializer(BaseModelSerializer):
             "id", "name", "sequence", "department", "departmentId", "assignedTeam",
             "assignedUser", "assignedUserId", "plannedDuration", "durationUnit",
             "startDateTime", "expectedCompletionDateTime", "actualStartDateTime",
-            "actualCompletionDateTime", "completionPct", "requiredApproval",
+            "actualCompletionDateTime", "completionPct", "percentage", "requiredApproval",
             "requiredDocument", "status", "tasks", "documents", "approvals",
             "delayDetails", "isOverdue", "isAtRisk", "created_at", "updated_at",
         ]
@@ -309,6 +313,8 @@ class ProjectListSerializer(BaseModelSerializer):
         source="actual_completion_date", read_only=True
     )
     isOverdue = serializers.SerializerMethodField()
+    createdBy = serializers.SerializerMethodField()
+    createdById = serializers.CharField(source="created_by_id", read_only=True)
 
     class Meta:
         model = Project
@@ -317,8 +323,18 @@ class ProjectListSerializer(BaseModelSerializer):
             "productDetails", "projectManager", "currentStageId",
             "currentDepartment", "priority", "overallCompletionPct",
             "startDate", "expectedCompletionDate", "actualCompletionDate",
-            "status", "isOverdue", "created_at", "updated_at",
+            "status", "isOverdue", "createdBy", "createdById",
+            "created_at", "updated_at",
         ]
+
+    def get_createdBy(self, project):
+        if not project.created_by_id:
+            return None
+        return {
+            "id": str(project.created_by_id),
+            "name": getattr(project.created_by, "name", "") or getattr(project.created_by, "username", "") or str(project.created_by),
+            "email": getattr(project.created_by, "email", "") or "",
+        }
 
     def get_crmOrderId(self, project):
         if not project.sales_order_id:
@@ -491,6 +507,7 @@ class ProofShareSerializer(BaseModelSerializer):
 
 class ApplyTemplateSerializer(BaseSerializer):
     configIds = serializers.ListField(child=serializers.CharField(), allow_empty=False)
+    stageWeights = serializers.DictField(required=False, default=dict)
 
 
 class CompleteProjectSerializer(BaseSerializer):
@@ -506,3 +523,32 @@ class FromOrderSerializer(BaseSerializer):
     stageConfigIds = serializers.ListField(
         child=serializers.CharField(), required=False, default=list
     )
+    stageWeights = serializers.DictField(required=False, default=dict)
+    stages = serializers.ListField(
+        child=serializers.DictField(), required=False, default=list
+    )
+
+
+class StagePercentagesSerializer(BaseSerializer):
+    stages = serializers.ListField(child=serializers.DictField(), allow_empty=False)
+
+    def validate_stages(self, value):
+        if not value:
+            raise serializers.ValidationError("At least one stage is required.")
+        total = 0.0
+        for item in value:
+            pct = item.get("percentage")
+            if pct is None:
+                pct = item.get("weightPct") or item.get("weight") or 0
+            try:
+                pct_num = float(pct)
+            except (ValueError, TypeError):
+                raise serializers.ValidationError("Stage percentage must be a valid number.")
+            if pct_num < 0 or pct_num > 100:
+                raise serializers.ValidationError("Stage percentage must be between 0 and 100.")
+            total += pct_num
+        if round(total, 2) != 100.0:
+            raise serializers.ValidationError(
+                f"Total stage percentage must equal 100% (currently {round(total, 2)}%)."
+            )
+        return value

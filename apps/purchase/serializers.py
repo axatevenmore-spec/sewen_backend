@@ -83,8 +83,14 @@ class PurchaseOrderSerializer(DocumentSerializer):
     line_fk_name = "purchase_order"
     line_table_name = "purchase_order_lines"
 
+    #: ``DocumentSerializer`` declares ``partyId`` over ``source="party"``;
+    #: api.md §6.2/§6.4 name the same column ``vendorId``. Two *writable* fields
+    #: on one source makes DRF demand both on create, so ``partyId`` is demoted
+    #: to a read-only mirror and ``vendorId`` carries the write.
     vendorId = TenantPrimaryKeyRelatedField(source="party", model="masters.Party")
     vendorName = serializers.CharField(source="party_name", read_only=True)
+    partyId = serializers.CharField(source="party_id", read_only=True)
+
     #: The UI shows the derived billed status, not the stored one (api.md §6.2).
     billedStatus = serializers.SerializerMethodField()
 
@@ -114,8 +120,14 @@ class PurchaseBillSerializer(DocumentSerializer):
     line_fk_name = "purchase_bill"
     line_table_name = "purchase_bill_lines"
 
+    #: ``DocumentSerializer`` declares ``partyId`` over ``source="party"``;
+    #: api.md §6.2/§6.4 name the same column ``vendorId``. Two *writable* fields
+    #: on one source makes DRF demand both on create, so ``partyId`` is demoted
+    #: to a read-only mirror and ``vendorId`` carries the write.
     vendorId = TenantPrimaryKeyRelatedField(source="party", model="masters.Party")
     vendorName = serializers.CharField(source="party_name", read_only=True)
+    partyId = serializers.CharField(source="party_id", read_only=True)
+
     vendorBillNumber = serializers.CharField(
         source="vendor_bill_number", required=False, allow_null=True, allow_blank=True
     )
@@ -234,6 +246,14 @@ class PurchaseReturnSerializer(DocumentSerializer):
     line_fk_name = "purchase_return"
     line_table_name = "purchase_return_lines"
 
+    #: ``DocumentSerializer`` declares ``partyId`` over ``source="party"``;
+    #: api.md §6.2/§6.4 name the same column ``vendorId``. Two *writable* fields
+    #: on one source makes DRF demand both on create, so ``partyId`` is demoted
+    #: to a read-only mirror and ``vendorId`` carries the write.
+    vendorId = TenantPrimaryKeyRelatedField(source="party", model="masters.Party")
+    vendorName = serializers.CharField(source="party_name", read_only=True)
+    partyId = serializers.CharField(source="party_id", read_only=True)
+
     purchaseBillId = TenantPrimaryKeyRelatedField(
         source="purchase_bill", queryset=PurchaseBill.objects.all()
     )
@@ -242,7 +262,7 @@ class PurchaseReturnSerializer(DocumentSerializer):
         model = PurchaseReturn
         fields = HEADER_FIELDS + [
             "return_number", "debit_note_number", "status", "purchaseBillId",
-            "reason", "location",
+            "reason", "location", "vendorId", "vendorName",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + [
             "return_number", "debit_note_number",

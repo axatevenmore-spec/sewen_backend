@@ -25,7 +25,13 @@ PO_STATUSES = ["Draft", "Issued", "Pending", "Received", "Cancelled"]
 BILL_STATUSES = ["Draft", "Unpaid", "Partially Paid", "Paid", "Cancelled"]
 #: api.md §6.4 -- only `Approved` releases stock for sale or dispatch.
 QC_STATUSES = ["Approved", "Pending Approval", "Rejected", "Rework"]
-PAYMENT_MODES = ["Cash", "Bank", "UPI", "Cheque", "Card"]
+# The strings the UI's <select> actually emits (api.md §0: where code and
+# spec disagree, the frontend code is the fact). PaymentInPage, PaymentOutPage,
+# PurchaseBillsPage and SalesInvoicesView between them offer all of these.
+PAYMENT_MODES = [
+    "Cash", "Bank", "UPI", "Cheque", "Card",
+    "Bank Transfer", "Bank Wire", "ACH", "Corporate Card",
+]
 
 
 def choices(values):

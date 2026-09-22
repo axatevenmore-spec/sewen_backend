@@ -426,6 +426,9 @@ class CompanyProfile(models.Model):
     address = models.JSONField(default=dict)
     state = models.TextField(default="")
     state_code = models.TextField(null=True, blank=True)
+    #: api.md §1.6 -- money is a plain number in *this* currency; the client
+    #: formats it and must not convert it against anything else.
+    currency = models.TextField(default="INR")
     phone = models.TextField(null=True, blank=True)
     email = models.EmailField(null=True, blank=True)
     website = models.TextField(null=True, blank=True)

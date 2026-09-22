@@ -222,6 +222,8 @@ class ProjectStage(TenantModel, LegacyIdMixin):
     actual_completion_datetime = models.DateTimeField(null=True, blank=True)
     #: DERIVED from tasks (db.md §12).
     completion_pct = models.SmallIntegerField(default=0)
+    #: Stage weight percentage in project (0 to 100).
+    weight_pct = models.DecimalField(max_digits=5, decimal_places=2, default=0)
     required_approval = models.BooleanField(default=False)
     required_document = models.BooleanField(default=False)
     status = models.TextField(choices=STAGE_STATUSES, default="Not Started")
@@ -236,6 +238,10 @@ class ProjectStage(TenantModel, LegacyIdMixin):
             models.CheckConstraint(
                 condition=models.Q(completion_pct__gte=0, completion_pct__lte=100),
                 name="ck_pms_stage_pct",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(weight_pct__gte=0, weight_pct__lte=100),
+                name="ck_pms_stage_weight_pct",
             ),
         ]
 

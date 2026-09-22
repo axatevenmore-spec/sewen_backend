@@ -1,4 +1,6 @@
 """Serializers for parties, items, categories, units, locations and BOM (api.md §4)."""
+import re
+
 from rest_framework import serializers
 
 from apps.core.serializers import (
@@ -21,6 +23,16 @@ from .models import (
     PartyContact,
     Unit,
 )
+
+
+def slug_code(name, fallback):
+    """A short, stable code derived from a name -- ``Mild Steel`` -> ``MILD-STEEL``.
+
+    Category and location codes are labels the user reads, not numbers from the
+    §1.7 series, so a missing one is filled in here rather than allocated.
+    """
+    cleaned = re.sub(r"[^A-Za-z0-9]+", "-", (name or "").strip()).strip("-").upper()
+    return cleaned[:24] or fallback
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +71,10 @@ class PartySerializer(BaseModelSerializer):
             "created_at", "updated_at",
         ]
         read_only_fields = ["balance", "created_at", "updated_at"]
+        # api.md 1.7: the server allocates the CUST-/VEND- code in
+        # ``PartyViewSet.perform_create``; the client must never invent one, so
+        # it is optional on the wire rather than required.
+        extra_kwargs = {"code": {"required": False, "allow_blank": True}}
 
     def validate_code(self, value):
         client_id = self.context.get("client_id")
@@ -115,6 +131,14 @@ class ItemCategorySerializer(BaseModelSerializer):
             "lead_time_days", "default_hsn_code", "customFields", "itemCount",
             "created_at", "updated_at",
         ]
+        extra_kwargs = {"code": {"required": False, "allow_blank": True}}
+
+    def validate(self, attrs):
+        """Derive the short code from the name when the client omits it."""
+        attrs = super().validate(attrs)
+        if not attrs.get("code") and not self.instance:
+            attrs["code"] = slug_code(attrs.get("name"), "CAT")
+        return attrs
 
     def get_itemCount(self, category):
         cached = getattr(category, "item_count", None)
@@ -160,6 +184,13 @@ class LocationSerializer(BaseModelSerializer):
             "id", "code", "name", "type", "parent", "address", "is_active",
             "created_at", "updated_at",
         ]
+        extra_kwargs = {"code": {"required": False, "allow_blank": True}}
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        if not attrs.get("code") and not self.instance:
+            attrs["code"] = slug_code(attrs.get("name"), "LOC")
+        return attrs
 
 
 # ---------------------------------------------------------------------------

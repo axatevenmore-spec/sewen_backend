@@ -289,8 +289,11 @@ class StockTransferViewSet(TenantModelViewSet):
         )
         return transfer
 
-    @action(detail=True, methods=["post"])
-    def dispatch(self, request, pk=None):
+    # ``dispatch`` is APIView's own entry point: a method of that name here
+    # shadows it and breaks every request to this viewset. Keep the URL,
+    # rename the method.
+    @action(detail=True, methods=["post"], url_path="dispatch", url_name="dispatch")
+    def dispatch_action(self, request, pk=None):
         """Posts the ``TRANSFER_OUT`` / ``TRANSFER_IN`` pair (api.md §7.2).
 
         Both movements share a ``reference_id``, and the stock between them

@@ -10,22 +10,25 @@ router.register("departments", views.HrmsDepartmentViewSet, basename="hrms-depar
 router.register("designations", views.DesignationViewSet, basename="hrms-designations")
 router.register("locations", views.HrmsLocationViewSet, basename="hrms-locations")
 
-router.register("attendance", views.AttendanceViewSet, basename="hrms-attendance")
+# A router emits each prefix's list route *and* its detail route in the order
+# the prefixes were registered, and a detail route matches any single segment.
+# So `attendance/<pk>/` would swallow `attendance/regularizations/` — the nested
+# collections have to be registered before the parent they sit under.
 router.register(
     "attendance/regularizations",
     views.RegularizationViewSet,
     basename="hrms-regularizations",
 )
+router.register("attendance", views.AttendanceViewSet, basename="hrms-attendance")
 
-router.register("leave", views.LeaveRequestViewSet, basename="hrms-leave")
 router.register("leave/types", views.LeaveTypeViewSet, basename="hrms-leave-types")
 router.register("leave/balances", views.LeaveBalanceViewSet, basename="hrms-leave-balances")
 router.register(
     "leave/encashments", views.LeaveEncashmentViewSet, basename="hrms-leave-encashments"
 )
+router.register("leave", views.LeaveRequestViewSet, basename="hrms-leave")
 router.register("comp-offs", views.CompOffViewSet, basename="hrms-comp-offs")
 
-router.register("payroll", views.PayslipViewSet, basename="hrms-payroll")
 router.register(
     "payroll/salary-structures",
     views.SalaryStructureViewSet,
@@ -34,6 +37,7 @@ router.register(
 router.register(
     "payroll/advances", views.SalaryAdvanceViewSet, basename="hrms-salary-advances"
 )
+router.register("payroll", views.PayslipViewSet, basename="hrms-payroll")
 
 router.register("jobs", views.JobViewSet, basename="hrms-jobs")
 router.register("candidates", views.CandidateViewSet, basename="hrms-candidates")
