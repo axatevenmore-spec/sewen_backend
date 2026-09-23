@@ -52,24 +52,44 @@ PRIORITY_ADJUSTMENT = {"Urgent": -2, "High": -1, "Medium": 0, "Low": 1}
 # Assignee resolution
 # ---------------------------------------------------------------------------
 def team_roster(client_id):
-    """``GET /crm/team-roster/`` -- role -> users, from ``users.crm_roles``."""
+    """``GET /crm/team-roster/`` -- role -> users, from ``users.crm_roles``.
+
+    Each person also carries ``isProjectManager`` (system role code ``PM``),
+    which the PMS "Project Manager" dropdowns filter on. Users whose system
+    role is ``PM`` always appear, even with empty ``crm_roles``.
+    """
     from apps.accounts.models import User
 
     roster = {}
-    users = User.objects.filter(
-        client_id=client_id, deleted_at__isnull=True, status="Active"
-    ).only("id", "name", "email", "department", "crm_roles")
+    users = (
+        User.objects.filter(
+            client_id=client_id, deleted_at__isnull=True, status="Active"
+        )
+        .select_related("role")
+        .only(
+            "id",
+            "name",
+            "email",
+            "department",
+            "crm_roles",
+            "role",
+            "role__code",
+        )
+    )
 
     for user in users:
+        role_code = user.role.code if user.role_id and user.role else None
+        person = {
+            "id": str(user.id),
+            "name": user.name,
+            "email": user.email,
+            "department": user.department,
+            "isProjectManager": role_code == "PM",
+        }
         for role in user.crm_roles or []:
-            roster.setdefault(role, []).append(
-                {
-                    "id": str(user.id),
-                    "name": user.name,
-                    "email": user.email,
-                    "department": user.department,
-                }
-            )
+            roster.setdefault(role, []).append(dict(person))
+        if role_code == "PM" and "Project Manager" not in (user.crm_roles or []):
+            roster.setdefault("Project Manager", []).append(dict(person))
     return roster
 
 

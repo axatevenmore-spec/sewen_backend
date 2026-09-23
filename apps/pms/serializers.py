@@ -118,12 +118,13 @@ class DocumentSerializer(BaseModelSerializer):
     approvalStatus = serializers.CharField(source="approval_status", read_only=True)
     docKey = serializers.CharField(source="doc_key", required=False)
     revisionReason = serializers.CharField(source="revision_reason", read_only=True)
+    uploadedAt = serializers.DateTimeField(source="uploaded_at", read_only=True)
 
     class Meta:
         model = Document
         fields = [
             "id", "docKey", "version", "fileId", "fileName", "fileSize",
-            "previewUrl", "uploadedBy", "uploaded_at", "comments",
+            "previewUrl", "uploadedBy", "uploaded_at", "uploadedAt", "comments",
             "revisionReason", "approvalStatus", "is_current", "is_proof",
         ]
 

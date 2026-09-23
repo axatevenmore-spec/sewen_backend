@@ -93,10 +93,15 @@ def sign_download(file_id, ttl=None):
     return TimestampSigner(salt=DOWNLOAD_SALT).sign(str(file_id))
 
 
-def verify_download(token, max_age=3600):
+def verify_download(token, max_age=None):
     signer = TimestampSigner(salt=DOWNLOAD_SALT)
     try:
-        return signer.unsign(token, max_age=max_age)
+        return signer.unsign(
+            token,
+            max_age=settings.FILE_DOWNLOAD_TTL_SECONDS
+            if max_age is None
+            else max_age,
+        )
     except SignatureExpired:
         raise NotFound("This link has expired.")
     except BadSignature:

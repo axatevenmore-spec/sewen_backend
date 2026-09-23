@@ -215,6 +215,9 @@ FILE_STORAGE_BACKEND = env("FILE_STORAGE_BACKEND", "local")
 FILE_MAX_BYTES = int(env("FILE_MAX_BYTES", str(25 * 1024 * 1024)))
 PMS_PROOF_MAX_BYTES = int(env("PMS_PROOF_MAX_BYTES", str(50 * 1024 * 1024)))
 UPLOAD_URL_TTL_SECONDS = 900
+#: Signed file download/preview URLs (``previewUrl`` on PMS documents). Long
+#: enough that a cached project still previews after days, not just an hour.
+FILE_DOWNLOAD_TTL_SECONDS = int(env("FILE_DOWNLOAD_TTL_SECONDS", str(7 * 24 * 3600)))
 PUBLIC_SHARE_DEFAULT_EXPIRY_DAYS = 14
 EXCHANGE_RATE_URL = env("EXCHANGE_RATE_URL", "https://open.er-api.com/v6/latest/USD")
 EXCHANGE_RATE_CACHE_SECONDS = 24 * 60 * 60

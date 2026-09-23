@@ -88,7 +88,7 @@ class FileUploadView(APIView):
 
     authentication_classes = []
     permission_classes = [AllowPublic]
-    parser_classes = [FileUploadParser, MultiPartParser]
+    parser_classes = [MultiPartParser, FileUploadParser]
 
     def put(self, request, pk):
         token = request.query_params.get("token")
@@ -163,6 +163,10 @@ class FileDownloadView(APIView):
 
         response = FileResponse(open(path, "rb"), content_type=row.content_type)
         response["Content-Disposition"] = f'inline; filename="{row.file_name}"'
+        # The PMS proof viewer renders PDFs in an <iframe> on the same origin
+        # (vite dev proxy / same deployment), which the global DENY policy
+        # would block. Relax clickjacking protection for this response only.
+        response["X-Frame-Options"] = "SAMEORIGIN"
         return response
 
 
