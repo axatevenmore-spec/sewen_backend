@@ -175,7 +175,7 @@ def _resolve_proof_share(token):
 
     share = (
         ProofShare.objects.filter(token_hash=hash_token(token))
-        .select_related("document", "document__file", "project")
+        .select_related("document", "document__file", "document__stage", "project")
         .first()
     )
     if share is None:
@@ -210,9 +210,15 @@ class PublicProofView(PublicView):
             {
                 "company": company_payload(share.client_id, request),
                 "project": {
+                    "id": str(project.id),
                     "code": project.code,
                     "customerName": project.customer_name,
                     "productName": project.product_name,
+                },
+                "stage": {
+                    "id": str(document.stage_id),
+                    "sequence": document.stage.sequence,
+                    "name": document.stage.name,
                 },
                 "document": {
                     "id": str(document.id),
