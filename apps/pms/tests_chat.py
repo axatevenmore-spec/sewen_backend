@@ -10,7 +10,11 @@ from apps.core.models import AuditLog, File, Notification
 from apps.pms.models import Conversation, Department, Project, ProjectStage, Task
 
 
-class MessengerTests(TestCase):
+class MessengerFixture:
+    """A project with a PM, a Design stage (Rahul), a QC stage whose task is
+    Dhruv's, an outsider with ``view_pms`` and a superuser. Shared with
+    ``tests_realtime``."""
+
     def setUp(self):
         sync_permissions()
         self.tenant = Client.objects.create(slug="chat-tenant", name="Chat Tenant")
@@ -81,6 +85,9 @@ class MessengerTests(TestCase):
             uploaded_by=owner,
         )
 
+
+
+class MessengerTests(MessengerFixture, TestCase):
     # -- structure and access -------------------------------------------------
     def test_project_and_team_chats_created_once(self):
         titles = [r["title"] for r in self.conversations(self.pm)["results"]]

@@ -12,10 +12,11 @@ with no sync step. The rest reuses what PMS already has: ``core.File`` for
 attachments (the store the design proofs use), ``notify`` for mentions and new
 messages, ``record_audit`` for the project activity trail.
 
-There is no real-time transport in this backend, so clients poll
-``messages/?since=<cursor>``. The cursor lags "now" by a few seconds so a
-message whose transaction commits late is still picked up on the next poll;
-clients de-duplicate by id.
+Changes are pushed over Socket.IO as ``chat:activity`` (ids only, see
+``apps.core.realtime``); the client then reads ``messages/?since=<cursor>``, the
+same call it polls with when the socket is down. The cursor lags "now" by a few
+seconds so a message whose transaction commits late is still picked up; clients
+de-duplicate by id.
 """
 import uuid
 from datetime import timedelta
@@ -27,6 +28,7 @@ from django.utils import timezone
 from apps.core.audit import notify, record_audit
 from apps.core.exceptions import NotFound, PermissionDenied, ValidationFailed
 from apps.core.permissions import has_permission
+from apps.core.realtime import emit, project_room, user_room
 from apps.core.serializers import ISODateTimeField
 
 from . import services
@@ -189,6 +191,29 @@ def _direct_users(conversations):
     if not ids:
         return {}
     return {user.id: user for user in User.objects.filter(pk__in=ids)}
+
+
+# ---------------------------------------------------------------------------
+# Real-time announcements
+# ---------------------------------------------------------------------------
+def announce(conversation, change, message_id=None):
+    """``chat:activity`` to whoever should re-read this conversation.
+
+    Project and Team chats go to the project's room (sockets showing the
+    project); a client that cannot see the conversation ignores the id. Direct
+    chats go only to their two members.
+    """
+    payload = {
+        "projectId": str(conversation.project_id),
+        "conversationId": str(conversation.id),
+        "messageId": str(message_id) if message_id else None,
+        "change": change,
+    }
+    if conversation.kind == "Direct":
+        for user_id in _direct_ids(conversation, as_str=True):
+            emit("chat:activity", payload, room=user_room(user_id))
+    else:
+        emit("chat:activity", payload, room=project_room(conversation.project_id))
 
 
 # ---------------------------------------------------------------------------
@@ -401,6 +426,7 @@ def start_direct(scope, other_user_id):
                 user_id=user_id,
                 defaults={"client_id": scope.project.client_id},
             )
+        announce(conversation, "conversation")
     return conversation, created
 
 
@@ -599,6 +625,7 @@ def post_message(scope, conversation, data):
             f"{title if conversation.kind != 'Direct' else 'a direct message'}",
         )
     _notify_new_message(scope, conversation, message, mentions)
+    announce(conversation, "created", message.id)
     return message_queryset().get(pk=message.pk)
 
 
@@ -631,6 +658,7 @@ def edit_message(scope, conversation, message_id, data):
     message.edited_at = timezone.now()
     message.updated_by = scope.user
     message.save(update_fields=["text", "mentions", "edited_at", "updated_by", "updated_at"])
+    announce(conversation, "updated", message.id)
     return message_queryset().get(pk=message.pk)
 
 
@@ -650,6 +678,7 @@ def delete_message(scope, conversation, message_id):
         description=f"Deleted a message in "
         f"{title if conversation.kind != 'Direct' else 'a direct message'}",
     )
+    announce(conversation, "deleted", message.id)
     return message_queryset().get(pk=message.pk)
 
 
@@ -680,6 +709,12 @@ def mark_read(scope, conversation):
         entity_id=conversation.id,
         read_at__isnull=True,
     ).update(read_at=now)
+    # The reader's other tabs clear their badges too.
+    emit(
+        "chat:read",
+        {"projectId": str(conversation.project_id), "conversationId": str(conversation.id)},
+        room=user_room(scope.user.id),
+    )
     return now
 
 

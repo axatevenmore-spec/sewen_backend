@@ -24,6 +24,7 @@ from apps.core.exceptions import (
 from apps.core.numbering import allocate_number
 from apps.core.pagination import envelope
 from apps.core.permissions import HasModulePermission
+from apps.core.realtime import announce_project_change
 from apps.core.viewsets import TenantModelViewSet
 
 from . import chat, services
@@ -476,7 +477,34 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
         if project is None:
             raise NotFound("That project no longer exists.")
         self.check_object_permissions(self.request, project)
+        self._realtime_project = project
         return project
+
+    #: Writes that do not change what a project screen shows. Chat announces
+    #: its own events (``chat.py``).
+    REALTIME_QUIET_ACTIONS = frozenset(CHAT_PERMISSIONS) | {"document_comments"}
+
+    def finalize_response(self, request, response, *args, **kwargs):
+        """Tell every PMS screen in the tenant that this project changed.
+
+        One hook for every write route on the project -- stages, tasks,
+        documents, delays, handoff, completion -- rather than one per action.
+        """
+        response = super().finalize_response(request, response, *args, **kwargs)
+        if (
+            request.method in ("GET", "HEAD", "OPTIONS")
+            or not 200 <= response.status_code < 300
+            or self.action in self.REALTIME_QUIET_ACTIONS
+        ):
+            return response
+        project = getattr(self, "_realtime_project", None)
+        if project is None and isinstance(getattr(response, "data", None), dict):
+            created_id = response.data.get("id")
+            if created_id:
+                project = Project.objects.filter(pk=created_id).first()
+        if project is not None:
+            announce_project_change(project, self.action or "update", request.user)
+        return response
 
     def get_serializer_class(self):
         if self.action in ("retrieve", "create", "update", "partial_update"):
@@ -1600,6 +1628,7 @@ def apply_document_decision(*, document, decision, comments=None, revision_reaso
             entity_id=document.id,
             actor=user,
         )
+    announce_project_change(project, "document_decided", user)
     return document
 
 

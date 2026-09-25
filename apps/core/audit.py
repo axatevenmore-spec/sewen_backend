@@ -166,7 +166,14 @@ def notify(
         )
         for recipient_id in targets
     ]
-    return Notification.objects.bulk_create(rows)
+    created = Notification.objects.bulk_create(rows)
+
+    # Wake each recipient's bell; the client re-reads GET /notifications/.
+    from .realtime import emit, user_room
+
+    for recipient_id in targets:
+        emit("notification:new", {}, room=user_room(recipient_id))
+    return created
 
 
 def mark_read(notification, at=None):
