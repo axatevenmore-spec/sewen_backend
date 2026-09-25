@@ -26,7 +26,8 @@ from apps.core.pagination import envelope
 from apps.core.permissions import HasModulePermission
 from apps.core.viewsets import TenantModelViewSet
 
-from . import services
+from . import chat, services
+from .chat_views import CHAT_PERMISSIONS, ProjectChatMixin
 from .models import (
     CLOSED_STAGE_STATUSES,
     Approval,
@@ -415,6 +416,7 @@ def apply_stage_template(project, config_ids, *, stage_weights=None, user=None):
         project.save(update_fields=["current_stage", "current_department", "status", "updated_at"])
 
     services.recalculate_project(project)
+    chat.ensure_conversations(project)
     record_audit(
         client=project.client_id,
         actor=user,
@@ -427,7 +429,7 @@ def apply_stage_template(project, config_ids, *, stage_weights=None, user=None):
     return created
 
 
-class ProjectViewSet(TenantModelViewSet):
+class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
     queryset = Project.objects.select_related(
         "party", "project_manager", "current_stage", "current_department", "sales_order"
     )
@@ -454,6 +456,7 @@ class ProjectViewSet(TenantModelViewSet):
         "apply_stage_template": ["assign_stage"],
         # Anyone who can see the project can take part in its proof review.
         "document_comments": ["view_pms"],
+        **CHAT_PERMISSIONS,
     }
     #: The UI uses ``code`` in URLs, so both a uuid and a code resolve.
     lookup_value_regex = "[^/]+"
@@ -804,6 +807,7 @@ class ProjectViewSet(TenantModelViewSet):
             project.save(update_fields=["current_stage", "current_department", "status", "updated_at"])
 
         services.recalculate_project(project)
+        chat.ensure_conversations(project)
         record_audit(
             client=project.client_id,
             actor=request.user,
@@ -876,6 +880,7 @@ class ProjectViewSet(TenantModelViewSet):
         if stage.status == "Not Started" and stage.assigned_user_id:
             stage.status = "Assigned"
         stage.save()
+        chat.ensure_conversations(project)
 
         record_audit(
             client=request.client_id,

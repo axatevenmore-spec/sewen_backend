@@ -531,3 +531,131 @@ class Settings(TenantModel):
         "Client Revision",
         "Other",
     ]
+
+
+# ---------------------------------------------------------------------------
+# Messenger (PMS -> Project -> Messenger)
+# ---------------------------------------------------------------------------
+#: ``Project`` is the whole project's channel, ``Team`` is one per PMS
+#: department on the project's stages, ``Direct`` is two project members.
+CONVERSATION_KINDS = [("Project", "Project"), ("Team", "Team"), ("Direct", "Direct")]
+
+
+class Conversation(TenantModel):
+    """One channel inside a project's messenger.
+
+    Team membership is deliberately *not* stored: it is read from the stage and
+    task assignments every time (see ``chat.ChatScope``), so re-staffing a stage
+    changes who is in the team chat without a second roster to keep in sync.
+    The partial unique constraints are what make "create the team chat if it is
+    missing" safe to run on every read.
+    """
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="conversations")
+    kind = models.TextField(choices=CONVERSATION_KINDS)
+    #: Set for ``Team`` only. PROTECT, because departments are soft-deleted
+    #: and a chat's history must outlive a department being retired.
+    department = models.ForeignKey(
+        Department, null=True, blank=True, on_delete=models.PROTECT, related_name="conversations"
+    )
+    #: Set for ``Direct`` only: the two user ids, sorted, joined by ``:``.
+    direct_key = models.TextField(null=True, blank=True)
+    last_message_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pms_conversations"
+        ordering = ["created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project"],
+                condition=models.Q(kind="Project", deleted_at__isnull=True),
+                name="uq_pms_conv_project",
+            ),
+            models.UniqueConstraint(
+                fields=["project", "department"],
+                condition=models.Q(kind="Team", deleted_at__isnull=True),
+                name="uq_pms_conv_team",
+            ),
+            models.UniqueConstraint(
+                fields=["project", "direct_key"],
+                condition=models.Q(kind="Direct", deleted_at__isnull=True),
+                name="uq_pms_conv_direct",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.project_id} {self.kind} {self.department_id or self.direct_key or ''}"
+
+
+class ConversationMember(TenantModel):
+    """Per-user read state, and the membership list for ``Direct`` chats.
+
+    For Project and Team chats a row appears the first time a user reads the
+    conversation; it records ``last_read_at`` only, and grants nothing.
+    """
+
+    conversation = models.ForeignKey(
+        Conversation, on_delete=models.CASCADE, related_name="memberships"
+    )
+    user = models.ForeignKey("accounts.User", on_delete=models.CASCADE, related_name="+")
+    last_read_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pms_conversation_members"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["conversation", "user"], name="uq_pms_conversation_member"
+            )
+        ]
+
+
+class Message(TenantModel):
+    """``project`` is denormalised (reachable via ``conversation``) so the
+    project-wide message search is a single indexed filter.
+
+    A deleted message stays as a soft-deleted row and is served as a tombstone,
+    so replies to it and polling clients both see that it went away.
+    """
+
+    conversation = models.ForeignKey(
+        Conversation, on_delete=models.CASCADE, related_name="messages"
+    )
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="chat_messages")
+    #: Optional PMS stage context the message was sent from.
+    stage = models.ForeignKey(
+        ProjectStage, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    sender = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    sender_name = models.TextField()  # frozen display copy, also searched
+    text = models.TextField(blank=True, default="")
+    reply_to = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.SET_NULL, related_name="replies"
+    )
+    #: ``[{type: 'user'|'team', id, name}]`` -- validated against the audience.
+    mentions = models.JSONField(default=list, blank=True)
+    edited_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pms_messages"
+        ordering = ["created_at"]
+        indexes = [
+            models.Index(fields=["conversation", "created_at"], name="ix_pms_messages_conv"),
+            models.Index(fields=["project", "created_at"], name="ix_pms_messages_project"),
+        ]
+
+
+class MessageAttachment(TenantModel):
+    """A chat file is an ordinary ``core.File`` (two-step upload, signed
+    download URL) -- the same storage the design proofs use."""
+
+    message = models.ForeignKey(Message, on_delete=models.CASCADE, related_name="attachments")
+    file = models.ForeignKey("core.File", on_delete=models.PROTECT, related_name="+")
+    file_name = models.TextField()
+    file_size = models.BigIntegerField(null=True, blank=True)
+    content_type = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pms_message_attachments"
+        ordering = ["created_at"]

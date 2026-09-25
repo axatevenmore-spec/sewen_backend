@@ -10,6 +10,7 @@ from rest_framework import serializers
 from apps.core.serializers import (
     BaseModelSerializer,
     BaseSerializer,
+    ISODateTimeField,
     TenantPrimaryKeyRelatedField,
 )
 
@@ -20,6 +21,7 @@ from .models import (
     Department,
     Document,
     DocumentComment,
+    Message,
     Project,
     ProjectStage,
     ProofShare,
@@ -584,3 +586,126 @@ class StagePercentagesSerializer(BaseSerializer):
                 f"Total stage percentage must equal 100% (currently {round(total, 2)}%)."
             )
         return value
+
+
+# ---------------------------------------------------------------------------
+# Messenger
+# ---------------------------------------------------------------------------
+#: How much of a replied-to message travels with the reply.
+REPLY_SNIPPET_CHARS = 140
+
+
+class MessageSerializer(BaseModelSerializer):
+    """One chat message. A deleted message is served as a tombstone -- id,
+    sender and time only -- so clients that already hold it can drop the
+    content, and replies to it can say so."""
+
+    conversationId = serializers.CharField(source="conversation_id", read_only=True)
+    projectId = serializers.CharField(source="project_id", read_only=True)
+    stageId = serializers.CharField(source="stage_id", read_only=True)
+    stageName = serializers.SerializerMethodField()
+    sender = serializers.SerializerMethodField()
+    replyTo = serializers.SerializerMethodField()
+    attachments = serializers.SerializerMethodField()
+    isEdited = serializers.SerializerMethodField()
+    editedAt = ISODateTimeField(source="edited_at", read_only=True)
+    isDeleted = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Message
+        fields = [
+            "id", "conversationId", "projectId", "stageId", "stageName", "sender",
+            "text", "replyTo", "mentions", "attachments", "isEdited", "editedAt",
+            "isDeleted", "created_at", "updated_at",
+        ]
+
+    def get_stageName(self, message):
+        return message.stage.name if message.stage_id else None
+
+    def get_sender(self, message):
+        user = message.sender if message.sender_id else None
+        return {
+            "id": str(message.sender_id) if message.sender_id else None,
+            "name": message.sender_name,
+            "avatar": getattr(user, "avatar_url", None),
+        }
+
+    def get_replyTo(self, message):
+        if not message.reply_to_id:
+            return None
+        parent = message.reply_to
+        deleted = parent.deleted_at is not None
+        text = "" if deleted else (parent.text or "")
+        if not text and not deleted:
+            names = [a.file_name for a in parent.attachments.all() if a.deleted_at is None]
+            text = ", ".join(names)
+        return {
+            "id": str(parent.id),
+            "senderName": parent.sender_name,
+            "text": text[:REPLY_SNIPPET_CHARS],
+            "isDeleted": deleted,
+        }
+
+    def get_attachments(self, message):
+        from apps.core.files import public_url
+
+        request = self.context.get("request")
+        return [
+            {
+                "id": str(row.id),
+                "fileId": str(row.file_id),
+                "fileName": row.file_name,
+                "fileSize": row.file_size,
+                "contentType": row.content_type,
+                "url": public_url(row.file, request),
+            }
+            for row in message.attachments.all()
+            if row.deleted_at is None
+        ]
+
+    def get_isEdited(self, message):
+        return message.edited_at is not None
+
+    def get_isDeleted(self, message):
+        return message.deleted_at is not None
+
+    def to_representation(self, message):
+        data = super().to_representation(message)
+        if message.deleted_at is not None:
+            data.update({"text": "", "mentions": [], "attachments": [], "replyTo": None})
+        return data
+
+
+class MentionSerializer(BaseSerializer):
+    type = serializers.ChoiceField(choices=["user", "team"])
+    id = serializers.CharField()
+
+
+class PostMessageSerializer(BaseSerializer):
+    text = serializers.CharField(
+        max_length=4000, required=False, allow_blank=True, trim_whitespace=True
+    )
+    replyToId = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    stageId = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    attachmentIds = serializers.ListField(
+        child=serializers.CharField(), required=False, max_length=10
+    )
+    mentions = MentionSerializer(many=True, required=False)
+
+    def validate(self, attrs):
+        if not (attrs.get("text") or "").strip() and not attrs.get("attachmentIds"):
+            raise serializers.ValidationError({"text": "Write a message or attach a file."})
+        return attrs
+
+
+class EditMessageSerializer(BaseSerializer):
+    text = serializers.CharField(max_length=4000, trim_whitespace=True, allow_blank=True)
+    mentions = MentionSerializer(many=True, required=False)
+
+
+class StartConversationSerializer(BaseSerializer):
+    """Only direct chats are started by hand; Project and Team chats exist
+    as soon as the project or team does."""
+
+    kind = serializers.ChoiceField(choices=["Direct"])
+    userId = serializers.CharField()
