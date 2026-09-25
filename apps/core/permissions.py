@@ -58,33 +58,40 @@ class HasModulePermission(IsAuthenticatedInTenant):
             "cancel": ["cancel_invoice"],
         }
 
-    A missing entry means the action is open to any authenticated tenant user;
-    that is deliberate, because api.md Appendix B has no ids for several
-    read-only screens and inventing them would break the seeded roles.
+    An entry that is a tuple means "any one of these" -- for shared records
+    such as parties, which Sales and Purchase both maintain::
+
+        permission_map = {"write": [("create_invoice", "create_bill")]}
+
+    A missing entry means the action is open to any authenticated tenant user
+    who holds a role; that is deliberate, because api.md Appendix B has no ids
+    for several read-only screens and inventing them would break the seeded
+    roles. A user with neither a role nor a per-user grant gets nothing here.
     """
 
     def has_permission(self, request, view):
         super().has_permission(request, view)
 
-        required = self._required_for(view, getattr(view, "action", None), request.method)
-        if not required:
-            return True
-
         user = request.user
-        granted = getattr(user, "permission_ids", None)
-        if granted is None:
-            granted = user.effective_permissions()
-
         if getattr(user, "is_superuser", False):
             return True
 
-        missing = [permission for permission in required if permission not in granted]
+        granted = granted_permissions(user)
+        if not user.role_id and not granted:
+            raise PermissionDenied(
+                "Your account has no role. Ask an administrator to assign one.",
+                code="NO_ROLE",
+            )
+
+        required = self._required_for(view, getattr(view, "action", None), request.method)
+        missing = missing_permissions(granted, required)
         if missing:
             raise PermissionDenied(
                 "You don't have permission to do that.",
-                # api.md §1.5 -- the permission id goes in `code`.
-                code=missing[0],
-                detail=f"Requires: {', '.join(missing)}.",
+                # api.md §1.5 -- the permission id goes in `code`; for an
+                # any-of entry that is its first option.
+                code=missing[0][0],
+                detail=f"Requires: {', '.join(' or '.join(m) for m in missing)}.",
             )
         return True
 
@@ -103,21 +110,44 @@ class HasModulePermission(IsAuthenticatedInTenant):
         return getattr(view, "required_permissions", None) or []
 
 
+def granted_permissions(user):
+    """The caller's effective permission ids, read once per request.
+
+    Authentication stamps ``permission_ids`` from the database on every
+    request; the fallback covers users that did not come through it (tests,
+    management commands).
+    """
+    granted = getattr(user, "permission_ids", None)
+    if granted is None:
+        granted = user.effective_permissions()
+        user.permission_ids = granted
+    return granted
+
+
+def missing_permissions(granted, required):
+    """Required entries the grant does not satisfy, each as a tuple of options.
+
+    A tuple entry is satisfied by any one of its ids.
+    """
+    missing = []
+    for entry in required or []:
+        options = tuple(entry) if isinstance(entry, (tuple, list)) else (entry,)
+        if not any(option in granted for option in options):
+            missing.append(options)
+    return missing
+
+
 def require_permission(user, permission_id, message=None):
     """Imperative gate for code paths that are not view-level.
 
     Used by override flows -- ``overrideCreditLimit`` (api.md §4.1) and PMS
     ``force`` completion (api.md §10.3) -- where the requirement depends on the
-    request body, not the route.
+    request body, not the route. ``permission_id`` may be a tuple (any of).
     """
-    if getattr(user, "is_superuser", False):
-        return True
-    granted = getattr(user, "permission_ids", None)
-    if granted is None:
-        granted = user.effective_permissions()
-    if permission_id not in granted:
+    if not has_permission(user, permission_id):
+        options = permission_id if isinstance(permission_id, (tuple, list)) else (permission_id,)
         raise PermissionDenied(
-            message or "You don't have permission to do that.", code=permission_id
+            message or "You don't have permission to do that.", code=options[0]
         )
     return True
 
@@ -125,7 +155,4 @@ def require_permission(user, permission_id, message=None):
 def has_permission(user, permission_id):
     if getattr(user, "is_superuser", False):
         return True
-    granted = getattr(user, "permission_ids", None)
-    if granted is None:
-        granted = user.effective_permissions()
-    return permission_id in granted
+    return not missing_permissions(granted_permissions(user), [permission_id])

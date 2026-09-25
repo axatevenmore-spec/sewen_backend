@@ -694,7 +694,7 @@ class QualityStandardViewSet(TenantModelViewSet):
     serializer_class = QualityStandardSerializer
     audit_entity_type = "QualityStandard"
     audit_label_field = "name"
-    required_permissions = ["view_purchase"]
+    permission_map = {"read": ["view_purchase"], "write": ["approve_qc"]}
     status_field = None
     search_fields = ["name"]
     ordering = ["name"]

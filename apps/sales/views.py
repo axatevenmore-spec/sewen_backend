@@ -149,7 +149,8 @@ class EstimateViewSet(SalesDocumentViewSet):
     audit_label_field = "estimate_number"
     status_field = "status"
     print_title = "Estimate"
-    permission_map = {"read": ["view_sales"], "write": ["view_sales"]}
+    # An estimate is the draft of a quotation; writing one needs the quotation id.
+    permission_map = {"read": ["view_sales"], "write": ["create_quotation"]}
 
     def perform_create(self, serializer):
         # An estimate is numbered on creation: it is a quoting artefact, not a
@@ -643,7 +644,12 @@ class ProformaInvoiceViewSet(SalesDocumentViewSet):
     status_field = "status"
     print_title = "Proforma Invoice"
     filter_map = {"customerId": "party_id"}
-    permission_map = {"read": ["view_sales"], "write": ["view_sales"]}
+    # A proforma is raised against a sales order; converting it bills the order.
+    permission_map = {
+        "read": ["view_sales"],
+        "write": ["create_sales_order"],
+        "convert_to_invoice": ["create_invoice"],
+    }
     draft_values = ("Draft", "Sent")
 
     def perform_create(self, serializer):

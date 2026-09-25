@@ -702,9 +702,13 @@ def _recover_advance(payslip):
     advance.save(update_fields=["recovered_amount", "status", "updated_at"])
 
 
-def payroll_summary(client_id, period_month=None):
-    """``GET /hrms/payroll/summary/`` -- gross, deductions, net, headcount."""
-    queryset = Payslip.objects.filter(client_id=client_id, deleted_at__isnull=True)
+def payroll_summary(client_id, period_month=None, queryset=None):
+    """``GET /hrms/payroll/summary/`` -- gross, deductions, net, headcount.
+
+    ``queryset`` narrows the totals to rows the caller may see.
+    """
+    if queryset is None:
+        queryset = Payslip.objects.filter(client_id=client_id, deleted_at__isnull=True)
     if period_month:
         queryset = queryset.filter(period_month=period_month.replace(day=1))
 

@@ -27,7 +27,13 @@ from apps.core.exceptions import (
     ValidationFailed,
 )
 from apps.core.pagination import envelope
-from apps.core.permissions import AllowPublic, HasModulePermission
+from apps.core.permissions import (
+    AllowPublic,
+    HasModulePermission,
+    granted_permissions,
+    has_permission,
+    require_permission,
+)
 from apps.core.throttling import LoginThrottle
 from apps.core.viewsets import TenantModelViewSet
 from apps.core.tenancy import set_current_client_id
@@ -70,10 +76,19 @@ def _hash(token):
 
 
 def _me_payload(user, request=None):
-    """The ``/auth/me/`` body (api.md §2)."""
+    """The ``/auth/me/`` body (api.md §2).
+
+    A superuser passes every server check, so the UI is told they hold the
+    whole catalogue -- otherwise client-side gating would hide the app from
+    the one account that can do everything.
+    """
+    if user.is_superuser:
+        permissions = sorted(Permission.objects.values_list("id", flat=True))
+    else:
+        permissions = sorted(user.effective_permissions())
     return {
         "user": MeUserSerializer(user).data,
-        "permissions": sorted(user.effective_permissions()),
+        "permissions": permissions,
         "tenant": TenantSerializer(user.client).data,
     }
 
@@ -401,7 +416,64 @@ class UserViewSet(TenantModelViewSet):
         "deactivate": ["edit_staff"],
         "reset_password": ["reset_staff_password"],
         "permissions": ["manage_roles"],
+        "stats": ["view_staff"],
     }
+
+    # -- no-escalation rules -------------------------------------------------
+    # ``edit_staff`` is an HR permission, not an access-control one. Without
+    # these checks it could hand out the Administrator role or overwrite an
+    # administrator's password and sign in as them.
+    def _guard_target(self, target):
+        """Only an administrator may change an administrator's account."""
+        actor = self.request.user
+        if actor.is_superuser:
+            return
+        if target.is_superuser:
+            raise PermissionDenied(
+                "Only a superuser can change a superuser account.", code="SUPERUSER_ONLY"
+            )
+        if has_permission(actor, "manage_roles"):
+            return
+        if "manage_roles" in target.effective_permissions():
+            raise PermissionDenied(
+                "Only an administrator can change an administrator's account.",
+                code="manage_roles",
+            )
+
+    def _guard_role(self, role):
+        """A role may only be handed out by someone who holds all of it."""
+        actor = self.request.user
+        if role is None or actor.is_superuser or has_permission(actor, "manage_roles"):
+            return
+        beyond = sorted(role.permission_ids() - granted_permissions(actor))
+        if beyond:
+            raise PermissionDenied(
+                "You cannot assign a role with permissions you don't hold.",
+                code="manage_roles",
+                detail=f"Role '{role.name}' also grants: {', '.join(beyond)}.",
+            )
+
+    def _guard_password(self, target, validated_data):
+        """Setting someone else's password is a reset, not a profile edit."""
+        if not validated_data.get("password"):
+            return
+        if target is not None and target.pk == self.request.user.pk:
+            return
+        require_permission(self.request.user, "reset_staff_password")
+
+    def perform_create(self, serializer):
+        self._guard_role(serializer.validated_data.get("role"))
+        return super().perform_create(serializer)
+
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        self._guard_target(instance)
+        if "role" in serializer.validated_data:
+            new_role = serializer.validated_data["role"]
+            if (new_role.pk if new_role else None) != instance.role_id:
+                self._guard_role(new_role)
+        self._guard_password(instance, serializer.validated_data)
+        return super().perform_update(serializer)
 
     def get_aggregates(self, queryset):
         """api.md §3.1 -- "KPI tiles: total, active, inactive, admins"."""
@@ -415,6 +487,7 @@ class UserViewSet(TenantModelViewSet):
 
     def perform_destroy(self, instance):
         """api.md §3.1 -- soft delete (``status: Deleted``)."""
+        self._guard_target(instance)
         instance.status = "Deleted"
         instance.is_active = False
         instance.save(update_fields=["status", "is_active"])
@@ -430,6 +503,7 @@ class UserViewSet(TenantModelViewSet):
     @action(detail=True, methods=["post"])
     def activate(self, request, pk=None):
         user = self.get_object()
+        self._guard_target(user)
         user.status = "Active"
         user.is_active = True
         user.save(update_fields=["status", "is_active"])
@@ -440,6 +514,7 @@ class UserViewSet(TenantModelViewSet):
     def deactivate(self, request, pk=None):
         """api.md §3.1 -- ``status: Inactive``, revoke sessions."""
         user = self.get_object()
+        self._guard_target(user)
         if user.id == request.user.id:
             raise Conflict(
                 "You cannot deactivate your own account.", code="SELF_DEACTIVATION"
@@ -457,6 +532,7 @@ class UserViewSet(TenantModelViewSet):
     @action(detail=True, methods=["post"], url_path="reset-password")
     def reset_password(self, request, pk=None):
         user = self.get_object()
+        self._guard_target(user)
         token = secrets.token_urlsafe(48)
         PasswordResetToken.objects.create(
             user=user, token_hash=_hash(token), expires_at=timezone.now() + timedelta(hours=24)

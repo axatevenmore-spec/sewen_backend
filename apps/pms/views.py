@@ -85,7 +85,8 @@ class DepartmentViewSet(TenantModelViewSet):
     status_field = None
     search_fields = ["name"]
     ordering = ["name"]
-    permission_map = {"read": ["view_pms"], "write": ["view_pms"]}
+    # PMS configuration is a project-manager task, not a viewer's.
+    permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
 
     def check_delete_allowed(self, department):
         """409 when in use unless ``?reassignTo=`` (api.md §10.1)."""
@@ -152,7 +153,8 @@ class StageConfigViewSet(TenantModelViewSet):
     search_fields = ["name", "description"]
     ordering = ["sequence"]
     filter_map = {"departmentId": "department_id", "isActive": "is_active"}
-    permission_map = {"read": ["view_pms"], "write": ["view_pms"]}
+    # PMS configuration is a project-manager task, not a viewer's.
+    permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
 
     def perform_create(self, serializer):
         if not serializer.validated_data.get("sequence"):
@@ -255,7 +257,8 @@ class StageConfigViewSet(TenantModelViewSet):
 
 class PmsSettingsView(APIView):
     permission_classes = [HasModulePermission]
-    permission_map = {"read": ["view_pms"], "write": ["view_pms"]}
+    # PMS configuration is a project-manager task, not a viewer's.
+    permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
 
     def get(self, request):
         return Response(services.settings_payload(request.client_id))
@@ -1685,7 +1688,7 @@ class DelayViewSet(TenantModelViewSet):
     serializer_class = DelaySerializer
     audit_entity_type = "PmsDelay"
     status_field = None
-    required_permissions = ["view_pms"]
+    permission_map = {"read": ["view_pms"], "write": ["log_delay"]}
     ordering = ["-created_at"]
     filter_map = {
         "projectId": "project_id",

@@ -200,6 +200,16 @@ CATALOGUE = [
             ("complete_project", "Complete project"),
         ],
     ),
+    # ---- Referenced by the Deals and Contracts views (and api.md §3.1's
+    # example payload) but missing from Appendix B. Appended last so no
+    # existing sort_order moves. ---------------------------------------------
+    (
+        "CRM",
+        "Deals & Contracts",
+        [
+            ("manage_deals", "Create, edit and delete deals and contracts"),
+        ],
+    ),
 ]
 
 
@@ -289,7 +299,7 @@ DEFAULT_ROLES = [
             "view_sales", "create_quotation", "create_sales_order", "create_invoice",
             "finalize_invoice", "cancel_invoice", "record_payment_in",
             "view_lead", "create_lead", "edit_lead", "move_lead", "manage_pipeline",
-            "view_task", "create_task", "edit_task", "assign_task",
+            "view_task", "create_task", "edit_task", "assign_task", "manage_deals",
             "view_inventory", "show_crm_dashboard", "export_excel",
         ],
     ),

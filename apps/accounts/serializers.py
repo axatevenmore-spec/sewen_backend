@@ -4,7 +4,11 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
 
 from apps.core.exceptions import ValidationFailed
-from apps.core.serializers import BaseModelSerializer, BaseSerializer
+from apps.core.serializers import (
+    BaseModelSerializer,
+    BaseSerializer,
+    TenantPrimaryKeyRelatedField,
+)
 
 from .models import Client, Permission, Role, RolePermission, User, UserPermission, UserSession
 
@@ -125,12 +129,13 @@ class UserSerializer(BaseModelSerializer):
     """
 
     role = serializers.SerializerMethodField()
-    roleId = serializers.PrimaryKeyRelatedField(
+    # Tenant-scoped: a role or manager id from another tenant must not resolve.
+    roleId = TenantPrimaryKeyRelatedField(
         source="role", queryset=Role.objects.all(), allow_null=True, required=False
     )
     employeeId = serializers.SerializerMethodField()
     reportingManager = serializers.SerializerMethodField()
-    reportingManagerId = serializers.PrimaryKeyRelatedField(
+    reportingManagerId = TenantPrimaryKeyRelatedField(
         source="reporting_manager",
         queryset=User.objects.all(),
         allow_null=True,

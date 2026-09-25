@@ -65,6 +65,20 @@ class PartyViewSet(TenantModelViewSet):
         "gst_treatment": "gst_treatment",
     }
     default_date_field = "created_at"
+    # Names and addresses stay readable to every role -- they fill the party
+    # picker on every document screen. Balances, ledgers and documents are
+    # financial, and changing a party is the job of whoever trades with it.
+    PARTY_FINANCE = ("view_sales", "view_purchase", "view_ledger")
+    PARTY_MAINTAINERS = (
+        "create_quotation", "create_sales_order", "create_invoice", "record_payment_in",
+        "create_purchase_order", "create_bill", "record_payment_out",
+    )
+    permission_map = {
+        "ledger": [PARTY_FINANCE],
+        "summary": [PARTY_FINANCE],
+        "documents": [PARTY_FINANCE],
+        "write": [PARTY_MAINTAINERS],
+    }
 
     def get_aggregates(self, queryset):
         rows = queryset.aggregate(
@@ -295,7 +309,8 @@ class ItemViewSet(TenantModelViewSet):
         "trackingMode": "tracking_mode",
         "vendorId": "vendor_id",
     }
-    permission_map = {"write": ["view_inventory"]}
+    # The per-item movement ledger is the same data `/inventory/movements/` gates.
+    permission_map = {"write": ["view_inventory"], "movements": ["view_inventory"]}
 
     def filter_queryset(self, queryset):
         queryset = super().filter_queryset(queryset)
@@ -730,6 +745,8 @@ class ItemCategoryViewSet(TenantModelViewSet):
     audit_entity_type = "ItemCategory"
     audit_label_field = "name"
     search_fields = ["name", "code", "description"]
+    # Same rule as items: masters are readable by all, maintained by inventory.
+    permission_map = {"write": ["view_inventory"]}
     ordering = ["name"]
     status_field = None
     filter_map = {"kind": "kind"}
@@ -779,6 +796,8 @@ class UnitViewSet(TenantModelViewSet):
     audit_entity_type = "Unit"
     audit_label_field = "code"
     search_fields = ["code", "label"]
+    # Same rule as items: masters are readable by all, maintained by inventory.
+    permission_map = {"write": ["view_inventory"]}
     ordering = ["code"]
     status_field = None
 
@@ -789,6 +808,8 @@ class LocationViewSet(TenantModelViewSet):
     audit_entity_type = "Location"
     audit_label_field = "name"
     search_fields = ["name", "code"]
+    # Same rule as items: masters are readable by all, maintained by inventory.
+    permission_map = {"write": ["view_inventory"]}
     ordering = ["name"]
     status_field = None
     filter_map = {"type": "type", "isActive": "is_active"}

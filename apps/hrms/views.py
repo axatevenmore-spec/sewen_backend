@@ -127,6 +127,44 @@ from .serializers import (
 )
 
 
+#: Leave and pay screens serve both the employee (own rows) and the approver
+#: (team rows, via OwnEmployeeScopeMixin). Requiring only the self-service id
+#: locked HR Manager -- who approves but does not apply -- out of the queue.
+LEAVE_READERS = ("apply_leave", "approve_leave")
+PAY_READERS = ("view_own_payslip", "generate_payroll", "approve_payroll")
+
+class OwnEmployeeScopeMixin:
+    """Record-level scope for self-service HR data.
+
+    The permission map decides whether a screen can be used at all; this
+    decides whose rows it shows. Holders of any of ``team_scope_permissions``
+    see the tenant; everyone else sees -- and may write -- only rows for the
+    employee linked to their own user. ``PayslipViewSet`` applies the same
+    rule by hand.
+    """
+
+    team_scope_permissions = ()
+
+    def has_team_scope(self):
+        return has_permission(self.request.user, tuple(self.team_scope_permissions))
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if self.has_team_scope():
+            return queryset
+        employee_id = getattr(self.request.user, "employee_id", None)
+        return queryset.filter(employee_id=employee_id) if employee_id else queryset.none()
+
+    def check_own_employee(self, employee):
+        if self.has_team_scope():
+            return
+        own = getattr(self.request.user, "employee_id", None)
+        if employee is None or own is None or employee.pk != own:
+            raise PermissionDenied(
+                "You can only do this for your own employee record.",
+                code=self.team_scope_permissions[0],
+            )
+
 # ---------------------------------------------------------------------------
 # Organisation (api.md §11.1)
 # ---------------------------------------------------------------------------
@@ -347,7 +385,7 @@ class HrmsDashboardView(APIView):
 # ---------------------------------------------------------------------------
 # Attendance (api.md §11.2)
 # ---------------------------------------------------------------------------
-class AttendanceViewSet(TenantModelViewSet):
+class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
     queryset = Attendance.objects.select_related("employee", "employee__department")
     serializer_class = AttendanceSerializer
     audit_entity_type = "Attendance"
@@ -361,7 +399,14 @@ class AttendanceViewSet(TenantModelViewSet):
         "department": "employee__department__name",
         "date": "work_date",
     }
-    permission_map = {"read": ["view_team_attendance"], "write": ["mark_attendance"]}
+    permission_map = {
+        "read": ["view_team_attendance"],
+        "write": ["mark_attendance"],
+        # Marking a whole day for many people is a team action.
+        "bulk": ["mark_attendance", "view_team_attendance"],
+    }
+    # Without it, `mark_attendance` covers the caller's own row only.
+    team_scope_permissions = ("view_team_attendance",)
 
     def get_aggregates(self, queryset):
         return queryset.aggregate(
@@ -375,6 +420,7 @@ class AttendanceViewSet(TenantModelViewSet):
 
     def perform_create(self, serializer):
         data = serializer.validated_data
+        self.check_own_employee(data.get("employee"))
         row = services.mark_attendance(
             client=self.request.user.client,
             employee=data["employee"],
@@ -394,6 +440,7 @@ class AttendanceViewSet(TenantModelViewSet):
     def perform_update(self, serializer):
         data = serializer.validated_data
         instance = serializer.instance
+        self.check_own_employee(data.get("employee", instance.employee))
         row = services.mark_attendance(
             client=self.request.user.client,
             employee=data.get("employee", instance.employee),
@@ -571,10 +618,10 @@ class LeaveTypeViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = None
     ordering = ["name"]
-    permission_map = {"read": ["apply_leave"], "write": ["approve_leave"]}
+    permission_map = {"read": [LEAVE_READERS], "write": ["approve_leave"]}
 
 
-class LeaveRequestViewSet(TenantModelViewSet):
+class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
     queryset = LeaveRequest.objects.select_related(
         "employee", "leave_type", "delegate_employee"
     )
@@ -585,7 +632,8 @@ class LeaveRequestViewSet(TenantModelViewSet):
     ordering = ["-from_date"]
     search_fields = ["employee__name", "reason"]
     filter_map = {"employeeId": "employee_id", "type": "leave_type__name", "leaveTypeId": "leave_type_id"}
-    permission_map = {"read": ["apply_leave"], "create": ["apply_leave"], "write": ["approve_leave"]}
+    team_scope_permissions = ("approve_leave",)
+    permission_map = {"read": [LEAVE_READERS], "create": ["apply_leave"], "write": ["approve_leave"]}
 
     def get_aggregates(self, queryset):
         return queryset.aggregate(
@@ -596,6 +644,7 @@ class LeaveRequestViewSet(TenantModelViewSet):
         )
 
     def perform_create(self, serializer):
+        self.check_own_employee(serializer.validated_data.get("employee"))
         request_row = super().perform_create(serializer)
         services.assert_no_overlap(request_row)
         return request_row
@@ -650,16 +699,17 @@ class LeaveRequestViewSet(TenantModelViewSet):
         return Response(self.get_serializer(row).data)
 
 
-class LeaveBalanceViewSet(ReadOnlyTenantViewSet):
+class LeaveBalanceViewSet(OwnEmployeeScopeMixin, ReadOnlyTenantViewSet):
     queryset = LeaveBalance.objects.select_related("employee", "leave_type")
     serializer_class = LeaveBalanceSerializer
     status_field = None
     filter_map = {"employeeId": "employee_id", "leaveTypeId": "leave_type_id", "year": "period_year"}
     ordering = ["employee__name"]
-    permission_map = {"read": ["apply_leave"]}
+    team_scope_permissions = ("approve_leave",)
+    permission_map = {"read": [LEAVE_READERS]}
 
 
-class CompOffViewSet(TenantModelViewSet):
+class CompOffViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
     queryset = CompOff.objects.select_related("employee")
     serializer_class = CompOffSerializer
     audit_entity_type = "CompOff"
@@ -667,17 +717,19 @@ class CompOffViewSet(TenantModelViewSet):
     default_date_field = "worked_date"
     ordering = ["-worked_date"]
     filter_map = {"employeeId": "employee_id", "used": "used"}
-    permission_map = {"read": ["apply_leave"], "write": ["approve_leave"]}
+    team_scope_permissions = ("approve_leave",)
+    permission_map = {"read": [LEAVE_READERS], "write": ["approve_leave"]}
 
 
-class LeaveEncashmentViewSet(TenantModelViewSet):
+class LeaveEncashmentViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
     queryset = LeaveEncashment.objects.select_related("employee", "leave_type")
     serializer_class = LeaveEncashmentSerializer
     audit_entity_type = "LeaveEncashment"
     status_field = "status"
     ordering = ["-created_at"]
     filter_map = {"employeeId": "employee_id"}
-    permission_map = {"read": ["apply_leave"], "write": ["approve_leave"]}
+    team_scope_permissions = ("approve_leave",)
+    permission_map = {"read": [LEAVE_READERS], "write": ["approve_leave"]}
 
 
 # ---------------------------------------------------------------------------
@@ -699,10 +751,12 @@ class PayslipViewSet(TenantModelViewSet):
         "month": "period_month",
     }
     permission_map = {
-        "read": ["view_own_payslip"],
+        "read": [PAY_READERS],
         "write": ["generate_payroll"],
         "approve": ["approve_payroll"],
         "mark_paid": ["approve_payroll"],
+        # Tenant-wide totals.
+        "summary": [("generate_payroll", "approve_payroll")],
     }
     http_method_names = ["get", "patch", "post", "head", "options"]
 
@@ -717,7 +771,11 @@ class PayslipViewSet(TenantModelViewSet):
         return queryset
 
     def get_aggregates(self, queryset):
-        return services.payroll_summary(self.get_client_id())
+        user = self.request.user
+        if has_permission(user, ("generate_payroll", "approve_payroll")):
+            return services.payroll_summary(self.get_client_id())
+        # Totals of the caller's own payslips, not the company payroll.
+        return services.payroll_summary(self.get_client_id(), queryset=queryset)
 
     def perform_update(self, serializer):
         """Adjust earnings / deductions before approval (api.md §11.4)."""
@@ -812,10 +870,10 @@ class SalaryStructureViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = None
     ordering = ["name"]
-    permission_map = {"read": ["view_own_payslip"], "write": ["edit_salary_structure"]}
+    permission_map = {"read": [PAY_READERS], "write": ["edit_salary_structure"]}
 
 
-class SalaryAdvanceViewSet(TenantModelViewSet):
+class SalaryAdvanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
     queryset = SalaryAdvance.objects.select_related("employee")
     serializer_class = SalaryAdvanceSerializer
     audit_entity_type = "SalaryAdvance"
@@ -823,7 +881,9 @@ class SalaryAdvanceViewSet(TenantModelViewSet):
     default_date_field = "issued_on"
     ordering = ["-issued_on"]
     filter_map = {"employeeId": "employee_id"}
-    permission_map = {"read": ["view_own_payslip"], "write": ["generate_payroll"]}
+    # Same rule as payslips: team-wide pay needs a payroll permission.
+    team_scope_permissions = ("generate_payroll", "approve_payroll")
+    permission_map = {"read": [PAY_READERS], "write": ["generate_payroll"]}
 
 
 # ---------------------------------------------------------------------------

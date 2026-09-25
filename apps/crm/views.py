@@ -14,7 +14,7 @@ from apps.core.exceptions import Codes, Conflict, NotFound, ValidationFailed
 from apps.core.money import ZERO, round2
 from apps.core.numbering import allocate_number
 from apps.core.pagination import envelope
-from apps.core.permissions import HasModulePermission
+from apps.core.permissions import HasModulePermission, has_permission
 from apps.core.viewsets import BulkDeleteMixin, ReadOnlyTenantViewSet, TenantModelViewSet
 
 from . import services
@@ -106,14 +106,18 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
         "city": "city",
         "stageId": "stage_id",
     }
+    # Keys are DRF action names. The bulk-delete action is `bulk_delete_action`;
+    # it used to be keyed as `bulk_delete`, which matched nothing and left it
+    # open. Sub-resources (notes, calls, files, threads, ...) fall to the
+    # read/write buckets.
     permission_map = {
-        "list": ["view_lead"],
-        "retrieve": ["view_lead"],
+        "read": ["view_lead"],
         "create": ["create_lead"],
-        "update": ["edit_lead"],
-        "partial_update": ["edit_lead"],
+        "bulk_import": ["create_lead"],
+        "export": ["view_lead", "export_excel"],
         "destroy": ["delete_lead"],
-        "bulk_delete": ["delete_lead"],
+        "bulk_delete_action": ["delete_lead"],
+        "write": ["edit_lead"],
     }
 
     def filter_queryset(self, queryset):
@@ -590,7 +594,18 @@ class TaskViewSet(TenantModelViewSet):
         "update": ["edit_task"],
         "partial_update": ["edit_task"],
         "destroy": ["delete_task"],
+        "complete": ["view_task"],
     }
+
+    #: Holders of this see the whole team's tasks; everyone else sees the
+    #: tasks assigned to them (the record-level half of `view_task`).
+    TEAM_SCOPE_PERMISSION = "assign_task"
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if not has_permission(self.request.user, self.TEAM_SCOPE_PERMISSION):
+            queryset = queryset.filter(assignee=self.request.user)
+        return queryset
 
     def filter_queryset(self, queryset):
         queryset = super().filter_queryset(queryset)
@@ -978,6 +993,7 @@ class SourceViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = None
     ordering = ["name"]
+    permission_map = {"read": ["view_lead"], "write": ["manage_pipeline"]}
 
 
 class IndustryViewSet(TenantModelViewSet):
@@ -987,6 +1003,7 @@ class IndustryViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = None
     ordering = ["name"]
+    permission_map = {"read": ["view_lead"], "write": ["manage_pipeline"]}
 
 
 class LostReasonViewSet(TenantModelViewSet):
@@ -996,6 +1013,7 @@ class LostReasonViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = None
     ordering = ["name"]
+    permission_map = {"read": ["view_lead"], "write": ["manage_pipeline"]}
 
 
 # Hidden: User Tracking out of scope (Sweven spec) -- restore by uncommenting this block.

@@ -53,11 +53,11 @@ class TenantJWTAuthentication(JWTAuthentication):
         request.client_id = user.client_id
         set_current_client_id(user.client_id)
 
-        # Effective permissions are computed at login and cached on the token
-        # (db.md §2.2). Falling back to a live lookup keeps a token minted
-        # before a role change honest rather than stale.
-        cached = token.get(PERMISSIONS_CLAIM)
-        user.permission_ids = set(cached) if cached is not None else user.effective_permissions()
+        # Effective permissions are read from the database on every request,
+        # not from the token's `perms` claim: a claim would keep a revoked
+        # permission alive until the access token expired. The claim is still
+        # minted for clients that read it, but it is never trusted here.
+        user.permission_ids = user.effective_permissions()
         user.session_id = token.get("sid")
         return user, token
 

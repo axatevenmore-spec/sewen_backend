@@ -35,7 +35,12 @@ class AccountViewSet(TenantModelViewSet):
     serializer_class = AccountSerializer
     audit_entity_type = "Account"
     audit_label_field = "name"
-    required_permissions = ["view_ledger"]
+    permission_map = {
+        "read": ["view_ledger"],
+        # Setting up accounts, bank accounts, transfers and budgets posts to or
+        # shapes the ledger -- the accountant's permission, not a viewer's.
+        "write": ["manage_journal_entries"],
+    }
     status_field = None
     filter_map = {"type": "type", "subtype": "subtype", "isActive": "is_active"}
     search_fields = ["name", "code"]
@@ -74,7 +79,12 @@ class BankAccountViewSet(TenantModelViewSet):
     serializer_class = BankAccountSerializer
     audit_entity_type = "BankAccount"
     audit_label_field = "name"
-    required_permissions = ["view_bank_accounts"]
+    permission_map = {
+        "read": ["view_bank_accounts"],
+        # Setting up accounts, bank accounts, transfers and budgets posts to or
+        # shapes the ledger -- the accountant's permission, not a viewer's.
+        "write": ["manage_journal_entries"],
+    }
     status_field = None
     search_fields = ["name", "account_number", "bank_name"]
     ordering = ["-is_default", "name"]
@@ -123,7 +133,12 @@ class BankTransferViewSet(TenantModelViewSet):
     queryset = BankTransfer.objects.select_related("from_account", "to_account")
     serializer_class = BankTransferSerializer
     audit_entity_type = "BankTransfer"
-    required_permissions = ["view_bank_accounts"]
+    permission_map = {
+        "read": ["view_bank_accounts"],
+        # Setting up accounts, bank accounts, transfers and budgets posts to or
+        # shapes the ledger -- the accountant's permission, not a viewer's.
+        "write": ["manage_journal_entries"],
+    }
     status_field = None
     default_date_field = "transfer_date"
     ordering = ["-transfer_date"]
@@ -243,7 +258,12 @@ class BudgetViewSet(TenantModelViewSet):
     queryset = Budget.objects.select_related("account")
     serializer_class = BudgetSerializer
     audit_entity_type = "Budget"
-    required_permissions = ["view_financial_reports"]
+    permission_map = {
+        "read": ["view_financial_reports"],
+        # Setting up accounts, bank accounts, transfers and budgets posts to or
+        # shapes the ledger -- the accountant's permission, not a viewer's.
+        "write": ["manage_journal_entries"],
+    }
     status_field = None
     default_date_field = "period_start"
     ordering = ["-period_start"]
@@ -271,7 +291,12 @@ class ExpenseCategoryViewSet(TenantModelViewSet):
     serializer_class = ExpenseCategorySerializer
     audit_entity_type = "ExpenseCategory"
     audit_label_field = "name"
-    required_permissions = ["view_purchase"]
+    permission_map = {
+        "read": ["view_purchase"],
+        # Setting up accounts, bank accounts, transfers and budgets posts to or
+        # shapes the ledger -- the accountant's permission, not a viewer's.
+        "write": ["manage_journal_entries"],
+    }
     status_field = None
     ordering = ["name"]
 
