@@ -42,6 +42,7 @@ from apps.core.permissions import has_permission
 from apps.inventory import services as stock
 
 from .models import (
+    CHALLAN_SHIPPED_STATUSES,
     NON_RESERVING_STAGES,
     CashPaymentReceipt,
     DeliveryChallan,
@@ -680,7 +681,7 @@ def _already_dispatched(sales_order_line_id):
     return DeliveryChallanLine.objects.filter(
         sales_order_line_id=sales_order_line_id,
         deleted_at__isnull=True,
-        delivery_challan__status__in=["Dispatched", "In Transit", "Delivered"],
+        delivery_challan__status__in=CHALLAN_SHIPPED_STATUSES,
     ).exists()
 
 
@@ -773,6 +774,13 @@ def dispatch_challan(challan, *, user=None):
     )
 
     for line in lines:
+        # Fulfilment counts every order line shipped, stock-holding or not --
+        # a service or free-text line is delivered too, and skipping it here
+        # left the order stuck short of Delivered and open to re-dispatch.
+        # (Invoicing already counts every line; see _bump_order_invoiced_qty.)
+        if line.sales_order_line_id:
+            _bump_order_dispatched_qty(line)
+
         if line.item_id is None or not line.item.holds_stock:
             continue
 
@@ -800,9 +808,6 @@ def dispatch_challan(challan, *, user=None):
         )
         if resolved:
             stock.set_serial_status(resolved, "sold", movement=movement)
-
-        if line.sales_order_line_id:
-            _bump_order_dispatched_qty(line)
 
     challan.status = "Dispatched"
     challan.dispatch_date = challan.dispatch_date or timezone.localdate()

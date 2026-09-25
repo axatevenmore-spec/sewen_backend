@@ -425,3 +425,118 @@ class SalesInvoiceCashAllocationTests(TestCase):
         self.assertEqual(Decimal(str(data["totalSalesValue"])), Decimal("100000.00"))
         self.assertEqual(len(data["revisions"]), 1)
         self.assertEqual(data["revisions"][0]["revisionNumber"], 1)
+
+
+class SalesPipelineLinkTests(TestCase):
+    """The document chain the UI walks: every hop is linked and reaches the API."""
+
+    def setUp(self):
+        self.client_obj, _ = Client.objects.get_or_create(
+            slug="pipeline-tenant", defaults={"name": "Pipeline Tenant"}
+        )
+        seed_chart_of_accounts(self.client_obj)
+        self.user = User.objects.create_superuser(
+            email="pipeline_user@example.com",
+            password="password123",
+            client=self.client_obj,
+        )
+        self.party = Party.objects.create(
+            client=self.client_obj, code="CUST-PIPE", type="Customer", name="Pipe Co",
+        )
+        from apps.masters.models import Location
+        Location.objects.create(
+            client=self.client_obj, code="WH-PIPE", name="Main Warehouse",
+            type="Warehouse", is_active=True,
+        )
+        self.api = APIClient()
+        tokens = build_tokens(self.user)
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['access']}")
+
+    def _line(self, qty=2, rate=500):
+        # A free-text line: no item, so no stock is needed to dispatch it.
+        return {"description": "Fabricated MS table", "qty": qty, "rate": rate, "tax": 18}
+
+    def _post(self, url, data=None, expected=201):
+        resp = self.api.post(url, data or {}, format="json")
+        self.assertEqual(resp.status_code, expected, resp.content)
+        return resp.json()
+
+    def test_estimate_to_delivered_challan_chain(self):
+        estimate = self._post("/api/v1/sales/estimates/", {
+            "partyId": str(self.party.id), "date": str(date.today()),
+            "lineItems": [self._line()],
+        })
+
+        # A status-only PATCH must leave the lines alone.
+        resp = self.api.patch(
+            f"/api/v1/sales/estimates/{estimate['id']}/", {"status": "Sent"}, format="json"
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()["status"], "Sent")
+        self.assertEqual(len(resp.json()["lineItems"]), 1)
+
+        quotation = self._post(f"/api/v1/sales/estimates/{estimate['id']}/convert-to-quotation/")
+        self.assertEqual(quotation["estimate"], estimate["id"])
+        self.assertTrue(quotation["quotationNumber"].startswith("QT"))
+
+        order = self._post(f"/api/v1/sales/quotations/{quotation['id']}/convert-to-order/")
+        self.assertEqual(order["quotation"], quotation["id"])
+        resp = self.api.patch(
+            f"/api/v1/sales/orders/{order['id']}/", {"stage": "Confirmed"}, format="json"
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+        challan = self._post(f"/api/v1/sales/orders/{order['id']}/convert-to-challan/", {})
+        self.assertEqual(challan["salesOrder"], order["id"])
+        self.assertEqual(challan["status"], "Draft")
+
+        # Tracking a draft is refused: nothing has shipped.
+        self._post(
+            f"/api/v1/sales/challans/{challan['id']}/track/", {"status": "In Transit"}, expected=409
+        )
+
+        dispatched = self._post(f"/api/v1/sales/challans/{challan['id']}/dispatch/", expected=200)
+        self.assertEqual(dispatched["status"], "Dispatched")
+
+        for step in ("In Transit", "In Transit", "Out for Delivery", "Delivered"):
+            tracked = self._post(
+                f"/api/v1/sales/challans/{challan['id']}/track/", {"status": step}, expected=200
+            )
+            self.assertEqual(tracked["status"], step)
+        self.assertIsNotNone(tracked["deliveredAt"])
+
+        # Forward-only.
+        self._post(
+            f"/api/v1/sales/challans/{challan['id']}/track/", {"status": "In Transit"}, expected=409
+        )
+        self._post(
+            f"/api/v1/sales/challans/{challan['id']}/track/", {"status": "Shipped"}, expected=400
+        )
+
+        resp = self.api.get(f"/api/v1/sales/orders/{order['id']}/")
+        self.assertEqual(resp.json()["stage"], "Delivered")
+
+    def test_direct_documents_accept_their_upstream_links(self):
+        order = self._post("/api/v1/sales/orders/", {
+            "partyId": str(self.party.id), "date": str(date.today()),
+            "lineItems": [self._line()],
+        })
+        proforma = self._post("/api/v1/sales/proforma-invoices/", {
+            "partyId": str(self.party.id), "date": str(date.today()),
+            "salesOrder": order["id"], "lineItems": [self._line()],
+        })
+        self.assertEqual(proforma["salesOrder"], order["id"])
+
+        invoice = self._post(f"/api/v1/sales/proforma-invoices/{proforma['id']}/convert-to-invoice/")
+        self.assertEqual(invoice["proformaInvoiceId"], proforma["id"])
+        self.assertEqual(invoice["salesOrderId"], order["id"])
+        resp = self.api.get(f"/api/v1/sales/proforma-invoices/{proforma['id']}/")
+        self.assertEqual(resp.json()["status"], "Converted")
+
+        challan = self._post("/api/v1/sales/challans/", {
+            "partyId": str(self.party.id), "date": str(date.today()),
+            "salesOrder": order["id"], "transporter": "Blue Dart",
+            "vehicleNumber": "GJ05AB1234", "lineItems": [self._line()],
+        })
+        self.assertEqual(challan["salesOrder"], order["id"])
+        self.assertEqual(challan["vehicleNumber"], "GJ05AB1234")

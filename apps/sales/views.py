@@ -27,6 +27,7 @@ from apps.inventory import services as stock
 
 from . import services
 from .models import (
+    CHALLAN_SHIPPED_STATUSES,
     CashPaymentReceipt,
     DeliveryChallan,
     DeliveryChallanLine,
@@ -737,6 +738,42 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
     def dispatch_action(self, request, pk=None):
         challan = services.dispatch_challan(self.get_object(), user=request.user)
         self.write_audit("dispatch", challan, description="Challan dispatched")
+        return Response(self.get_serializer(challan).data)
+
+    @action(detail=True, methods=["post"])
+    def track(self, request, pk=None):
+        """``{ status }`` -- carrier progress after dispatch (the challan tracker).
+
+        A dispatched challan is otherwise read-only (drafts only), so moving it
+        on to In Transit / Out for Delivery / Delivered has its own endpoint.
+        Moves are forward-only; repeating the current status is a no-op.
+        """
+        challan = self.get_object()
+        target = request.data.get("status")
+        if target not in CHALLAN_SHIPPED_STATUSES:
+            raise ValidationFailed(
+                "Unknown tracking status.",
+                field_errors={"status": [f"Must be one of: {', '.join(CHALLAN_SHIPPED_STATUSES)}."]},
+            )
+        if challan.status not in CHALLAN_SHIPPED_STATUSES:
+            raise Conflict(
+                f"A {challan.status} challan has not been dispatched.",
+                code=Codes.BAD_TARGET,
+            )
+        if challan.status == target:
+            return Response(self.get_serializer(challan).data)
+        if CHALLAN_SHIPPED_STATUSES.index(target) < CHALLAN_SHIPPED_STATUSES.index(challan.status):
+            raise Conflict(
+                f"This challan is already {challan.status}.", code=Codes.BAD_TARGET
+            )
+
+        challan.status = target
+        update_fields = ["status", "updated_at"]
+        if target == "Delivered":
+            challan.delivered_at = timezone.now()
+            update_fields.append("delivered_at")
+        challan.save(update_fields=update_fields)
+        self.write_audit("track", challan, description=f"Marked {target}")
         return Response(self.get_serializer(challan).data)
 
     @action(detail=True, methods=["post"])

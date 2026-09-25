@@ -34,7 +34,12 @@ ORDER_STAGES = [
 NON_RESERVING_STAGES = ["Delivered", "Invoiced", "Cancelled"]
 PAYMENT_STATUSES = ["Unpaid", "Partially Paid", "Paid"]
 PROFORMA_STATUSES = ["Draft", "Sent", "Accepted", "Converted", "Expired", "Cancelled"]
-CHALLAN_STATUSES = ["Draft", "Dispatched", "In Transit", "Delivered", "Cancelled"]
+CHALLAN_STATUSES = [
+    "Draft", "Dispatched", "In Transit", "Out for Delivery", "Delivered", "Cancelled",
+]
+#: A challan in any of these has moved its stock (``dispatch_challan`` ran).
+#: In carrier order -- the challan tracker only ever moves forward through them.
+CHALLAN_SHIPPED_STATUSES = ["Dispatched", "In Transit", "Out for Delivery", "Delivered"]
 INVOICE_STATUSES = ["Draft", "Unpaid", "Partially Paid", "Paid", "Cancelled"]
 # The strings the UI's <select> actually emits (api.md §0: where code and
 # spec disagree, the frontend code is the fact). PaymentInPage, PaymentOutPage,
