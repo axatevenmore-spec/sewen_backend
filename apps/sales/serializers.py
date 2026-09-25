@@ -1,5 +1,9 @@
 """Sales serializers (api.md §5)."""
+from decimal import Decimal
+
 from rest_framework import serializers
+
+from apps.core.money import round2
 
 from apps.core.document_serializers import (
     HEADER_FIELDS,
@@ -21,6 +25,7 @@ from .models import (
     DeliveryChallanLine,
     Estimate,
     EstimateLine,
+    CashPaymentReceipt,
     PaymentAllocation,
     PaymentIn,
     ProformaInvoice,
@@ -30,6 +35,7 @@ from .models import (
     QuotationLine,
     SalesInvoice,
     SalesInvoiceLine,
+    SalesInvoiceRevision,
     SalesOrder,
     SalesOrderLine,
     SalesReturn,
@@ -137,13 +143,48 @@ class SalesOrderSerializer(DocumentSerializer):
     line_fk_name = "sales_order"
     line_table_name = "sales_order_lines"
 
+    totalSalesValue = MoneyField(source="total_sales_value", required=False, allow_null=True)
+    formalInvoiceAmount = MoneyField(source="formal_invoice_amount", required=False, allow_null=True)
+    cashAmount = MoneyField(source="cash_amount", required=False, allow_null=True)
+    invoice = serializers.SerializerMethodField()
+    cashReceipt = serializers.SerializerMethodField()
+
     class Meta:
         model = SalesOrder
         fields = HEADER_FIELDS + [
             "order_number", "stage", "payment_status", "delivery_date",
             "quotation", "pms_project", "reference_number",
+            "total_sales_value", "formal_invoice_amount", "cash_amount",
+            "totalSalesValue", "formalInvoiceAmount", "cashAmount",
+            "invoice", "cashReceipt",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["order_number", "payment_status"]
+
+    def get_invoice(self, order):
+        inv = order.invoices.filter(deleted_at__isnull=True).exclude(status="Cancelled").first()
+        if not inv:
+            return None
+        return {
+            "id": inv.id,
+            "invoiceNumber": inv.invoice_number,
+            "total": float(inv.total),
+            "status": inv.status,
+            "date": inv.doc_date.isoformat() if inv.doc_date else None,
+        }
+
+    def get_cashReceipt(self, order):
+        pmt = order.cash_receipts.filter(deleted_at__isnull=True).exclude(status="Cancelled").first()
+        if not pmt:
+            return None
+        return {
+            "id": pmt.id,
+            "receiptNumber": pmt.payment_number,
+            "amount": float(pmt.amount),
+            "date": pmt.payment_date.isoformat() if pmt.payment_date else None,
+            "mode": pmt.mode,
+            "reference": pmt.reference_number,
+            "status": pmt.status,
+        }
 
 
 class ConvertLinesSerializer(BaseSerializer):
@@ -194,6 +235,27 @@ class DeliveryChallanSerializer(DocumentSerializer):
 # ---------------------------------------------------------------------------
 # Sales invoices (api.md §5.7)
 # ---------------------------------------------------------------------------
+class SalesInvoiceRevisionSerializer(BaseModelSerializer):
+    revisionNumber = serializers.IntegerField(source="revision_number")
+    oldInvoiceAmount = MoneyField(source="old_invoice_amount")
+    newInvoiceAmount = MoneyField(source="new_invoice_amount")
+    oldCashAmount = MoneyField(source="old_cash_amount")
+    newCashAmount = MoneyField(source="new_cash_amount")
+    difference = MoneyField()
+    reason = serializers.CharField(allow_blank=True, required=False)
+    changedBy = serializers.CharField(source="changed_by.email", read_only=True)
+    changedAt = serializers.DateTimeField(source="changed_at", read_only=True)
+    cashReceiptNumber = serializers.CharField(source="cash_receipt.receipt_number", read_only=True)
+
+    class Meta:
+        model = SalesInvoiceRevision
+        fields = [
+            "id", "revisionNumber", "oldInvoiceAmount", "newInvoiceAmount",
+            "oldCashAmount", "newCashAmount", "difference", "reason",
+            "changedBy", "changedAt", "cashReceiptNumber",
+        ]
+
+
 class SalesInvoiceSerializer(DocumentSerializer):
     line_model = SalesInvoiceLine
     line_serializer = SalesInvoiceLineSerializer
@@ -203,11 +265,32 @@ class SalesInvoiceSerializer(DocumentSerializer):
     #: ``Overdue`` is layered on at read time, never stored (db.md §12).
     displayStatus = serializers.SerializerMethodField()
 
+    salesOrderId = TenantPrimaryKeyRelatedField(
+        source="sales_order", model="sales.SalesOrder", required=False, allow_null=True
+    )
+    deliveryChallanId = TenantPrimaryKeyRelatedField(
+        source="delivery_challan", model="sales.DeliveryChallan", required=False, allow_null=True
+    )
+    proformaInvoiceId = TenantPrimaryKeyRelatedField(
+        source="proforma_invoice", model="sales.ProformaInvoice", required=False, allow_null=True
+    )
+
+    totalSalesValue = MoneyField(source="total_sales_value", required=False, allow_null=True)
+    formalInvoiceAmount = MoneyField(source="total", read_only=True)
+    cashAmount = MoneyField(source="cash_amount", required=False)
+    totalAllocated = serializers.SerializerMethodField()
+    remainingAmount = serializers.SerializerMethodField()
+    revisions = SalesInvoiceRevisionSerializer(many=True, read_only=True)
+    cashReceipt = serializers.SerializerMethodField()
+
     class Meta:
         model = SalesInvoice
         fields = HEADER_FIELDS + [
             "invoice_number", "status", "displayStatus", "due_date",
             "sales_order", "delivery_challan", "proforma_invoice", "location",
+            "salesOrderId", "deliveryChallanId", "proformaInvoiceId",
+            "totalSalesValue", "formalInvoiceAmount", "cashAmount",
+            "totalAllocated", "remainingAmount", "revisions", "cashReceipt",
             "irn", "eway_bill_number",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["invoice_number", "status"]
@@ -215,10 +298,34 @@ class SalesInvoiceSerializer(DocumentSerializer):
     def get_displayStatus(self, invoice):
         return services.display_status(invoice)
 
+    def get_totalAllocated(self, invoice):
+        cash = invoice.cash_amount or Decimal("0.00")
+        return round2(invoice.total + cash)
+
+    def get_remainingAmount(self, invoice):
+        total_sales = invoice.total_sales_value if invoice.total_sales_value is not None else round2(invoice.total + (invoice.cash_amount or Decimal("0.00")))
+        allocated = round2(invoice.total + (invoice.cash_amount or Decimal("0.00")))
+        rem = round2(total_sales - allocated)
+        return rem if rem > Decimal("0.00") else Decimal("0.00")
+
+    def get_cashReceipt(self, invoice):
+        receipt = invoice.cash_receipts.filter(deleted_at__isnull=True).exclude(status__in=["CANCELLED", "VOIDED"]).first()
+        return CashPaymentReceiptSerializer(receipt, context=self.context).data if receipt else None
+
 
 class InvoiceOutstandingSerializer(BaseSerializer):
     total = MoneyField()
+    totalSalesValue = MoneyField(required=False)
+    formalInvoiceAmount = MoneyField(required=False)
+    cashAmount = MoneyField(required=False)
+    totalAllocated = MoneyField(required=False)
+    remaining = MoneyField(required=False)
+    taxableAmount = MoneyField(required=False)
+    gst = MoneyField(required=False)
     paid = MoneyField()
+    paidAgainstInvoice = MoneyField(required=False)
+    withoutBillCash = MoneyField(required=False)
+    totalReceived = MoneyField(required=False)
     outstanding = MoneyField()
     dueDate = serializers.DateField(allow_null=True)
     daysOverdue = serializers.IntegerField()
@@ -236,17 +343,57 @@ class PaymentAllocationSerializer(BaseModelSerializer):
         fields = ["id", "document_type", "documentId", "amount", "allocated_at"]
 
 
+class CashPaymentReceiptSerializer(BaseModelSerializer):
+    customerId = TenantPrimaryKeyRelatedField(source="party", model="masters.Party")
+    customerName = serializers.CharField(source="party.name", read_only=True)
+    paymentId = serializers.UUIDField(source="payment_id", read_only=True)
+    invoiceId = TenantPrimaryKeyRelatedField(
+        source="invoice", model="sales.SalesInvoice", required=False, allow_null=True
+    )
+    invoiceNumber = serializers.CharField(source="invoice.invoice_number", read_only=True)
+    receiptNumber = serializers.CharField(source="receipt_number", read_only=True)
+    date = serializers.DateField(source="payment_date")
+    paymentMode = serializers.CharField(source="mode")
+    referenceNumber = serializers.CharField(source="reference_number", required=False, allow_blank=True, allow_null=True)
+    createdBy = serializers.CharField(source="created_by.email", read_only=True)
+    cancelledBy = serializers.CharField(source="cancelled_by.email", read_only=True)
+    cancelledAt = serializers.DateTimeField(source="cancelled_at", read_only=True)
+    cancellationReason = serializers.CharField(source="cancellation_reason", read_only=True)
+
+    class Meta:
+        model = CashPaymentReceipt
+        fields = [
+            "id", "receiptNumber", "paymentId", "customerId", "customerName",
+            "invoiceId", "invoiceNumber", "amount", "date", "paymentMode",
+            "referenceNumber", "description", "notes", "status",
+            "createdBy", "cancelledBy", "cancelledAt", "cancellationReason",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "receiptNumber", "paymentId", "status", "createdBy", "cancelledBy",
+            "cancelledAt", "cancellationReason", "created_at", "updated_at",
+        ]
+
+
 class PaymentInSerializer(BaseModelSerializer):
     customerId = TenantPrimaryKeyRelatedField(source="party", model="masters.Party")
     customerName = serializers.CharField(source="party.name", read_only=True)
+    paymentType = serializers.CharField(source="payment_type", default="WITH_BILL")
     bankAccountId = TenantPrimaryKeyRelatedField(
         source="bank_account", model="accounting.BankAccount", required=False, allow_null=True
     )
     date = serializers.DateField(source="payment_date")
     allocations = serializers.SerializerMethodField()
     unallocatedAmount = serializers.SerializerMethodField()
-    #: Write-only: the target invoice(s) this payment settles.
-    invoiceId = serializers.CharField(required=False, allow_null=True, write_only=True)
+    cashReceipt = CashPaymentReceiptSerializer(source="cash_receipt", read_only=True)
+    invoiceId = TenantPrimaryKeyRelatedField(
+        source="invoice", model="sales.SalesInvoice", required=False, allow_null=True
+    )
+    invoiceNumber = serializers.CharField(source="invoice.invoice_number", read_only=True)
+    salesOrderId = TenantPrimaryKeyRelatedField(
+        source="sales_order", model="sales.SalesOrder", required=False, allow_null=True
+    )
+    salesOrderNumber = serializers.CharField(source="sales_order.order_number", read_only=True)
     allocationsInput = serializers.ListField(
         child=serializers.DictField(), required=False, write_only=True
     )
@@ -254,10 +401,10 @@ class PaymentInSerializer(BaseModelSerializer):
     class Meta:
         model = PaymentIn
         fields = [
-            "id", "payment_number", "customerId", "customerName", "date", "amount",
-            "mode", "bankAccountId", "reference_number", "notes",
-            "allocated_amount", "unallocatedAmount", "allocations", "status",
-            "invoiceId", "allocationsInput", "created_at", "updated_at",
+            "id", "payment_number", "paymentType", "customerId", "customerName", "date", "amount",
+            "mode", "bankAccountId", "reference_number", "description", "notes",
+            "allocated_amount", "unallocatedAmount", "allocations", "cashReceipt", "status",
+            "invoiceId", "invoiceNumber", "salesOrderId", "salesOrderNumber", "allocationsInput", "created_at", "updated_at",
         ]
         read_only_fields = [
             "payment_number", "allocated_amount", "status", "created_at", "updated_at",

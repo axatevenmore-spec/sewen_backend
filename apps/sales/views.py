@@ -27,6 +27,7 @@ from apps.inventory import services as stock
 
 from . import services
 from .models import (
+    CashPaymentReceipt,
     DeliveryChallan,
     DeliveryChallanLine,
     Estimate,
@@ -47,6 +48,7 @@ from .models import (
 )
 from .serializers import (
     AllocateSerializer,
+    CashPaymentReceiptSerializer,
     ConvertLinesSerializer,
     DeliveryChallanSerializer,
     EstimateSerializer,
@@ -445,6 +447,24 @@ class SalesOrderViewSet(SalesDocumentViewSet):
         # which is what "releases the reservation" means here.
         self.write_audit("cancel", order, description=reason)
         return Response(self.get_serializer(order).data)
+
+    @action(detail=True, methods=["post"], url_path="allocate-split")
+    def allocate_split(self, request, pk=None):
+        order = self.get_object()
+        formal_amt = request.data.get("formalInvoiceAmount")
+        cash_amt = request.data.get("cashAmount")
+        total_val = request.data.get("totalSalesValue")
+
+        if total_val is not None:
+            order.total_sales_value = Decimal(str(total_val))
+        if formal_amt is not None:
+            order.formal_invoice_amount = Decimal(str(formal_amt))
+        if cash_amt is not None:
+            order.cash_amount = Decimal(str(cash_amt))
+
+        order.save(update_fields=["total_sales_value", "formal_invoice_amount", "cash_amount", "updated_at"])
+        self.write_audit("update", order, description="Updated Sales Order split allocation")
+        return Response(self.get_serializer(order).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["get"])
     def fulfilment(self, request, pk=None):
@@ -864,6 +884,7 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
         "write": ["create_invoice"],
         "finalize": ["finalize_invoice"],
         "cancel": ["cancel_invoice"],
+        "allocate_split": ["create_invoice"],
     }
 
     def filter_queryset(self, queryset):
@@ -893,6 +914,19 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
     def perform_create(self, serializer):
         """``POST /sales/invoices/`` -- Draft unless ``{ finalize: true }``."""
         invoice = super().perform_create(serializer)
+        formal_amount = self.request.data.get("formalInvoiceAmount") or self.request.data.get("formal_invoice_amount")
+        cash_amount = self.request.data.get("cashReceiptAmount") or self.request.data.get("cashAmount") or self.request.data.get("cash_amount")
+        total_sales = self.request.data.get("totalSalesValue") or self.request.data.get("total_sales_value")
+        if formal_amount is not None or cash_amount is not None or total_sales is not None:
+            invoice = services.update_sales_allocation(
+                invoice,
+                formal_invoice_amount=formal_amount,
+                cash_amount=cash_amount,
+                total_sales_value=total_sales,
+                reason="Initial allocation",
+                user=self.request.user,
+            )
+
         if self.request.data.get("finalize"):
             services.finalize_invoice(
                 invoice,
@@ -901,6 +935,41 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
             )
             invoice.refresh_from_db()
         return invoice
+
+    def perform_update(self, serializer):
+        invoice = super().perform_update(serializer)
+        formal_amount = self.request.data.get("formalInvoiceAmount") or self.request.data.get("formal_invoice_amount")
+        cash_amount = self.request.data.get("cashReceiptAmount") or self.request.data.get("cashAmount") or self.request.data.get("cash_amount")
+        total_sales = self.request.data.get("totalSalesValue") or self.request.data.get("total_sales_value")
+        reason = self.request.data.get("reason")
+        if formal_amount is not None or cash_amount is not None or total_sales is not None:
+            invoice = services.update_sales_allocation(
+                invoice,
+                formal_invoice_amount=formal_amount,
+                cash_amount=cash_amount,
+                total_sales_value=total_sales,
+                reason=reason,
+                user=self.request.user,
+            )
+        return invoice
+
+    @action(detail=True, methods=["post"], url_path="allocate-split")
+    def allocate_split(self, request, pk=None):
+        invoice = self.get_object()
+        formal_amount = request.data.get("formalInvoiceAmount") or request.data.get("formal_invoice_amount")
+        cash_amount = request.data.get("cashReceiptAmount") or request.data.get("cashAmount") or request.data.get("cash_amount")
+        total_sales = request.data.get("totalSalesValue") or request.data.get("total_sales_value")
+        reason = request.data.get("reason")
+        invoice = services.update_sales_allocation(
+            invoice,
+            formal_invoice_amount=formal_amount,
+            cash_amount=cash_amount,
+            total_sales_value=total_sales,
+            reason=reason,
+            user=request.user,
+        )
+        self.write_audit("allocate_split", invoice, description=reason or "Updated sales invoice/cash allocation")
+        return Response(self.get_serializer(invoice).data)
 
     @action(detail=True, methods=["post"])
     def finalize(self, request, pk=None):
@@ -960,6 +1029,8 @@ class PaymentInViewSet(TenantModelViewSet):
         rows = queryset.aggregate(
             count=Count("id"),
             totalReceived=money_sum("amount"),
+            withBillPayments=money_sum("amount", filter=Q(payment_type="WITH_BILL")),
+            withoutBillCash=money_sum("amount", filter=Q(payment_type="WITHOUT_BILL")),
             allocated=money_sum("allocated_amount"),
         )
         rows["unallocated"] = round2(rows["totalReceived"] - rows["allocated"])
@@ -968,6 +1039,13 @@ class PaymentInViewSet(TenantModelViewSet):
     @transaction.atomic
     def perform_create(self, serializer):
         data = serializer.validated_data
+        payment_type = (
+            self.request.data.get("paymentType")
+            or self.request.data.get("payment_type")
+            or data.get("payment_type")
+            or "WITH_BILL"
+        )
+        description = self.request.data.get("description") or data.get("description")
         allocations = self.request.data.get("allocations") or []
         invoice_id = self.request.data.get("invoiceId")
         invoice = None
@@ -975,7 +1053,7 @@ class PaymentInViewSet(TenantModelViewSet):
             invoice = SalesInvoice.objects.filter(
                 pk=invoice_id, client_id=self.get_client_id(), deleted_at__isnull=True
             ).first()
-            if invoice is None:
+            if invoice is None and payment_type == "WITH_BILL":
                 raise NotFound("That invoice no longer exists.")
 
         payment = services.record_payment_in(
@@ -984,8 +1062,10 @@ class PaymentInViewSet(TenantModelViewSet):
             amount=data["amount"],
             payment_date=data["payment_date"],
             mode=data["mode"],
+            payment_type=payment_type,
             bank_account=data.get("bank_account"),
             reference_number=data.get("reference_number"),
+            description=description,
             notes=data.get("notes"),
             allocations=allocations,
             invoice=invoice,
@@ -1026,6 +1106,86 @@ class PaymentInViewSet(TenantModelViewSet):
         )
         page = self.paginate_queryset(queryset)
         return self.get_paginated_response(self.get_serializer(page, many=True).data)
+
+
+# ---------------------------------------------------------------------------
+# Cash Payment Receipts (Without Bill / Cash)
+# ---------------------------------------------------------------------------
+class CashPaymentReceiptViewSet(TenantModelViewSet):
+    queryset = CashPaymentReceipt.objects.select_related("party", "invoice", "created_by", "cancelled_by")
+    serializer_class = CashPaymentReceiptSerializer
+    audit_entity_type = "CashPaymentReceipt"
+    audit_label_field = "receipt_number"
+    status_field = "status"
+    default_date_field = "payment_date"
+    search_fields = ["receipt_number", "reference_number", "party__name", "description"]
+    ordering = ["-payment_date", "-created_at"]
+    filter_map = {"customerId": "party_id", "mode": "mode", "status": "status", "invoiceId": "invoice_id"}
+    permission_map = {"read": ["view_sales"], "write": ["record_payment_in"]}
+
+    def get_aggregates(self, queryset):
+        rows = queryset.aggregate(
+            count=Count("id"),
+            totalAmount=money_sum("amount"),
+            receivedCount=Count("id", filter=Q(status="RECEIVED")),
+            cancelledCount=Count("id", filter=Q(status="CANCELLED")),
+            voidedCount=Count("id", filter=Q(status="VOIDED")),
+        )
+        return rows
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        data = serializer.validated_data
+        invoice = data.get("invoice")
+        party = data.get("party")
+        amount = data.get("amount")
+        payment_date = data.get("payment_date")
+        mode = data.get("mode") or "Cash"
+        description = data.get("description") or "Cash Payment Receipt"
+        notes = data.get("notes")
+        reference_number = data.get("reference_number")
+
+        payment = services.record_payment_in(
+            client=self.get_client(),
+            party=party,
+            amount=amount,
+            payment_date=payment_date,
+            mode=mode,
+            payment_type="WITHOUT_BILL",
+            invoice=invoice,
+            description=description,
+            notes=notes,
+            reference_number=reference_number,
+            user=self.request.user,
+        )
+        serializer.instance = payment.cash_receipt
+        return payment.cash_receipt
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        serializer = ReasonSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        receipt = services.cancel_cash_receipt(
+            self.get_object(),
+            reason=serializer.validated_data.get("reason"),
+            user=request.user,
+            void=False,
+        )
+        self.write_audit("cancel", receipt, description=serializer.validated_data.get("reason"))
+        return Response(self.get_serializer(receipt).data)
+
+    @action(detail=True, methods=["post"])
+    def void(self, request, pk=None):
+        serializer = ReasonSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        receipt = services.cancel_cash_receipt(
+            self.get_object(),
+            reason=serializer.validated_data.get("reason"),
+            user=request.user,
+            void=True,
+        )
+        self.write_audit("void", receipt, description=serializer.validated_data.get("reason"))
+        return Response(self.get_serializer(receipt).data)
 
 
 # ---------------------------------------------------------------------------

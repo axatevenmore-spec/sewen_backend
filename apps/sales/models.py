@@ -195,6 +195,9 @@ class SalesOrder(DocumentHeader):
         "pms.Project", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     reference_number = models.TextField(null=True, blank=True)
+    total_sales_value = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    formal_invoice_amount = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    cash_amount = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
 
     class Meta:
         db_table = "sales_orders"
@@ -366,6 +369,9 @@ class SalesInvoice(DocumentHeader):
     )
     irn = models.TextField(null=True, blank=True)
     eway_bill_number = models.TextField(null=True, blank=True)
+    total_sales_value = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    cash_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    original_items = models.JSONField(null=True, blank=True, default=list)
 
     class Meta:
         db_table = "sales_invoices"
@@ -399,6 +405,9 @@ class SalesInvoiceLine(DocumentLine):
     )
     #: DERIVED -- how much of this line has come back on a credit note.
     returned_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    original_rate = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    original_amount = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    original_line_total = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
 
     class Meta(DocumentLine.Meta):
         db_table = "sales_invoice_lines"
@@ -410,6 +419,41 @@ class SalesInvoiceLine(DocumentLine):
                 condition=models.Q(returned_qty__lte=models.F("qty")), name="ck_sil_returned"
             ),
         ]
+
+
+class SalesInvoiceRevision(TenantModel):
+    """Preserves history of Sales Invoice / Cash Receipt allocation revisions (api.md §5.7)."""
+
+    invoice = models.ForeignKey(
+        SalesInvoice, on_delete=models.CASCADE, related_name="revisions"
+    )
+    cash_receipt = models.ForeignKey(
+        "CashPaymentReceipt", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    revision_number = models.PositiveIntegerField(default=1)
+    old_invoice_amount = models.DecimalField(max_digits=18, decimal_places=2)
+    new_invoice_amount = models.DecimalField(max_digits=18, decimal_places=2)
+    old_cash_amount = models.DecimalField(max_digits=18, decimal_places=2)
+    new_cash_amount = models.DecimalField(max_digits=18, decimal_places=2)
+    difference = models.DecimalField(max_digits=18, decimal_places=2)
+    reason = models.TextField(null=True, blank=True)
+    changed_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    changed_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "sales_invoice_revisions"
+        ordering = ["revision_number", "changed_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["invoice", "revision_number"],
+                name="uq_sales_invoice_revision_number",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.invoice} Rev {self.revision_number}"
 
 
 # ---------------------------------------------------------------------------
@@ -426,6 +470,17 @@ class PaymentIn(TenantModel, LegacyIdMixin):
     )
     reference_number = models.TextField(null=True, blank=True)
     notes = models.TextField(null=True, blank=True)
+    description = models.TextField(null=True, blank=True)
+    payment_type = models.TextField(
+        choices=[("WITH_BILL", "With Bill"), ("WITHOUT_BILL", "Without Bill / Cash")],
+        default="WITH_BILL",
+    )
+    invoice = models.ForeignKey(
+        "SalesInvoice", null=True, blank=True, on_delete=models.SET_NULL, related_name="payments"
+    )
+    sales_order = models.ForeignKey(
+        "SalesOrder", null=True, blank=True, on_delete=models.SET_NULL, related_name="cash_receipts"
+    )
     #: DERIVED from payment_allocations. The unallocated remainder *is* the
     #: customer advance -- there is no separate balance column (db.md §5.4).
     allocated_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
@@ -503,6 +558,56 @@ class PaymentAllocation(TenantModel):
             models.Index(fields=["document_type", "document_id"], name="ix_payment_alloc_doc"),
             models.Index(fields=["payment_side", "payment_id"], name="ix_payment_alloc_payment"),
         ]
+
+
+class CashPaymentReceipt(TenantModel, LegacyIdMixin):
+    """Cash / Unbilled Payment Receipt (without GST tax invoice)."""
+
+    STATUS_CHOICES = [
+        ("RECEIVED", "Received"),
+        ("CANCELLED", "Cancelled"),
+        ("VOIDED", "Voided"),
+    ]
+
+    receipt_number = models.TextField()
+    payment = models.OneToOneField(
+        PaymentIn, on_delete=models.CASCADE, related_name="cash_receipt", null=True, blank=True
+    )
+    party = models.ForeignKey("masters.Party", on_delete=models.PROTECT, related_name="cash_receipts")
+    invoice = models.ForeignKey(
+        "SalesInvoice", null=True, blank=True, on_delete=models.SET_NULL, related_name="cash_receipts"
+    )
+    amount = models.DecimalField(max_digits=18, decimal_places=2)
+    payment_date = models.DateField()
+    mode = models.TextField(choices=choices(PAYMENT_MODES), default="Cash")
+    reference_number = models.TextField(null=True, blank=True)
+    description = models.TextField(null=True, blank=True)
+    notes = models.TextField(null=True, blank=True)
+    status = models.TextField(choices=STATUS_CHOICES, default="RECEIVED")
+    created_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    cancelled_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    cancellation_reason = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "cash_payment_receipts"
+        ordering = ["-payment_date", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "receipt_number"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_cash_receipt_number",
+            ),
+            models.CheckConstraint(condition=models.Q(amount__gt=0), name="ck_cash_receipt_amount"),
+        ]
+
+    def __str__(self):
+        return self.receipt_number
+
 
 
 # ---------------------------------------------------------------------------

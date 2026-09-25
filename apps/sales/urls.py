@@ -14,6 +14,7 @@ router.register(
 router.register("challans", views.DeliveryChallanViewSet, basename="sales-challans")
 router.register("invoices", views.SalesInvoiceViewSet, basename="sales-invoices")
 router.register("payments", views.PaymentInViewSet, basename="sales-payments")
+router.register("cash-receipts", views.CashPaymentReceiptViewSet, basename="sales-cash-receipts")
 router.register("returns", views.SalesReturnViewSet, basename="sales-returns")
 router.register("warranties", views.WarrantyCardViewSet, basename="sales-warranties")
 

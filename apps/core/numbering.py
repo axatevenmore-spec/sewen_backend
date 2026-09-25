@@ -25,6 +25,7 @@ SERIES_DEFAULTS = {
     "INV": ("INV", "fy", 4, "-"),
     "DC": ("DC", "fy", 4, "-"),
     "PAY-IN": ("PAY-IN", "fy", 4, "-"),
+    "CPR": ("CPR", "fy", 4, "-"),
     "SR": ("SR", "fy", 4, "-"),
     "WC": ("WC", "fy", 5, "-"),
     # Purchase
