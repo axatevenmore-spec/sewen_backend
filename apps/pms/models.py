@@ -391,6 +391,8 @@ class ProofShare(TenantModel):
     token_hash = models.TextField(unique=True)
     recipient_name = models.TextField(null=True, blank=True)
     recipient_email = models.EmailField(null=True, blank=True)
+    #: The PM's covering note, shown to the client above the drawing.
+    message = models.TextField(null=True, blank=True)
     status = models.TextField(choices=STATUSES, default="Active")
     decision = models.TextField(choices=DECISIONS, null=True, blank=True)
     decided_at = models.DateTimeField(null=True, blank=True)
@@ -405,6 +407,32 @@ class ProofShare(TenantModel):
     class Meta:
         db_table = "pms_proof_shares"
         ordering = ["-created_at"]
+
+
+class DocumentComment(TenantModel):
+    """The review thread on one proof version, shared by the team and the client.
+
+    Staff post from the Design Proofs tab; the client posts through the approval
+    link, so the author is text (``author_name``) with the user FK only when an
+    account wrote it. ``page`` pins a note to a sheet of a multi-page drawing.
+    """
+
+    AUTHOR_TYPES = [("Staff", "Staff"), ("Client", "Client")]
+
+    document = models.ForeignKey(Document, on_delete=models.CASCADE, related_name="review_comments")
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="document_comments")
+    share = models.ForeignKey(
+        ProofShare, null=True, blank=True, on_delete=models.SET_NULL, related_name="comments"
+    )
+    author_type = models.TextField(choices=AUTHOR_TYPES, default="Staff")
+    author_name = models.TextField(null=True, blank=True)
+    page = models.PositiveIntegerField(null=True, blank=True)
+    text = models.TextField()
+
+    class Meta:
+        db_table = "pms_document_comments"
+        ordering = ["created_at"]
+        indexes = [models.Index(fields=["document", "created_at"], name="ix_pms_doc_comments")]
 
 
 # ---------------------------------------------------------------------------

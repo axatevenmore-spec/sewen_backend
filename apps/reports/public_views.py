@@ -206,6 +206,7 @@ class PublicProofView(PublicView):
 
         document = share.document
         project = share.project
+        order = project.sales_order
         return Response(
             {
                 "company": company_payload(share.client_id, request),
@@ -214,6 +215,13 @@ class PublicProofView(PublicView):
                     "code": project.code,
                     "customerName": project.customer_name,
                     "productName": project.product_name,
+                    # What the client is signing off: the product as ordered.
+                    "specifications": project.specifications,
+                    "orderValue": project.order_value,
+                    "quantity": project.quantity,
+                    "orderNumber": order.order_number if order else None,
+                    "expectedCompletionDate": project.expected_completion_date,
+                    "items": _order_items(order),
                 },
                 "stage": {
                     "id": str(document.stage_id),
@@ -230,11 +238,69 @@ class PublicProofView(PublicView):
                     "comments": document.comments,
                 },
                 "recipientName": share.recipient_name,
+                "message": share.message,
+                "createdBy": getattr(share.created_by, "name", None),
                 "decision": share.decision,
                 "decidedAt": share.decided_at,
+                "decidedBy": share.decided_by,
+                "revisionReason": share.revision_reason,
                 "canDecide": share.decision is None,
                 "expiresAt": share.expires_at,
+                "comments": _comment_rows(document),
             }
+        )
+
+
+def _order_items(order):
+    """The order lines as the client sees them -- product and quantity, no pricing."""
+    if order is None:
+        return []
+    return [
+        {
+            "name": line.item_name,
+            "description": line.description,
+            "qty": line.qty,
+            "uom": line.uom,
+        }
+        for line in order.line_items.filter(deleted_at__isnull=True).order_by("line_no")
+    ]
+
+
+def _comment_rows(document):
+    from apps.pms.serializers import DocumentCommentSerializer
+
+    rows = document.review_comments.filter(deleted_at__isnull=True)
+    return DocumentCommentSerializer(rows, many=True).data
+
+
+class PublicProofCommentView(PublicWriteView):
+    """``GET/POST /public/pms/approve/{token}/comments/`` -- the client's side of
+    the proof review thread. Open while the link is live, decided or not."""
+
+    def get(self, request, token):
+        share = _resolve_proof_share(token)
+        return Response({"results": _comment_rows(share.document)})
+
+    def post(self, request, token):
+        from apps.pms.models import DocumentComment
+        from apps.pms.serializers import PostDocumentCommentSerializer
+
+        share = _resolve_proof_share(token)
+        serializer = PostDocumentCommentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        DocumentComment.objects.create(
+            client_id=share.client_id,
+            document=share.document,
+            project=share.project,
+            share=share,
+            author_type="Client",
+            author_name=(data.get("authorName") or "").strip() or share.recipient_name or "Client",
+            page=data.get("page"),
+            text=data["text"],
+        )
+        return Response(
+            {"results": _comment_rows(share.document)}, status=status.HTTP_201_CREATED
         )
 
 

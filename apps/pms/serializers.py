@@ -19,6 +19,7 @@ from .models import (
     Delay,
     Department,
     Document,
+    DocumentComment,
     Project,
     ProjectStage,
     ProofShare,
@@ -480,8 +481,28 @@ class LogDelaySerializer(BaseSerializer):
 
 class ShareProofSerializer(BaseSerializer):
     recipientName = serializers.CharField(required=False, allow_blank=True, allow_null=True)
-    recipientEmail = serializers.EmailField(required=False, allow_null=True)
+    # Optional in the share form, which sends "" when left empty.
+    recipientEmail = serializers.EmailField(required=False, allow_blank=True, allow_null=True)
     expiryDays = serializers.IntegerField(required=False, default=14, min_value=1, max_value=365)
+    message = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+
+class DocumentCommentSerializer(BaseModelSerializer):
+    """One note in a proof's review thread (staff or client)."""
+
+    documentId = serializers.CharField(source="document_id", read_only=True)
+    author = serializers.CharField(source="author_name", read_only=True)
+    authorType = serializers.CharField(source="author_type", read_only=True)
+
+    class Meta:
+        model = DocumentComment
+        fields = ["id", "documentId", "author", "authorType", "page", "text", "created_at"]
+
+
+class PostDocumentCommentSerializer(BaseSerializer):
+    text = serializers.CharField(max_length=4000, trim_whitespace=True)
+    page = serializers.IntegerField(required=False, allow_null=True, min_value=1)
+    authorName = serializers.CharField(required=False, allow_blank=True, allow_null=True, max_length=200)
 
 
 class ProofShareSerializer(BaseModelSerializer):
@@ -500,7 +521,7 @@ class ProofShareSerializer(BaseModelSerializer):
         model = ProofShare
         fields = [
             "id", "documentId", "projectId", "recipientName", "recipientEmail",
-            "status", "decision", "decidedAt", "decidedBy", "decisionComments",
+            "message", "status", "decision", "decidedAt", "decidedBy", "decisionComments",
             "revisionReason", "openedAt", "expiresAt", "revoked_at",
             "revoked_reason", "created_at",
         ]

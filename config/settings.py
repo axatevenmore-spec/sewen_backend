@@ -204,6 +204,8 @@ CORS_ALLOW_HEADERS = (
     "x-requested-with",
     "idempotency-key",
     "if-unmodified-since",
+    # The proof viewer probes a signed file URL with a 1-byte Range GET.
+    "range",
 )
 CORS_EXPOSE_HEADERS = ("last-modified", "idempotency-replayed")
 

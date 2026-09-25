@@ -50,6 +50,11 @@ public_urlpatterns = [
         public_views.PublicProofDecisionView.as_view(),
         name="public-proof-decide",
     ),
+    path(
+        "pms/approve/<str:token>/comments/",
+        public_views.PublicProofCommentView.as_view(),
+        name="public-proof-comments",
+    ),
     # Public lead forms (api.md §9.7)
     path(
         "forms/<slug:slug>/",

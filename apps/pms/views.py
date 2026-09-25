@@ -33,6 +33,7 @@ from .models import (
     Delay,
     Department,
     Document,
+    DocumentComment,
     Project,
     ProjectStage,
     ProofShare,
@@ -47,11 +48,13 @@ from .serializers import (
     DecideSerializer,
     DelaySerializer,
     DepartmentSerializer,
+    DocumentCommentSerializer,
     DocumentSerializer,
     FromOrderSerializer,
     HandoffSerializer,
     LogDelaySerializer,
     PmsSettingsSerializer,
+    PostDocumentCommentSerializer,
     ProgressSerializer,
     ProjectDetailSerializer,
     ProjectListSerializer,
@@ -449,6 +452,8 @@ class ProjectViewSet(TenantModelViewSet):
         "write": ["create_pms_project"],
         "complete": ["complete_project"],
         "apply_stage_template": ["assign_stage"],
+        # Anyone who can see the project can take part in its proof review.
+        "document_comments": ["view_pms"],
     }
     #: The UI uses ``code`` in URLs, so both a uuid and a code resolve.
     lookup_value_regex = "[^/]+"
@@ -1461,7 +1466,8 @@ class ProjectViewSet(TenantModelViewSet):
             project=project,
             token_hash=hash_token(token),
             recipient_name=data.get("recipientName"),
-            recipient_email=data.get("recipientEmail"),
+            recipient_email=data.get("recipientEmail") or None,
+            message=(data.get("message") or "").strip() or None,
             expires_at=timezone.now() + timedelta(days=data["expiryDays"]),
             created_by=request.user,
         )
@@ -1474,6 +1480,37 @@ class ProjectViewSet(TenantModelViewSet):
             },
             status=status.HTTP_201_CREATED,
         )
+
+
+    @action(
+        detail=True,
+        methods=["get", "post"],
+        url_path=r"documents/(?P<doc_id>[^/.]+)/comments",
+    )
+    def document_comments(self, request, pk=None, doc_id=None):
+        """The review thread on one proof version -- the same thread the client
+        writes to through the approval link (``/public/pms/approve/{token}/comments/``)."""
+        project = self.get_object()
+        document = project.documents.filter(pk=doc_id, deleted_at__isnull=True).first()
+        if document is None:
+            raise NotFound("That document no longer exists.")
+
+        if request.method == "POST":
+            serializer = PostDocumentCommentSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            DocumentComment.objects.create(
+                client_id=request.client_id,
+                document=document,
+                project=project,
+                author_type="Staff",
+                author_name=getattr(request.user, "name", None) or request.user.email,
+                page=serializer.validated_data.get("page"),
+                text=serializer.validated_data["text"],
+                created_by=request.user,
+            )
+
+        rows = document.review_comments.filter(deleted_at__isnull=True)
+        return Response(envelope(DocumentCommentSerializer(rows, many=True).data))
 
 
 @transaction.atomic

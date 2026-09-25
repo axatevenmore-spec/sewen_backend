@@ -148,3 +148,104 @@ class StagePercentageCalculationTests(TestCase):
         project.refresh_from_db()
         # 100 * 0.8 = 80%
         self.assertEqual(project.overall_completion_pct, 80)
+
+
+class ProofShareReviewTests(TestCase):
+    """Generate Link → client opens it, comments, decides; the team sees the thread."""
+
+    def setUp(self):
+        from rest_framework.test import APIClient
+
+        from apps.accounts.authentication import build_tokens
+        from apps.core.models import File
+        from apps.pms.models import Document
+
+        self.client_obj, _ = Client.objects.get_or_create(
+            slug="proof-tenant", defaults={"name": "Proof Tenant"}
+        )
+        self.user = User.objects.create_superuser(
+            email="proof_pm@example.com", password="pass-12345", client=self.client_obj,
+        )
+        self.project = Project.objects.create(
+            client=self.client_obj, code="PRJ-PROOF-001", customer_name="Acme Engineering",
+            product_name="Belt Conveyor 6m", specifications="SS-304 frame, 600 mm belt",
+            quantity=Decimal("2"), order_value=Decimal("321095.70"), status="In Progress",
+        )
+        stage = ProjectStage.objects.create(
+            client=self.client_obj, project=self.project, name="Design & Drawing", sequence=1,
+        )
+        file_row = File.objects.create(
+            client=self.client_obj, storage_key="proof-tests/drawing.pdf",
+            file_name="drawing.pdf", content_type="application/pdf", status="committed",
+        )
+        self.document = Document.objects.create(
+            client=self.client_obj, project=self.project, stage=stage, doc_key="drawing",
+            version=1, file=file_row, file_name="drawing.pdf", is_proof=True,
+        )
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {build_tokens(self.user)['access']}")
+        self.public = APIClient()
+
+    def _share(self, **extra):
+        resp = self.api.post(
+            f"/api/v1/pms/projects/{self.project.code}/documents/{self.document.id}/share/",
+            {"recipientName": "Rhea Shah", "recipientEmail": "", "expiryDays": 7, **extra},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        return resp.json()["token"]
+
+    def test_link_without_email_carries_note_and_product(self):
+        token = self._share(message="Please confirm the bracket positions.")
+        resp = self.public.get(f"/api/v1/public/pms/approve/{token}/")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        body = resp.json()
+        self.assertEqual(body["message"], "Please confirm the bracket positions.")
+        self.assertEqual(body["project"]["productName"], "Belt Conveyor 6m")
+        self.assertEqual(body["project"]["specifications"], "SS-304 frame, 600 mm belt")
+        self.assertEqual(body["project"]["items"], [])
+        self.assertTrue(body["canDecide"])
+        self.assertEqual(body["comments"], [])
+
+    def test_client_and_team_share_one_comment_thread(self):
+        token = self._share()
+        resp = self.public.post(
+            f"/api/v1/public/pms/approve/{token}/comments/",
+            {"text": "Can the guard rail be 50 mm higher?", "page": 1},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        thread = resp.json()["results"]
+        self.assertEqual(len(thread), 1)
+        self.assertEqual(thread[0]["authorType"], "Client")
+        self.assertEqual(thread[0]["author"], "Rhea Shah")
+
+        staff_url = f"/api/v1/pms/projects/{self.project.code}/documents/{self.document.id}/comments/"
+        resp = self.api.post(staff_url, {"text": "Yes — revised in v2."}, format="json")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        thread = resp.json()["results"]
+        self.assertEqual([c["authorType"] for c in thread], ["Client", "Staff"])
+
+        resp = self.public.get(f"/api/v1/public/pms/approve/{token}/comments/")
+        self.assertEqual(len(resp.json()["results"]), 2)
+
+        resp = self.public.post(
+            f"/api/v1/public/pms/approve/{token}/comments/", {"text": "   "}, format="json"
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_client_rejects_with_reason(self):
+        token = self._share()
+        resp = self.public.post(
+            f"/api/v1/public/pms/approve/{token}/decide/",
+            {"decision": "Need Improvement", "decidedBy": "Rhea Shah",
+             "revisionReason": "Raise the guard rail by 50 mm."},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        body = self.public.get(f"/api/v1/public/pms/approve/{token}/").json()
+        self.assertEqual(body["decision"], "Need Improvement")
+        self.assertEqual(body["revisionReason"], "Raise the guard rail by 50 mm.")
+        self.assertFalse(body["canDecide"])
+        self.document.refresh_from_db()
+        self.assertEqual(self.document.approval_status, "Need Improvement")
