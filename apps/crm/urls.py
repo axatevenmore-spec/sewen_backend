@@ -11,19 +11,21 @@ router.register("deal-stages", views.DealStageViewSet, basename="crm-deal-stages
 router.register("stage-tasks", views.StageTaskViewSet, basename="crm-stage-tasks")
 router.register("master-tasks", views.MasterTaskViewSet, basename="crm-master-tasks")
 router.register("tasks", views.TaskViewSet, basename="crm-tasks")
-router.register(
-    "task-allocations", views.TaskAllocationViewSet, basename="crm-task-allocations"
-)
+# Hidden: Task Allocation duplicates CRM Tasks
+# router.register(
+#     "task-allocations", views.TaskAllocationViewSet, basename="crm-task-allocations"
+# )
 router.register("deals", views.DealViewSet, basename="crm-deals")
 router.register("contracts", views.ContractViewSet, basename="crm-contracts")
 router.register("projects", views.CrmProjectViewSet, basename="crm-projects")
 router.register("sources", views.SourceViewSet, basename="crm-sources")
 router.register("industries", views.IndustryViewSet, basename="crm-industries")
 router.register("lost-reasons", views.LostReasonViewSet, basename="crm-lost-reasons")
-router.register(
-    "user-allocations", views.UserAllocationViewSet, basename="crm-user-allocations"
-)
-router.register("user-locations", views.UserLocationViewSet, basename="crm-user-locations")
+# Hidden: User Tracking & field GPS map out of scope (Sweven spec)
+# router.register(
+#     "user-allocations", views.UserAllocationViewSet, basename="crm-user-allocations"
+# )
+# router.register("user-locations", views.UserLocationViewSet, basename="crm-user-locations")
 router.register("forms", views.FormViewSet, basename="crm-forms")
 
 urlpatterns = [

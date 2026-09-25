@@ -62,7 +62,7 @@ from .serializers import (
     SalesOrderSerializer,
     SalesReturnSerializer,
     ShareRequestSerializer,
-    WarrantyCardSerializer,
+    # WarrantyCardSerializer,  # Hidden: out of scope
 )
 
 MONEY = DecimalField(max_digits=18, decimal_places=2)
@@ -792,80 +792,81 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
             status=status.HTTP_201_CREATED,
         )
 
-    @action(detail=True, methods=["post"], url_path="warranty-card")
-    @transaction.atomic
-    def warranty_card(self, request, pk=None):
-        """Issue a warranty card for the dispatched serials (api.md §5.6)."""
-        from .models import WarrantyCardItem, WarrantyCardSerial
+    # Hidden: Warranty Cards out of scope (Sweven spec) -- restore by uncommenting this block.
+    # @action(detail=True, methods=["post"], url_path="warranty-card")
+    # @transaction.atomic
+    # def warranty_card(self, request, pk=None):
+    #     """Issue a warranty card for the dispatched serials (api.md §5.6)."""
+    #     from .models import WarrantyCardItem, WarrantyCardSerial
 
-        challan = self.get_object()
-        if challan.status == "Draft":
-            raise Conflict(
-                "Dispatch the challan before issuing a warranty card.",
-                code=Codes.NOT_FINALIZED,
-            )
+    #     challan = self.get_object()
+    #     if challan.status == "Draft":
+    #         raise Conflict(
+    #             "Dispatch the challan before issuing a warranty card.",
+    #             code=Codes.NOT_FINALIZED,
+    #         )
 
-        period = int(request.data.get("warrantyPeriod") or 1)
-        unit = request.data.get("warrantyUnit") or "Years"
-        start_event = request.data.get("warrantyStartEvent") or "Delivery"
-        start_date = challan.dispatch_date or challan.doc_date
+    #     period = int(request.data.get("warrantyPeriod") or 1)
+    #     unit = request.data.get("warrantyUnit") or "Years"
+    #     start_event = request.data.get("warrantyStartEvent") or "Delivery"
+    #     start_date = challan.dispatch_date or challan.doc_date
 
-        card = WarrantyCard.objects.create(
-            client_id=challan.client_id,
-            card_number=allocate_number(challan.client, "WC"),
-            party=challan.party,
-            contact_person=request.data.get("contactPerson"),
-            billing_address=challan.billing_address,
-            shipping_address=challan.shipping_address,
-            gstin=challan.party_gstin,
-            delivery_challan=challan,
-            sales_order=challan.sales_order,
-            delivery_date=start_date,
-            delivery_location=challan.delivery_location,
-            warranty_period=period,
-            warranty_unit=unit,
-            warranty_start_event=start_event,
-            start_date=start_date,
-            expiry_date=services.compute_expiry(start_date, period, unit),
-            document_status="Generated",
-            created_by=request.user,
-        )
+    #     card = WarrantyCard.objects.create(
+    #         client_id=challan.client_id,
+    #         card_number=allocate_number(challan.client, "WC"),
+    #         party=challan.party,
+    #         contact_person=request.data.get("contactPerson"),
+    #         billing_address=challan.billing_address,
+    #         shipping_address=challan.shipping_address,
+    #         gstin=challan.party_gstin,
+    #         delivery_challan=challan,
+    #         sales_order=challan.sales_order,
+    #         delivery_date=start_date,
+    #         delivery_location=challan.delivery_location,
+    #         warranty_period=period,
+    #         warranty_unit=unit,
+    #         warranty_start_event=start_event,
+    #         start_date=start_date,
+    #         expiry_date=services.compute_expiry(start_date, period, unit),
+    #         document_status="Generated",
+    #         created_by=request.user,
+    #     )
 
-        line_ids = list(
-            challan.line_items.filter(deleted_at__isnull=True).values_list("id", flat=True)
-        )
-        serial_map = stock.serials_for_lines(
-            challan.client_id, "delivery_challan_lines", line_ids
-        )
-        for line in challan.line_items.filter(deleted_at__isnull=True):
-            WarrantyCardItem.objects.create(
-                client_id=challan.client_id,
-                warranty_card=card,
-                item_id=line.item_id,
-                sku=line.sku,
-                item_name=line.item_name,
-                qty=line.qty,
-            )
-            numbers = serial_map.get(line.id, [])
-            if numbers:
-                resolved = stock.resolve_serials(
-                    challan.client_id, line.item_id, numbers, expected_status=None
-                )
-                WarrantyCardSerial.objects.bulk_create(
-                    [
-                        WarrantyCardSerial(
-                            client_id=challan.client_id, warranty_card=card, serial=serial
-                        )
-                        for serial in resolved
-                    ],
-                    ignore_conflicts=True,
-                )
-                stock.set_serial_status(resolved, "sold", warranty_card=card)
+    #     line_ids = list(
+    #         challan.line_items.filter(deleted_at__isnull=True).values_list("id", flat=True)
+    #     )
+    #     serial_map = stock.serials_for_lines(
+    #         challan.client_id, "delivery_challan_lines", line_ids
+    #     )
+    #     for line in challan.line_items.filter(deleted_at__isnull=True):
+    #         WarrantyCardItem.objects.create(
+    #             client_id=challan.client_id,
+    #             warranty_card=card,
+    #             item_id=line.item_id,
+    #             sku=line.sku,
+    #             item_name=line.item_name,
+    #             qty=line.qty,
+    #         )
+    #         numbers = serial_map.get(line.id, [])
+    #         if numbers:
+    #             resolved = stock.resolve_serials(
+    #                 challan.client_id, line.item_id, numbers, expected_status=None
+    #             )
+    #             WarrantyCardSerial.objects.bulk_create(
+    #                 [
+    #                     WarrantyCardSerial(
+    #                         client_id=challan.client_id, warranty_card=card, serial=serial
+    #                     )
+    #                     for serial in resolved
+    #                 ],
+    #                 ignore_conflicts=True,
+    #             )
+    #             stock.set_serial_status(resolved, "sold", warranty_card=card)
 
-        return Response(
-            WarrantyCardSerializer(card, context=self.get_serializer_context()).data,
-            status=status.HTTP_201_CREATED,
-        )
+    #     return Response(
+    #         WarrantyCardSerializer(card, context=self.get_serializer_context()).data,
+    #         status=status.HTTP_201_CREATED,
+    #     )
 
 
 # ---------------------------------------------------------------------------
@@ -1315,95 +1316,96 @@ class SalesReturnViewSet(SalesDocumentViewSet):
         return Response(self.get_serializer(sales_return).data)
 
 
-# ---------------------------------------------------------------------------
-# Warranty cards (api.md §5.10)
-# ---------------------------------------------------------------------------
-class WarrantyCardViewSet(TenantModelViewSet):
-    queryset = WarrantyCard.objects.select_related(
-        "party", "delivery_challan", "sales_invoice"
-    ).prefetch_related("items")
-    serializer_class = WarrantyCardSerializer
-    audit_entity_type = "WarrantyCard"
-    audit_label_field = "card_number"
-    status_field = "document_status"
-    default_date_field = "start_date"
-    search_fields = ["card_number", "party__name", "contact_person"]
-    ordering = ["-created_at"]
-    filter_map = {"customerId": "party_id"}
-    permission_map = {"read": ["view_sales"], "write": ["view_sales"]}
-    draft_only_writes = True
-    draft_status_field = "document_status"
-    draft_values = ("Draft",)
+# Hidden: Warranty Cards out of scope (Sweven spec) -- restore by uncommenting this block.
+# # ---------------------------------------------------------------------------
+# # Warranty cards (api.md §5.10)
+# # ---------------------------------------------------------------------------
+# class WarrantyCardViewSet(TenantModelViewSet):
+#     queryset = WarrantyCard.objects.select_related(
+#         "party", "delivery_challan", "sales_invoice"
+#     ).prefetch_related("items")
+#     serializer_class = WarrantyCardSerializer
+#     audit_entity_type = "WarrantyCard"
+#     audit_label_field = "card_number"
+#     status_field = "document_status"
+#     default_date_field = "start_date"
+#     search_fields = ["card_number", "party__name", "contact_person"]
+#     ordering = ["-created_at"]
+#     filter_map = {"customerId": "party_id"}
+#     permission_map = {"read": ["view_sales"], "write": ["view_sales"]}
+#     draft_only_writes = True
+#     draft_status_field = "document_status"
+#     draft_values = ("Draft",)
 
-    def perform_create(self, serializer):
-        data = serializer.validated_data
-        data["card_number"] = allocate_number(self.request.user.client, "WC")
-        if not data.get("expiry_date") and data.get("start_date"):
-            data["expiry_date"] = services.compute_expiry(
-                data["start_date"],
-                data.get("warranty_period", 1),
-                data.get("warranty_unit", "Years"),
-            )
-        return super().perform_create(serializer)
+#     def perform_create(self, serializer):
+#         data = serializer.validated_data
+#         data["card_number"] = allocate_number(self.request.user.client, "WC")
+#         if not data.get("expiry_date") and data.get("start_date"):
+#             data["expiry_date"] = services.compute_expiry(
+#                 data["start_date"],
+#                 data.get("warranty_period", 1),
+#                 data.get("warranty_unit", "Years"),
+#             )
+#         return super().perform_create(serializer)
 
-    def _transition(self, request, target, reason_field=None, allowed_from=None):
-        card = self.get_object()
-        if allowed_from and card.document_status not in allowed_from:
-            raise Conflict(
-                f"A {card.document_status} card cannot be {target.lower()}.",
-                code=Codes.BAD_TARGET,
-            )
-        reason = request.data.get("reason")
-        card.document_status = target
-        if reason_field:
-            setattr(card, reason_field, reason)
-        card.save()
-        self.write_audit(target.lower(), card, description=reason)
-        return Response(self.get_serializer(card).data)
+#     def _transition(self, request, target, reason_field=None, allowed_from=None):
+#         card = self.get_object()
+#         if allowed_from and card.document_status not in allowed_from:
+#             raise Conflict(
+#                 f"A {card.document_status} card cannot be {target.lower()}.",
+#                 code=Codes.BAD_TARGET,
+#             )
+#         reason = request.data.get("reason")
+#         card.document_status = target
+#         if reason_field:
+#             setattr(card, reason_field, reason)
+#         card.save()
+#         self.write_audit(target.lower(), card, description=reason)
+#         return Response(self.get_serializer(card).data)
 
-    @action(detail=True, methods=["post"])
-    def cancel(self, request, pk=None):
-        return self._transition(request, "Cancelled", "cancelled_reason")
+#     @action(detail=True, methods=["post"])
+#     def cancel(self, request, pk=None):
+#         return self._transition(request, "Cancelled", "cancelled_reason")
 
-    @action(detail=True, methods=["post"])
-    def void(self, request, pk=None):
-        return self._transition(request, "Void", "void_reason")
+#     @action(detail=True, methods=["post"])
+#     def void(self, request, pk=None):
+#         return self._transition(request, "Void", "void_reason")
 
-    @action(detail=True, methods=["post"])
-    def suspend(self, request, pk=None):
-        return self._transition(
-            request, "Suspended", "suspended_reason", allowed_from=("Generated",)
-        )
+#     @action(detail=True, methods=["post"])
+#     def suspend(self, request, pk=None):
+#         return self._transition(
+#             request, "Suspended", "suspended_reason", allowed_from=("Generated",)
+#         )
 
-    @action(detail=True, methods=["post"])
-    def resume(self, request, pk=None):
-        return self._transition(request, "Generated", allowed_from=("Suspended",))
+#     @action(detail=True, methods=["post"])
+#     def resume(self, request, pk=None):
+#         return self._transition(request, "Generated", allowed_from=("Suspended",))
 
-    @action(detail=False, methods=["get"], url_path=r"by-challan/(?P<challan_id>[^/.]+)")
-    def by_challan(self, request, challan_id=None):
-        card = self.get_queryset().filter(delivery_challan_id=challan_id).first()
-        if card is None:
-            raise NotFound("No warranty card has been issued for that challan.")
-        return Response(self.get_serializer(card).data)
+#     @action(detail=False, methods=["get"], url_path=r"by-challan/(?P<challan_id>[^/.]+)")
+#     def by_challan(self, request, challan_id=None):
+#         card = self.get_queryset().filter(delivery_challan_id=challan_id).first()
+#         if card is None:
+#             raise NotFound("No warranty card has been issued for that challan.")
+#         return Response(self.get_serializer(card).data)
 
-    @action(detail=False, methods=["get"], url_path=r"by-serial/(?P<serial_no>[^/.]+)")
-    def by_serial(self, request, serial_no=None):
-        """Also used by service intake (api.md §5.10)."""
-        card = (
-            self.get_queryset()
-            .filter(serial_links__serial__serial_no=serial_no)
-            .distinct()
-            .first()
-        )
-        if card is None:
-            raise NotFound("No warranty card covers that serial number.")
-        return Response(self.get_serializer(card).data)
+#     @action(detail=False, methods=["get"], url_path=r"by-serial/(?P<serial_no>[^/.]+)")
+#     def by_serial(self, request, serial_no=None):
+#         """Also used by service intake (api.md §5.10)."""
+#         card = (
+#             self.get_queryset()
+#             .filter(serial_links__serial__serial_no=serial_no)
+#             .distinct()
+#             .first()
+#         )
+#         if card is None:
+#             raise NotFound("No warranty card covers that serial number.")
+#         return Response(self.get_serializer(card).data)
 
-    @action(detail=True, methods=["get"])
-    def print(self, request, pk=None):
-        card = self.get_object()
-        return Response(
-            print_payload(
-                card, self.get_serializer_class(), request=request, title="Warranty Card"
-            )
-        )
+#     @action(detail=True, methods=["get"])
+#     def print(self, request, pk=None):
+#         card = self.get_object()
+#         return Response(
+#             print_payload(
+#                 card, self.get_serializer_class(), request=request, title="Warranty Card"
+#             )
+#         )

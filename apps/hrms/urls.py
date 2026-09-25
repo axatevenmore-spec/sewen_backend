@@ -45,11 +45,12 @@ router.register("applications", views.ApplicationViewSet, basename="hrms-applica
 router.register("interviews", views.InterviewViewSet, basename="hrms-interviews")
 router.register("offers", views.OfferViewSet, basename="hrms-offers")
 router.register("onboarding", views.OnboardingViewSet, basename="hrms-onboarding")
-router.register(
-    "recruitment/questions",
-    views.ScreeningQuestionViewSet,
-    basename="hrms-screening-questions",
-)
+# Hidden: Screening Questions out of scope (Sweven spec)
+# router.register(
+#     "recruitment/questions",
+#     views.ScreeningQuestionViewSet,
+#     basename="hrms-screening-questions",
+# )
 
 router.register(
     "performance/cycles", views.AppraisalCycleViewSet, basename="hrms-appraisal-cycles"

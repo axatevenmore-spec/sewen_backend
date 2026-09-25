@@ -117,7 +117,7 @@ from .serializers import (
     ResignationSerializer,
     SalaryAdvanceSerializer,
     SalaryStructureSerializer,
-    ScreeningQuestionSerializer,
+    # ScreeningQuestionSerializer,  # Hidden: out of scope
     TeamSerializer,
     TerminationSerializer,
     TrainerSerializer,
@@ -1030,14 +1030,15 @@ class OnboardingViewSet(TenantModelViewSet):
         return Response({"verified": True})
 
 
-class ScreeningQuestionViewSet(TenantModelViewSet):
-    queryset = ScreeningQuestion.objects.select_related("job")
-    serializer_class = ScreeningQuestionSerializer
-    audit_entity_type = "ScreeningQuestion"
-    status_field = None
-    ordering = ["sort_order"]
-    filter_map = {"jobId": "job_id", "isActive": "is_active"}
-    permission_map = {"read": ["view_staff"], "write": ["create_staff"]}
+# Hidden: Screening Questions out of scope (Sweven spec) -- restore by uncommenting this block.
+# class ScreeningQuestionViewSet(TenantModelViewSet):
+#     queryset = ScreeningQuestion.objects.select_related("job")
+#     serializer_class = ScreeningQuestionSerializer
+#     audit_entity_type = "ScreeningQuestion"
+#     status_field = None
+#     ordering = ["sort_order"]
+#     filter_map = {"jobId": "job_id", "isActive": "is_active"}
+#     permission_map = {"read": ["view_staff"], "write": ["create_staff"]}
 
 
 class RecruitmentFunnelView(APIView):

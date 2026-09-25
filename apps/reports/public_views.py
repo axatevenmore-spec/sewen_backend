@@ -364,226 +364,231 @@ class PublicFormSubmitView(PublicWriteView):
         )
 
 
-# ---------------------------------------------------------------------------
-# Public career portal (api.md §11.5)
-# ---------------------------------------------------------------------------
-class PublicCareersListView(PublicView):
-    def get(self, request):
-        from apps.hrms.models import Job
+# Hidden: Career Portal out of scope (Sweven spec) -- restore by uncommenting this block.
+# # ---------------------------------------------------------------------------
+# # Public career portal (api.md §11.5)
+# # ---------------------------------------------------------------------------
+# class PublicCareersListView(PublicView):
+#     def get(self, request):
+#         from apps.hrms.models import Job
 
-        jobs = Job.objects.filter(
-            is_published=True, status="Open", deleted_at__isnull=True
-        ).select_related("department", "location")
-        return Response(
-            {
-                "results": [
-                    {
-                        "id": str(job.id),
-                        "slug": job.slug,
-                        "title": job.title,
-                        "department": job.department.name if job.department_id else None,
-                        "location": job.location.name if job.location_id else None,
-                        "employmentType": job.employment_type,
-                        "experienceRange": job.experience_range,
-                        "publishedAt": job.published_at,
-                    }
-                    for job in jobs
-                ]
-            }
-        )
-
-
-class PublicCareerDetailView(PublicView):
-    def get(self, request, job_id):
-        from apps.hrms.models import Job, ScreeningQuestion
-
-        job = Job.objects.filter(
-            is_published=True, status="Open", deleted_at__isnull=True
-        ).filter(slug=job_id).select_related("department", "location").first()
-        if job is None:
-            job = Job.objects.filter(
-                pk=job_id, is_published=True, status="Open", deleted_at__isnull=True
-            ).select_related("department", "location").first()
-        if job is None:
-            raise NotFound("This role is no longer open.")
-
-        set_current_client_id(job.client_id)
-        questions = ScreeningQuestion.objects.filter(
-            client_id=job.client_id, deleted_at__isnull=True, is_active=True
-        ).filter(models_q(job)).order_by("sort_order")
-
-        return Response(
-            {
-                "id": str(job.id),
-                "slug": job.slug,
-                "title": job.title,
-                "department": job.department.name if job.department_id else None,
-                "location": job.location.name if job.location_id else None,
-                "employmentType": job.employment_type,
-                "experienceRange": job.experience_range,
-                "salaryRange": job.salary_range,
-                "description": job.description,
-                "openings": job.openings,
-                "questions": [
-                    {
-                        "id": str(question.id),
-                        "question": question.question,
-                        "type": question.type,
-                        "options": question.options,
-                    }
-                    for question in questions
-                ],
-            }
-        )
+#         jobs = Job.objects.filter(
+#             is_published=True, status="Open", deleted_at__isnull=True
+#         ).select_related("department", "location")
+#         return Response(
+#             {
+#                 "results": [
+#                     {
+#                         "id": str(job.id),
+#                         "slug": job.slug,
+#                         "title": job.title,
+#                         "department": job.department.name if job.department_id else None,
+#                         "location": job.location.name if job.location_id else None,
+#                         "employmentType": job.employment_type,
+#                         "experienceRange": job.experience_range,
+#                         "publishedAt": job.published_at,
+#                     }
+#                     for job in jobs
+#                 ]
+#             }
+#         )
 
 
-def models_q(job):
-    """Global questions (``job_id is null``) plus this role's own."""
-    from django.db.models import Q
+# Hidden: Career Portal out of scope (Sweven spec) -- restore by uncommenting this block.
+# class PublicCareerDetailView(PublicView):
+#     def get(self, request, job_id):
+#         from apps.hrms.models import Job, ScreeningQuestion
 
-    return Q(job__isnull=True) | Q(job=job)
+#         job = Job.objects.filter(
+#             is_published=True, status="Open", deleted_at__isnull=True
+#         ).filter(slug=job_id).select_related("department", "location").first()
+#         if job is None:
+#             job = Job.objects.filter(
+#                 pk=job_id, is_published=True, status="Open", deleted_at__isnull=True
+#             ).select_related("department", "location").first()
+#         if job is None:
+#             raise NotFound("This role is no longer open.")
 
+#         set_current_client_id(job.client_id)
+#         questions = ScreeningQuestion.objects.filter(
+#             client_id=job.client_id, deleted_at__isnull=True, is_active=True
+#         ).filter(models_q(job)).order_by("sort_order")
 
-class PublicCareerApplyView(PublicWriteView):
-    """``POST /public/careers/{jobId}/apply/`` -- application + résumé."""
-
-    def post(self, request, job_id):
-        from apps.hrms.models import (
-            Application,
-            Candidate,
-            Job,
-            ScreeningAnswer,
-            ScreeningQuestion,
-        )
-
-        job = Job.objects.filter(
-            is_published=True, status="Open", deleted_at__isnull=True
-        ).filter(slug=job_id).first()
-        if job is None:
-            job = Job.objects.filter(
-                pk=job_id, is_published=True, status="Open", deleted_at__isnull=True
-            ).first()
-        if job is None:
-            raise NotFound("This role is no longer open.")
-        set_current_client_id(job.client_id)
-
-        name = (request.data.get("name") or "").strip()
-        email = (request.data.get("email") or "").strip()
-        if not name or not email:
-            raise ValidationFailed(
-                "Name and email are required.",
-                field_errors={
-                    **({} if name else {"name": ["Required."]}),
-                    **({} if email else {"email": ["Required."]}),
-                },
-            )
-
-        with transaction.atomic():
-            candidate = Candidate.objects.filter(
-                client_id=job.client_id, email__iexact=email, deleted_at__isnull=True
-            ).first()
-            if candidate is None:
-                candidate = Candidate.objects.create(
-                    client_id=job.client_id,
-                    name=name,
-                    email=email,
-                    phone=request.data.get("phone"),
-                    resume_file_id=request.data.get("resumeFileId"),
-                    source="careers_portal",
-                    current_ctc=request.data.get("currentCtc") or None,
-                    expected_ctc=request.data.get("expectedCtc") or None,
-                    notice_period_days=request.data.get("noticePeriodDays") or None,
-                    stage="Applied",
-                )
-
-            application, created = Application.objects.get_or_create(
-                client_id=job.client_id,
-                candidate=candidate,
-                job=job,
-                defaults={"stage": "Applied"},
-            )
-            if not created:
-                raise Conflict(
-                    "You have already applied for this role.",
-                    code=Codes.ALREADY_DONE,
-                )
-
-            answers = request.data.get("answers") or {}
-            if answers:
-                questions = {
-                    str(question.id): question
-                    for question in ScreeningQuestion.objects.filter(
-                        client_id=job.client_id, pk__in=list(answers.keys())
-                    )
-                }
-                ScreeningAnswer.objects.bulk_create(
-                    [
-                        ScreeningAnswer(
-                            client_id=job.client_id,
-                            application=application,
-                            question=question,
-                            answer=str(answers.get(question_id, "")),
-                        )
-                        for question_id, question in questions.items()
-                    ]
-                )
-
-        return Response(
-            {"received": True, "reference": str(application.id)},
-            status=status.HTTP_201_CREATED,
-        )
+#         return Response(
+#             {
+#                 "id": str(job.id),
+#                 "slug": job.slug,
+#                 "title": job.title,
+#                 "department": job.department.name if job.department_id else None,
+#                 "location": job.location.name if job.location_id else None,
+#                 "employmentType": job.employment_type,
+#                 "experienceRange": job.experience_range,
+#                 "salaryRange": job.salary_range,
+#                 "description": job.description,
+#                 "openings": job.openings,
+#                 "questions": [
+#                     {
+#                         "id": str(question.id),
+#                         "question": question.question,
+#                         "type": question.type,
+#                         "options": question.options,
+#                     }
+#                     for question in questions
+#                 ],
+#             }
+#         )
 
 
-class PublicUploadUrlView(PublicWriteView):
-    """A résumé upload slot for the careers portal.
+# Hidden: Career Portal out of scope (Sweven spec) -- restore by uncommenting this block.
+# def models_q(job):
+#     """Global questions (``job_id is null``) plus this role's own."""
+#     from django.db.models import Q
 
-    Scoped to ``resume`` only, so an unauthenticated caller cannot mint an
-    upload URL for a PMS proof or an HR document.
-    """
+#     return Q(job__isnull=True) | Q(job=job)
 
-    def post(self, request, job_id):
-        from django.conf import settings as django_settings
 
-        from apps.core import files as file_service
-        from apps.core.models import File
-        from apps.hrms.models import Job
+# Hidden: Career Portal out of scope (Sweven spec) -- restore by uncommenting this block.
+# class PublicCareerApplyView(PublicWriteView):
+#     """``POST /public/careers/{jobId}/apply/`` -- application + résumé."""
 
-        job = Job.objects.filter(
-            is_published=True, status="Open", deleted_at__isnull=True
-        ).filter(slug=job_id).first()
-        if job is None:
-            job = Job.objects.filter(
-                pk=job_id, is_published=True, status="Open", deleted_at__isnull=True
-            ).first()
-        if job is None:
-            raise NotFound("This role is no longer open.")
+#     def post(self, request, job_id):
+#         from apps.hrms.models import (
+#             Application,
+#             Candidate,
+#             Job,
+#             ScreeningAnswer,
+#             ScreeningQuestion,
+#         )
 
-        content_type, size = file_service.validate_upload_request(
-            file_name=request.data.get("fileName"),
-            content_type=request.data.get("contentType"),
-            size=request.data.get("size"),
-            scope="resume",
-        )
-        row = File.objects.create(
-            client_id=job.client_id,
-            scope="resume",
-            storage_key=file_service.build_storage_key(
-                job.client_id, "resume", request.data.get("fileName")
-            ),
-            file_name=request.data.get("fileName"),
-            content_type=content_type,
-            file_size=size,
-            status="pending",
-        )
-        token = file_service.sign_upload(row.id)
-        return Response(
-            {
-                "fileId": str(row.id),
-                "uploadUrl": request.build_absolute_uri(
-                    f"{django_settings.API_BASE_PATH}/files/{row.id}/upload/?token={token}"
-                ),
-                "expiresAt": timezone.now()
-                + timedelta(seconds=django_settings.UPLOAD_URL_TTL_SECONDS),
-            },
-            status=status.HTTP_201_CREATED,
-        )
+#         job = Job.objects.filter(
+#             is_published=True, status="Open", deleted_at__isnull=True
+#         ).filter(slug=job_id).first()
+#         if job is None:
+#             job = Job.objects.filter(
+#                 pk=job_id, is_published=True, status="Open", deleted_at__isnull=True
+#             ).first()
+#         if job is None:
+#             raise NotFound("This role is no longer open.")
+#         set_current_client_id(job.client_id)
+
+#         name = (request.data.get("name") or "").strip()
+#         email = (request.data.get("email") or "").strip()
+#         if not name or not email:
+#             raise ValidationFailed(
+#                 "Name and email are required.",
+#                 field_errors={
+#                     **({} if name else {"name": ["Required."]}),
+#                     **({} if email else {"email": ["Required."]}),
+#                 },
+#             )
+
+#         with transaction.atomic():
+#             candidate = Candidate.objects.filter(
+#                 client_id=job.client_id, email__iexact=email, deleted_at__isnull=True
+#             ).first()
+#             if candidate is None:
+#                 candidate = Candidate.objects.create(
+#                     client_id=job.client_id,
+#                     name=name,
+#                     email=email,
+#                     phone=request.data.get("phone"),
+#                     resume_file_id=request.data.get("resumeFileId"),
+#                     source="careers_portal",
+#                     current_ctc=request.data.get("currentCtc") or None,
+#                     expected_ctc=request.data.get("expectedCtc") or None,
+#                     notice_period_days=request.data.get("noticePeriodDays") or None,
+#                     stage="Applied",
+#                 )
+
+#             application, created = Application.objects.get_or_create(
+#                 client_id=job.client_id,
+#                 candidate=candidate,
+#                 job=job,
+#                 defaults={"stage": "Applied"},
+#             )
+#             if not created:
+#                 raise Conflict(
+#                     "You have already applied for this role.",
+#                     code=Codes.ALREADY_DONE,
+#                 )
+
+#             answers = request.data.get("answers") or {}
+#             if answers:
+#                 questions = {
+#                     str(question.id): question
+#                     for question in ScreeningQuestion.objects.filter(
+#                         client_id=job.client_id, pk__in=list(answers.keys())
+#                     )
+#                 }
+#                 ScreeningAnswer.objects.bulk_create(
+#                     [
+#                         ScreeningAnswer(
+#                             client_id=job.client_id,
+#                             application=application,
+#                             question=question,
+#                             answer=str(answers.get(question_id, "")),
+#                         )
+#                         for question_id, question in questions.items()
+#                     ]
+#                 )
+
+#         return Response(
+#             {"received": True, "reference": str(application.id)},
+#             status=status.HTTP_201_CREATED,
+#         )
+
+
+# Hidden: Career Portal out of scope (Sweven spec) -- restore by uncommenting this block.
+# class PublicUploadUrlView(PublicWriteView):
+#     """A résumé upload slot for the careers portal.
+
+#     Scoped to ``resume`` only, so an unauthenticated caller cannot mint an
+#     upload URL for a PMS proof or an HR document.
+#     """
+
+#     def post(self, request, job_id):
+#         from django.conf import settings as django_settings
+
+#         from apps.core import files as file_service
+#         from apps.core.models import File
+#         from apps.hrms.models import Job
+
+#         job = Job.objects.filter(
+#             is_published=True, status="Open", deleted_at__isnull=True
+#         ).filter(slug=job_id).first()
+#         if job is None:
+#             job = Job.objects.filter(
+#                 pk=job_id, is_published=True, status="Open", deleted_at__isnull=True
+#             ).first()
+#         if job is None:
+#             raise NotFound("This role is no longer open.")
+
+#         content_type, size = file_service.validate_upload_request(
+#             file_name=request.data.get("fileName"),
+#             content_type=request.data.get("contentType"),
+#             size=request.data.get("size"),
+#             scope="resume",
+#         )
+#         row = File.objects.create(
+#             client_id=job.client_id,
+#             scope="resume",
+#             storage_key=file_service.build_storage_key(
+#                 job.client_id, "resume", request.data.get("fileName")
+#             ),
+#             file_name=request.data.get("fileName"),
+#             content_type=content_type,
+#             file_size=size,
+#             status="pending",
+#         )
+#         token = file_service.sign_upload(row.id)
+#         return Response(
+#             {
+#                 "fileId": str(row.id),
+#                 "uploadUrl": request.build_absolute_uri(
+#                     f"{django_settings.API_BASE_PATH}/files/{row.id}/upload/?token={token}"
+#                 ),
+#                 "expiresAt": timezone.now()
+#                 + timedelta(seconds=django_settings.UPLOAD_URL_TTL_SECONDS),
+#             },
+#             status=status.HTTP_201_CREATED,
+#         )

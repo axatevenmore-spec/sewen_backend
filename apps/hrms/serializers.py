@@ -551,14 +551,15 @@ class OnboardingTaskSerializer(BaseModelSerializer):
         fields = ["id", "candidateId", "title", "owner", "due_date", "completed_at"]
 
 
-class ScreeningQuestionSerializer(BaseModelSerializer):
-    jobId = TenantPrimaryKeyRelatedField(
-        source="job", model="hrms.Job", required=False, allow_null=True
-    )
+# Hidden: Screening Questions out of scope (Sweven spec) -- restore by uncommenting this block.
+# class ScreeningQuestionSerializer(BaseModelSerializer):
+#     jobId = TenantPrimaryKeyRelatedField(
+#         source="job", model="hrms.Job", required=False, allow_null=True
+#     )
 
-    class Meta:
-        model = ScreeningQuestion
-        fields = ["id", "jobId", "question", "type", "options", "is_active", "sort_order"]
+#     class Meta:
+#         model = ScreeningQuestion
+#         fields = ["id", "jobId", "question", "type", "options", "is_active", "sort_order"]
 
 
 # ---------------------------------------------------------------------------

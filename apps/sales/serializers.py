@@ -463,96 +463,98 @@ class SalesReturnSerializer(DocumentSerializer):
         ]
 
 
-# ---------------------------------------------------------------------------
-# Warranty cards (api.md §5.10)
-# ---------------------------------------------------------------------------
-class WarrantyCardItemSerializer(BaseModelSerializer):
-    itemId = TenantPrimaryKeyRelatedField(source="item", model="masters.Item")
-    serials = serializers.ListField(
-        child=serializers.CharField(), required=False, default=list
-    )
+# Hidden: Warranty Cards out of scope (Sweven spec) -- restore by uncommenting this block.
+# # ---------------------------------------------------------------------------
+# # Warranty cards (api.md §5.10)
+# # ---------------------------------------------------------------------------
+# class WarrantyCardItemSerializer(BaseModelSerializer):
+#     itemId = TenantPrimaryKeyRelatedField(source="item", model="masters.Item")
+#     serials = serializers.ListField(
+#         child=serializers.CharField(), required=False, default=list
+#     )
 
-    class Meta:
-        model = WarrantyCardItem
-        fields = ["id", "itemId", "sku", "item_name", "qty", "serials"]
-
-
-
-class WarrantyCardSerializer(BaseModelSerializer):
-    """Two independent status fields -- do not collapse them (api.md §5.10)."""
-
-    customerId = TenantPrimaryKeyRelatedField(source="party", model="masters.Party")
-    customerName = serializers.CharField(source="party.name", read_only=True)
-    challanNumber = serializers.CharField(
-        source="delivery_challan.challan_number", read_only=True
-    )
-    invoiceNumber = serializers.CharField(
-        source="sales_invoice.invoice_number", read_only=True
-    )
-    #: DERIVED on every read (api.md §5.10) -- never stored.
-    coverageStatus = serializers.SerializerMethodField()
-    items = WarrantyCardItemSerializer(many=True, required=False)
-
-    class Meta:
-        model = WarrantyCard
-        fields = [
-            "id", "card_number", "customerId", "customerName", "contact_person",
-            "billing_address", "shipping_address", "gstin",
-            "delivery_challan", "challanNumber", "sales_invoice", "invoiceNumber",
-            "sales_order", "delivery_date", "delivery_location",
-            "warranty_period", "warranty_unit", "warranty_start_event",
-            "start_date", "expiry_date", "expiring_soon_days",
-            "document_status", "coverageStatus",
-            "suspended_reason", "cancelled_reason", "void_reason",
-            "terms", "notes", "items", "created_at", "updated_at",
-        ]
-        read_only_fields = ["card_number", "created_at", "updated_at"]
+#     class Meta:
+#         model = WarrantyCardItem
+#         fields = ["id", "itemId", "sku", "item_name", "qty", "serials"]
 
 
-    def get_coverageStatus(self, card):
-        return services.coverage_status(card)
 
-    def create(self, validated_data):
-        items = validated_data.pop("items", [])
-        card = super().create(validated_data)
-        self._write_items(card, items)
-        return card
+# Hidden: Warranty Cards out of scope (Sweven spec) -- restore by uncommenting this block.
+# class WarrantyCardSerializer(BaseModelSerializer):
+#     """Two independent status fields -- do not collapse them (api.md §5.10)."""
 
-    def update(self, instance, validated_data):
-        items = validated_data.pop("items", None)
-        card = super().update(instance, validated_data)
-        if items is not None:
-            card.items.all().delete()
-            self._write_items(card, items)
-        return card
+#     customerId = TenantPrimaryKeyRelatedField(source="party", model="masters.Party")
+#     customerName = serializers.CharField(source="party.name", read_only=True)
+#     challanNumber = serializers.CharField(
+#         source="delivery_challan.challan_number", read_only=True
+#     )
+#     invoiceNumber = serializers.CharField(
+#         source="sales_invoice.invoice_number", read_only=True
+#     )
+#     #: DERIVED on every read (api.md §5.10) -- never stored.
+#     coverageStatus = serializers.SerializerMethodField()
+#     items = WarrantyCardItemSerializer(many=True, required=False)
 
-    def _write_items(self, card, rows):
-        from apps.inventory.services import resolve_serials
-        from .models import WarrantyCardSerial
+#     class Meta:
+#         model = WarrantyCard
+#         fields = [
+#             "id", "card_number", "customerId", "customerName", "contact_person",
+#             "billing_address", "shipping_address", "gstin",
+#             "delivery_challan", "challanNumber", "sales_invoice", "invoiceNumber",
+#             "sales_order", "delivery_date", "delivery_location",
+#             "warranty_period", "warranty_unit", "warranty_start_event",
+#             "start_date", "expiry_date", "expiring_soon_days",
+#             "document_status", "coverageStatus",
+#             "suspended_reason", "cancelled_reason", "void_reason",
+#             "terms", "notes", "items", "created_at", "updated_at",
+#         ]
+#         read_only_fields = ["card_number", "created_at", "updated_at"]
 
-        for row in rows:
-            serial_numbers = row.pop("serials", [])
-            item = row.get("item")
-            line = WarrantyCardItem.objects.create(
-                client_id=card.client_id,
-                warranty_card=card,
-                sku=item.sku if item else row.get("sku"),
-                item_name=item.name if item else row.get("item_name"),
-                **row,
-            )
-            if serial_numbers and item is not None:
-                resolved = resolve_serials(
-                    card.client_id, item.id, serial_numbers, expected_status=None
-                )
-                WarrantyCardSerial.objects.bulk_create(
-                    [
-                        WarrantyCardSerial(
-                            client_id=card.client_id, warranty_card=card, serial=serial
-                        )
-                        for serial in resolved
-                    ],
-                    ignore_conflicts=True,
-                )
+
+#     def get_coverageStatus(self, card):
+#         return services.coverage_status(card)
+
+#     def create(self, validated_data):
+#         items = validated_data.pop("items", [])
+#         card = super().create(validated_data)
+#         self._write_items(card, items)
+#         return card
+
+#     def update(self, instance, validated_data):
+#         items = validated_data.pop("items", None)
+#         card = super().update(instance, validated_data)
+#         if items is not None:
+#             card.items.all().delete()
+#             self._write_items(card, items)
+#         return card
+
+#     def _write_items(self, card, rows):
+#         from apps.inventory.services import resolve_serials
+#         from .models import WarrantyCardSerial
+
+#         for row in rows:
+#             serial_numbers = row.pop("serials", [])
+#             item = row.get("item")
+#             line = WarrantyCardItem.objects.create(
+#                 client_id=card.client_id,
+#                 warranty_card=card,
+#                 sku=item.sku if item else row.get("sku"),
+#                 item_name=item.name if item else row.get("item_name"),
+#                 **row,
+#             )
+#             if serial_numbers and item is not None:
+#                 resolved = resolve_serials(
+#                     card.client_id, item.id, serial_numbers, expected_status=None
+#                 )
+#                 WarrantyCardSerial.objects.bulk_create(
+#                     [
+#                         WarrantyCardSerial(
+#                             client_id=card.client_id, warranty_card=card, serial=serial
+#                         )
+#                         for serial in resolved
+#                     ],
+#                     ignore_conflicts=True,
+#                 )
 
 
 class ReasonSerializer(BaseSerializer):

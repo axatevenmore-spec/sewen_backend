@@ -25,14 +25,17 @@ router.register("locations", LocationViewSet, basename="inventory-locations")
 router.register("movements", views.StockMovementViewSet, basename="inventory-movements")
 router.register("transfers", views.StockTransferViewSet, basename="inventory-transfers")
 router.register("faulty-parts", views.FaultyPartViewSet, basename="inventory-faulty-parts")
-router.register("service-usage", views.ServiceUsageViewSet, basename="inventory-service-usage")
-router.register("zone-requests", views.ZoneRequestViewSet, basename="inventory-zone-requests")
+# Hidden: Service Usage & Zone Requests out of scope (Sweven spec)
+# router.register("service-usage", views.ServiceUsageViewSet, basename="inventory-service-usage")
+# router.register("zone-requests", views.ZoneRequestViewSet, basename="inventory-zone-requests")
 router.register("audits", views.StockAuditViewSet, basename="inventory-audits")
 
 urlpatterns = [
     path("stock/summary/", views.StockSummaryView.as_view(), name="inventory-stock-summary"),
     path("stock/", views.StockPositionView.as_view(), name="inventory-stock"),
     path("adjustments/", views.StockAdjustmentView.as_view(), name="inventory-adjustments"),
-    path("valuation/", views.ValuationView.as_view(), name="inventory-valuation"),
+    # Hidden: Valuation & Ageing screen out of scope (Sweven spec). ValuationView
+    # itself stays -- the "inventory-valuation" report in apps.reports reuses it.
+    # path("valuation/", views.ValuationView.as_view(), name="inventory-valuation"),
     path("", include(router.urls)),
 ]

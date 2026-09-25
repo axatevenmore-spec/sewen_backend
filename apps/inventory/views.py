@@ -35,12 +35,12 @@ from .models import (
 from .serializers import (
     FaultyPartSerializer,
     QualityStandardSerializer,
-    ServiceUsageSerializer,
+    # ServiceUsageSerializer,  # Hidden: out of scope
     StockAdjustmentSerializer,
     StockAuditSerializer,
     StockMovementSerializer,
     StockTransferSerializer,
-    ZoneRequestSerializer,
+    # ZoneRequestSerializer,  # Hidden: out of scope
 )
 
 QTY = DecimalField(max_digits=18, decimal_places=4)
@@ -430,110 +430,112 @@ class FaultyPartViewSet(TenantModelViewSet):
         return Response(self.get_serializer(part).data)
 
 
-class ServiceUsageViewSet(TenantModelViewSet):
-    queryset = ServiceUsage.objects.select_related("item", "party")
-    serializer_class = ServiceUsageSerializer
-    audit_entity_type = "ServiceUsage"
-    audit_label_field = "ticket_number"
-    required_permissions = ["view_inventory"]
-    status_field = None
-    default_date_field = "used_on"
-    search_fields = ["ticket_number", "technician", "item__sku"]
-    ordering = ["-used_on"]
+# Hidden: Service Usage out of scope (Sweven spec) -- restore by uncommenting this block.
+# class ServiceUsageViewSet(TenantModelViewSet):
+#     queryset = ServiceUsage.objects.select_related("item", "party")
+#     serializer_class = ServiceUsageSerializer
+#     audit_entity_type = "ServiceUsage"
+#     audit_label_field = "ticket_number"
+#     required_permissions = ["view_inventory"]
+#     status_field = None
+#     default_date_field = "used_on"
+#     search_fields = ["ticket_number", "technician", "item__sku"]
+#     ordering = ["-used_on"]
 
-    @transaction.atomic
-    def perform_create(self, serializer):
-        serializer.validated_data["ticket_number"] = allocate_number(
-            self.request.user.client, "TKT"
-        )
-        serializer.validated_data.setdefault("used_by", self.request.user)
-        usage = super().perform_create(serializer)
+#     @transaction.atomic
+#     def perform_create(self, serializer):
+#         serializer.validated_data["ticket_number"] = allocate_number(
+#             self.request.user.client, "TKT"
+#         )
+#         serializer.validated_data.setdefault("used_by", self.request.user)
+#         usage = super().perform_create(serializer)
 
-        location = usage.item.default_location_id
-        if location and usage.item.holds_stock:
-            stock.assert_sufficient_stock(
-                self.get_client_id(), usage.item, usage.quantity, location, usage.item.name
-            )
-            stock.post_movement(
-                client_id=self.get_client_id(),
-                item=usage.item_id,
-                location=location,
-                type="SERVICE_USAGE",
-                quantity=-D(usage.quantity),
-                unit_cost=usage.item.cost_price,
-                reference_type="ServiceUsage",
-                reference_id=usage.id,
-                reference_number=usage.ticket_number,
-                movement_date=usage.used_on,
-                user=self.request.user,
-            )
-        return usage
+#         location = usage.item.default_location_id
+#         if location and usage.item.holds_stock:
+#             stock.assert_sufficient_stock(
+#                 self.get_client_id(), usage.item, usage.quantity, location, usage.item.name
+#             )
+#             stock.post_movement(
+#                 client_id=self.get_client_id(),
+#                 item=usage.item_id,
+#                 location=location,
+#                 type="SERVICE_USAGE",
+#                 quantity=-D(usage.quantity),
+#                 unit_cost=usage.item.cost_price,
+#                 reference_type="ServiceUsage",
+#                 reference_id=usage.id,
+#                 reference_number=usage.ticket_number,
+#                 movement_date=usage.used_on,
+#                 user=self.request.user,
+#             )
+#         return usage
 
 
-class ZoneRequestViewSet(TenantModelViewSet):
-    queryset = ZoneRequest.objects.select_related("zone_location").prefetch_related("lines__item")
-    serializer_class = ZoneRequestSerializer
-    audit_entity_type = "ZoneRequest"
-    audit_label_field = "request_number"
-    required_permissions = ["view_inventory"]
-    status_field = "status"
-    default_date_field = "request_date"
-    search_fields = ["request_number", "requested_by_name", "notes"]
-    ordering = ["-requested_at"]
+# Hidden: Zone Requests out of scope (Sweven spec) -- restore by uncommenting this block.
+# class ZoneRequestViewSet(TenantModelViewSet):
+#     queryset = ZoneRequest.objects.select_related("zone_location").prefetch_related("lines__item")
+#     serializer_class = ZoneRequestSerializer
+#     audit_entity_type = "ZoneRequest"
+#     audit_label_field = "request_number"
+#     required_permissions = ["view_inventory"]
+#     status_field = "status"
+#     default_date_field = "request_date"
+#     search_fields = ["request_number", "requested_by_name", "notes"]
+#     ordering = ["-requested_at"]
 
-    @transaction.atomic
-    def perform_create(self, serializer):
-        lines = serializer.validated_data.pop("lines", [])
-        serializer.validated_data["request_number"] = allocate_number(
-            self.request.user.client, "REQ"
-        )
-        serializer.validated_data.setdefault("requested_by", self.request.user)
-        serializer.validated_data.setdefault("requested_by_name", self.request.user.name)
-        request_row = super().perform_create(serializer)
+#     @transaction.atomic
+#     def perform_create(self, serializer):
+#         lines = serializer.validated_data.pop("lines", [])
+#         serializer.validated_data["request_number"] = allocate_number(
+#             self.request.user.client, "REQ"
+#         )
+#         serializer.validated_data.setdefault("requested_by", self.request.user)
+#         serializer.validated_data.setdefault("requested_by_name", self.request.user.name)
+#         request_row = super().perform_create(serializer)
 
-        ZoneRequestLine.objects.bulk_create(
-            [
-                ZoneRequestLine(client_id=self.get_client_id(), zone_request=request_row, **line)
-                for line in lines
-            ]
-        )
-        return request_row
+#         ZoneRequestLine.objects.bulk_create(
+#             [
+#                 ZoneRequestLine(client_id=self.get_client_id(), zone_request=request_row, **line)
+#                 for line in lines
+#             ]
+#         )
+#         return request_row
 
-    @transaction.atomic
-    def perform_update(self, serializer):
-        """api.md §7 -- only the ``Fulfilled`` transition issues stock."""
-        previous = serializer.instance.status
-        request_row = super().perform_update(serializer)
+#     @transaction.atomic
+#     def perform_update(self, serializer):
+#         """api.md §7 -- only the ``Fulfilled`` transition issues stock."""
+#         previous = serializer.instance.status
+#         request_row = super().perform_update(serializer)
 
-        if previous != "Fulfilled" and request_row.status == "Fulfilled":
-            from apps.core.permissions import require_permission
+#         if previous != "Fulfilled" and request_row.status == "Fulfilled":
+#             from apps.core.permissions import require_permission
 
-            require_permission(self.request.user, "approve_zone_request")
-            for line in request_row.lines.filter(deleted_at__isnull=True).select_related("item"):
-                quantity = D(line.requested_qty) - D(line.issued_qty)
-                if quantity <= ZERO or not line.item.holds_stock:
-                    continue
-                stock.assert_sufficient_stock(
-                    self.get_client_id(), line.item, quantity,
-                    request_row.zone_location_id, line.item.name,
-                )
-                stock.post_movement(
-                    client_id=self.get_client_id(),
-                    item=line.item_id,
-                    location=request_row.zone_location_id,
-                    type="ZONE_ISSUE",
-                    quantity=-quantity,
-                    unit_cost=line.item.cost_price,
-                    reference_type="ZoneRequest",
-                    reference_id=request_row.id,
-                    reference_number=request_row.request_number,
-                    user=self.request.user,
-                )
-                line.issued_qty = line.requested_qty
-                line.save(update_fields=["issued_qty", "updated_at"])
-            request_row.issued_by = self.request.user
-            request_row.save(update_fields=["issued_by", "updated_at"])
-        return request_row
+#             require_permission(self.request.user, "approve_zone_request")
+#             for line in request_row.lines.filter(deleted_at__isnull=True).select_related("item"):
+#                 quantity = D(line.requested_qty) - D(line.issued_qty)
+#                 if quantity <= ZERO or not line.item.holds_stock:
+#                     continue
+#                 stock.assert_sufficient_stock(
+#                     self.get_client_id(), line.item, quantity,
+#                     request_row.zone_location_id, line.item.name,
+#                 )
+#                 stock.post_movement(
+#                     client_id=self.get_client_id(),
+#                     item=line.item_id,
+#                     location=request_row.zone_location_id,
+#                     type="ZONE_ISSUE",
+#                     quantity=-quantity,
+#                     unit_cost=line.item.cost_price,
+#                     reference_type="ZoneRequest",
+#                     reference_id=request_row.id,
+#                     reference_number=request_row.request_number,
+#                     user=self.request.user,
+#                 )
+#                 line.issued_qty = line.requested_qty
+#                 line.save(update_fields=["issued_qty", "updated_at"])
+#             request_row.issued_by = self.request.user
+#             request_row.save(update_fields=["issued_by", "updated_at"])
+#         return request_row
 
 
 # ---------------------------------------------------------------------------

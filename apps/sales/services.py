@@ -1323,49 +1323,51 @@ def order_fulfilment(order):
     }
 
 
-# ---------------------------------------------------------------------------
-# Warranty coverage (api.md §5.10)
-# ---------------------------------------------------------------------------
-def coverage_status(card, today=None):
-    """Derived on every read (api.md §5.10, from ``utils/warrantyUtils.js``).
+# Hidden: Warranty Cards out of scope (Sweven spec) -- restore by uncommenting this block.
+# # ---------------------------------------------------------------------------
+# # Warranty coverage (api.md §5.10)
+# # ---------------------------------------------------------------------------
+# def coverage_status(card, today=None):
+#     """Derived on every read (api.md §5.10, from ``utils/warrantyUtils.js``).
 
-    ``documentStatus`` of Cancelled/Suspended wins outright; a future or
-    missing ``startDate`` -> Pending Activation; past ``expiryDate`` ->
-    Expired; inside the expiring-soon window -> Expiring Soon; else Active.
-    """
-    today = today or timezone.localdate()
+#     ``documentStatus`` of Cancelled/Suspended wins outright; a future or
+#     missing ``startDate`` -> Pending Activation; past ``expiryDate`` ->
+#     Expired; inside the expiring-soon window -> Expiring Soon; else Active.
+#     """
+#     today = today or timezone.localdate()
 
-    if card.document_status == "Cancelled":
-        return "Cancelled"
-    if card.document_status == "Suspended":
-        return "Suspended"
-    if card.document_status in ("Draft", "Void"):
-        return "Pending Activation"
+#     if card.document_status == "Cancelled":
+#         return "Cancelled"
+#     if card.document_status == "Suspended":
+#         return "Suspended"
+#     if card.document_status in ("Draft", "Void"):
+#         return "Pending Activation"
 
-    if card.start_date is None or card.start_date > today:
-        return "Pending Activation"
-    if card.expiry_date is None:
-        return "Active"
-    if card.expiry_date < today:
-        return "Expired"
-    if (card.expiry_date - today).days <= (card.expiring_soon_days or 30):
-        return "Expiring Soon"
-    return "Active"
+#     if card.start_date is None or card.start_date > today:
+#         return "Pending Activation"
+#     if card.expiry_date is None:
+#         return "Active"
+#     if card.expiry_date < today:
+#         return "Expired"
+#     if (card.expiry_date - today).days <= (card.expiring_soon_days or 30):
+#         return "Expiring Soon"
+#     return "Active"
 
 
-def compute_expiry(start_date, period, unit):
-    """``warrantyPeriod`` + ``warrantyUnit`` -> an expiry date."""
-    if start_date is None:
-        return None
-    period = int(period or 0)
-    if unit == "Months":
-        month = start_date.month - 1 + period
-        year = start_date.year + month // 12
-        month = month % 12 + 1
-        day = min(start_date.day, [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
-                                   else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1])
-        return start_date.replace(year=year, month=month, day=day)
-    try:
-        return start_date.replace(year=start_date.year + period)
-    except ValueError:  # 29 Feb
-        return start_date.replace(year=start_date.year + period, day=28)
+# Hidden: Warranty Cards out of scope (Sweven spec) -- restore by uncommenting this block.
+# def compute_expiry(start_date, period, unit):
+#     """``warrantyPeriod`` + ``warrantyUnit`` -> an expiry date."""
+#     if start_date is None:
+#         return None
+#     period = int(period or 0)
+#     if unit == "Months":
+#         month = start_date.month - 1 + period
+#         year = start_date.year + month // 12
+#         month = month % 12 + 1
+#         day = min(start_date.day, [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+#                                    else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1])
+#         return start_date.replace(year=year, month=month, day=day)
+#     try:
+#         return start_date.replace(year=start_date.year + period)
+#     except ValueError:  # 29 Feb
+#         return start_date.replace(year=start_date.year + period, day=28)
