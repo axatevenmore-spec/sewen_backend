@@ -262,6 +262,9 @@ class ProformaInvoice(DocumentHeader):
     sales_order = models.ForeignKey(
         SalesOrder, null=True, blank=True, on_delete=models.SET_NULL, related_name="proformas"
     )
+    total_sales_value = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    formal_invoice_amount = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    cash_amount = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
 
     class Meta:
         db_table = "proforma_invoices"
@@ -480,6 +483,9 @@ class PaymentIn(TenantModel, LegacyIdMixin):
     )
     sales_order = models.ForeignKey(
         "SalesOrder", null=True, blank=True, on_delete=models.SET_NULL, related_name="cash_receipts"
+    )
+    proforma_invoice = models.ForeignKey(
+        "ProformaInvoice", null=True, blank=True, on_delete=models.SET_NULL, related_name="cash_receipts"
     )
     #: DERIVED from payment_allocations. The unallocated remainder *is* the
     #: customer advance -- there is no separate balance column (db.md §5.4).

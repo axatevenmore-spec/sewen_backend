@@ -683,6 +683,24 @@ class ProformaInvoiceViewSet(SalesDocumentViewSet):
             status=status.HTTP_201_CREATED,
         )
 
+    @action(detail=True, methods=["post"], url_path="allocate-split")
+    def allocate_split(self, request, pk=None):
+        proforma = self.get_object()
+        formal_amt = request.data.get("formalInvoiceAmount")
+        cash_amt = request.data.get("cashAmount")
+        total_val = request.data.get("totalSalesValue")
+
+        if total_val is not None:
+            proforma.total_sales_value = Decimal(str(total_val))
+        if formal_amt is not None:
+            proforma.formal_invoice_amount = Decimal(str(formal_amt))
+        if cash_amt is not None:
+            proforma.cash_amount = Decimal(str(cash_amt))
+
+        proforma.save(update_fields=["total_sales_value", "formal_invoice_amount", "cash_amount", "updated_at"])
+        self.write_audit("update", proforma, description="Updated Proforma Invoice split allocation")
+        return Response(self.get_serializer(proforma).data, status=status.HTTP_200_OK)
+
 
 # ---------------------------------------------------------------------------
 # Delivery challans (api.md §5.6)

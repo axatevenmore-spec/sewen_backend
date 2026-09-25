@@ -205,12 +205,47 @@ class ProformaInvoiceSerializer(DocumentSerializer):
     line_fk_name = "proforma_invoice"
     line_table_name = "proforma_invoice_lines"
 
+    totalSalesValue = MoneyField(source="total_sales_value", required=False, allow_null=True)
+    formalInvoiceAmount = MoneyField(source="formal_invoice_amount", required=False, allow_null=True)
+    cashAmount = MoneyField(source="cash_amount", required=False, allow_null=True)
+    invoice = serializers.SerializerMethodField()
+    cashReceipt = serializers.SerializerMethodField()
+
     class Meta:
         model = ProformaInvoice
         fields = HEADER_FIELDS + [
             "proforma_number", "status", "valid_until", "sales_order",
+            "total_sales_value", "formal_invoice_amount", "cash_amount",
+            "totalSalesValue", "formalInvoiceAmount", "cashAmount",
+            "invoice", "cashReceipt",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["proforma_number"]
+
+    def get_invoice(self, proforma):
+        inv = proforma.invoices.filter(deleted_at__isnull=True).exclude(status="Cancelled").first()
+        if not inv:
+            return None
+        return {
+            "id": inv.id,
+            "invoiceNumber": inv.invoice_number,
+            "total": float(inv.total),
+            "status": inv.status,
+            "date": inv.doc_date.isoformat() if inv.doc_date else None,
+        }
+
+    def get_cashReceipt(self, proforma):
+        pmt = proforma.cash_receipts.filter(deleted_at__isnull=True).exclude(status="Cancelled").first()
+        if not pmt:
+            return None
+        return {
+            "id": pmt.id,
+            "receiptNumber": pmt.payment_number,
+            "amount": float(pmt.amount),
+            "date": pmt.payment_date.isoformat() if pmt.payment_date else None,
+            "mode": pmt.mode,
+            "reference": pmt.reference_number,
+            "status": pmt.status,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -394,6 +429,10 @@ class PaymentInSerializer(BaseModelSerializer):
         source="sales_order", model="sales.SalesOrder", required=False, allow_null=True
     )
     salesOrderNumber = serializers.CharField(source="sales_order.order_number", read_only=True)
+    proformaInvoiceId = TenantPrimaryKeyRelatedField(
+        source="proforma_invoice", model="sales.ProformaInvoice", required=False, allow_null=True
+    )
+    proformaInvoiceNumber = serializers.CharField(source="proforma_invoice.proforma_number", read_only=True)
     allocationsInput = serializers.ListField(
         child=serializers.DictField(), required=False, write_only=True
     )
@@ -404,7 +443,7 @@ class PaymentInSerializer(BaseModelSerializer):
             "id", "payment_number", "paymentType", "customerId", "customerName", "date", "amount",
             "mode", "bankAccountId", "reference_number", "description", "notes",
             "allocated_amount", "unallocatedAmount", "allocations", "cashReceipt", "status",
-            "invoiceId", "invoiceNumber", "salesOrderId", "salesOrderNumber", "allocationsInput", "created_at", "updated_at",
+            "invoiceId", "invoiceNumber", "salesOrderId", "salesOrderNumber", "proformaInvoiceId", "proformaInvoiceNumber", "allocationsInput", "created_at", "updated_at",
         ]
         read_only_fields = [
             "payment_number", "allocated_amount", "status", "created_at", "updated_at",
