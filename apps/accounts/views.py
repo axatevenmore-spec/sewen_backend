@@ -2,6 +2,7 @@
 Authentication and identity (api.md §2) and Administration (api.md §3).
 """
 import hashlib
+import math
 import secrets
 from datetime import timedelta
 
@@ -34,7 +35,14 @@ from apps.core.permissions import (
     has_permission,
     require_permission,
 )
-from apps.core.throttling import LoginThrottle
+from apps.core.throttling import (
+    FailedLoginThrottle,
+    LoginThrottle,
+    OTPVerifyThrottle,
+    PasswordResetThrottle,
+    SensitiveActionThrottle,
+    TokenRefreshThrottle,
+)
 from apps.core.viewsets import TenantModelViewSet
 from apps.core.tenancy import set_current_client_id
 
@@ -110,93 +118,123 @@ def _me_payload(user, request=None):
 class LoginView(APIView):
     authentication_classes = []
     permission_classes = [AllowPublic]
-    throttle_classes = [LoginThrottle]
+    throttle_classes = [LoginThrottle, FailedLoginThrottle]
 
     def post(self, request):
-        serializer = LoginSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        email = serializer.validated_data["email"].lower()
-        password = serializer.validated_data["password"]
+        try:
+            serializer = LoginSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            email = serializer.validated_data["email"].lower()
+            password = serializer.validated_data["password"]
 
-        candidates = list(
-            User.objects.filter(email=email, deleted_at__isnull=True).select_related(
-                "client", "role"
+            candidates = list(
+                User.objects.filter(email=email, deleted_at__isnull=True).select_related(
+                    "client", "role"
+                )
             )
-        )
-        # A tenant slug disambiguates when the same address exists in more than
-        # one tenant. Without it, an ambiguous address is treated as a failure
-        # rather than guessing which tenant the caller meant.
-        slug = (request.data.get("tenant") or request.data.get("clientSlug") or "").strip()
-        if slug:
-            candidates = [u for u in candidates if u.client.slug == slug]
+            # A tenant slug disambiguates when the same address exists in more than
+            # one tenant. Without it, an ambiguous address is treated as a failure
+            # rather than guessing which tenant the caller meant.
+            slug = (request.data.get("tenant") or request.data.get("clientSlug") or "").strip()
+            if slug:
+                candidates = [u for u in candidates if u.client.slug == slug]
 
-        invalid = NotAuthenticated(
-            "Incorrect email or password.", code="INVALID_CREDENTIALS"
-        )
-
-        if len(candidates) != 1:
-            raise invalid
-
-        user = candidates[0]
-
-        if user.is_locked():
-            raise NotAuthenticated(
-                "This account is temporarily locked. Try again shortly.",
-                code="ACCOUNT_LOCKED",
-            )
-        if user.status != "Active":
-            raise NotAuthenticated(
-                "This account is not active. Contact your administrator.",
-                code="ACCOUNT_INACTIVE",
-            )
-        if user.client.status != "Active":
-            raise NotAuthenticated(
-                "This workspace is not active.", code="TENANT_INACTIVE"
+            invalid = NotAuthenticated(
+                "Incorrect email or password.", code="INVALID_CREDENTIALS"
             )
 
-        if not user.check_password(password):
-            user.failed_login_count += 1
-            fields = ["failed_login_count"]
-            if user.failed_login_count >= MAX_FAILED_LOGINS:
-                user.locked_until = timezone.now() + LOCKOUT
-                fields.append("locked_until")
-            user.save(update_fields=fields)
-            raise invalid
+            if len(candidates) != 1:
+                raise invalid
 
-        set_current_client_id(user.client_id)
-        with transaction.atomic():
-            user.failed_login_count = 0
-            user.locked_until = None
-            user.last_login_at = timezone.now()
-            user.save(update_fields=["failed_login_count", "locked_until", "last_login_at"])
+            user = candidates[0]
 
-            refresh = RefreshToken.for_user(user)
-            session = UserSession.objects.create(
-                user=user,
-                client=user.client,
-                refresh_token_hash=_hash(str(refresh)),
-                user_agent=request.META.get("HTTP_USER_AGENT", "")[:500],
-                ip=request_ip(request),
-                device_label=_device_label(request),
-                expires_at=timezone.now() + settings.SIMPLE_JWT["REFRESH_TOKEN_LIFETIME"],
-            )
-            tokens = build_tokens(user, session=session)
-            # The stored hash must match the token actually handed out.
-            session.refresh_token_hash = _hash(tokens["refresh"])
-            session.save(update_fields=["refresh_token_hash"])
+            lockout_attempts = getattr(settings, "ACCOUNT_LOCKOUT_ATTEMPTS", 5)
+            lockout_minutes = getattr(settings, "ACCOUNT_LOCKOUT_MINUTES", 15)
+            lockout_duration = timedelta(minutes=lockout_minutes)
 
-            record_audit(
-                client=user.client_id,
-                actor=user,
-                action="login",
-                entity_type="User",
-                entity_id=user.id,
-                entity_label=user.email,
-                description="Signed in",
-                ip=request_ip(request),
-            )
+            if user.is_locked():
+                remaining_sec = int((user.locked_until - timezone.now()).total_seconds())
+                remaining_min = max(1, math.ceil(remaining_sec / 60))
+                raise NotAuthenticated(
+                    f"This account is temporarily locked due to too many failed attempts. Please try again in {remaining_min} minute{'s' if remaining_min > 1 else ''}.",
+                    code="ACCOUNT_LOCKED",
+                )
+            if user.status != "Active":
+                raise NotAuthenticated(
+                    "This account is not active. Contact your administrator.",
+                    code="ACCOUNT_INACTIVE",
+                )
+            if user.client.status != "Active":
+                raise NotAuthenticated(
+                    "This workspace is not active.", code="TENANT_INACTIVE"
+                )
 
-        return Response({**tokens, **_me_payload(user, request)})
+            if not user.check_password(password):
+                user.failed_login_count += 1
+                fields = ["failed_login_count"]
+                if user.failed_login_count >= lockout_attempts:
+                    user.locked_until = timezone.now() + lockout_duration
+                    fields.append("locked_until")
+                    user.save(update_fields=fields)
+                    record_audit(
+                        client=user.client_id,
+                        actor=user,
+                        action="account_locked",
+                        entity_type="User",
+                        entity_id=user.id,
+                        entity_label=user.email,
+                        description=f"Account locked for {lockout_minutes} minutes after {user.failed_login_count} failed attempts",
+                        ip=request_ip(request),
+                    )
+                    raise NotAuthenticated(
+                        f"This account is temporarily locked due to too many failed login attempts. Please try again in {lockout_minutes} minutes.",
+                        code="ACCOUNT_LOCKED",
+                    )
+                user.save(update_fields=fields)
+                remaining = max(0, lockout_attempts - user.failed_login_count)
+                raise NotAuthenticated(
+                    f"Incorrect email or password. {remaining} attempt{'s' if remaining != 1 else ''} remaining before account lockout.",
+                    code="INVALID_CREDENTIALS",
+                )
+
+            set_current_client_id(user.client_id)
+            with transaction.atomic():
+                user.failed_login_count = 0
+                user.locked_until = None
+                user.last_login_at = timezone.now()
+                user.save(update_fields=["failed_login_count", "locked_until", "last_login_at"])
+
+                refresh = RefreshToken.for_user(user)
+                session = UserSession.objects.create(
+                    user=user,
+                    client=user.client,
+                    refresh_token_hash=_hash(str(refresh)),
+                    user_agent=request.META.get("HTTP_USER_AGENT", "")[:500],
+                    ip=request_ip(request),
+                    device_label=_device_label(request),
+                    expires_at=timezone.now() + settings.SIMPLE_JWT["REFRESH_TOKEN_LIFETIME"],
+                )
+                tokens = build_tokens(user, session=session)
+                # The stored hash must match the token actually handed out.
+                session.refresh_token_hash = _hash(tokens["refresh"])
+                session.save(update_fields=["refresh_token_hash"])
+
+                record_audit(
+                    client=user.client_id,
+                    actor=user,
+                    action="login",
+                    entity_type="User",
+                    entity_id=user.id,
+                    entity_label=user.email,
+                    description="Signed in",
+                    ip=request_ip(request),
+                )
+
+            FailedLoginThrottle.clear_failures(request)
+            return Response({**tokens, **_me_payload(user, request)})
+        except Exception:
+            FailedLoginThrottle.record_failure(request)
+            raise
 
 
 def _device_label(request):
@@ -220,7 +258,7 @@ class RefreshView(APIView):
 
     authentication_classes = []
     permission_classes = [AllowPublic]
-    throttle_classes = [LoginThrottle]
+    throttle_classes = [TokenRefreshThrottle]
 
     def post(self, request):
         serializer = RefreshSerializer(data=request.data)
@@ -279,7 +317,7 @@ class MeView(APIView):
 
 
 class ChangePasswordView(APIView):
-    throttle_classes = [LoginThrottle]
+    throttle_classes = [SensitiveActionThrottle]
 
     def post(self, request):
         serializer = ChangePasswordSerializer(data=request.data, context={"user": request.user})
@@ -313,7 +351,7 @@ class ForgotPasswordView(APIView):
 
     authentication_classes = []
     permission_classes = [AllowPublic]
-    throttle_classes = [LoginThrottle]
+    throttle_classes = [PasswordResetThrottle]
 
     def post(self, request):
         serializer = ForgotPasswordSerializer(data=request.data)
@@ -357,7 +395,7 @@ class ForgotPasswordView(APIView):
             )
 
             import logging
-            logging.getLogger(__name__).info("Password reset OTP for %s: %s", email, otp)
+            logging.getLogger(__name__).info("Password reset OTP requested for %s", email)
 
         return Response(
             {
@@ -373,7 +411,7 @@ class VerifyOTPView(APIView):
 
     authentication_classes = []
     permission_classes = [AllowPublic]
-    throttle_classes = [LoginThrottle]
+    throttle_classes = [OTPVerifyThrottle]
 
     def post(self, request):
         serializer = VerifyOTPSerializer(data=request.data)
@@ -452,7 +490,7 @@ class VerifyOTPView(APIView):
 class ResetPasswordView(APIView):
     authentication_classes = []
     permission_classes = [AllowPublic]
-    throttle_classes = [LoginThrottle]
+    throttle_classes = [PasswordResetThrottle]
 
     def post(self, request):
         serializer = ResetPasswordSerializer(data=request.data)
@@ -649,7 +687,7 @@ class UserViewSet(TenantModelViewSet):
         if target is not None and target.pk == self.request.user.pk:
             return
         actor = self.request.user
-        if actor.is_superuser or has_permission(actor, "manage_roles") or has_permission(actor, "edit_staff"):
+        if actor.is_superuser or has_permission(actor, "manage_roles"):
             return
         require_permission(self.request.user, "reset_staff_password")
 
@@ -748,8 +786,19 @@ class UserViewSet(TenantModelViewSet):
         self.write_audit("reset_password", user, description="Admin-triggered password reset")
         import logging
 
-        logging.getLogger(__name__).info("Admin reset OTP for %s: %s (token: %s)", user.email, otp, token)
+        logging.getLogger(__name__).info("Admin reset OTP dispatched for %s", user.email)
         return Response({"message": f"A password reset verification code has been sent to {user.email}."})
+
+    @action(detail=True, methods=["post"], url_path="unlock")
+    def unlock(self, request, pk=None):
+        """Administrator unlocks a temporarily locked account."""
+        user = self.get_object()
+        self._guard_target(user)
+        user.failed_login_count = 0
+        user.locked_until = None
+        user.save(update_fields=["failed_login_count", "locked_until"])
+        self.write_audit("unlock", user, description="Account unlocked by administrator")
+        return Response({"message": f"Account for {user.email} has been unlocked."})
 
     @action(detail=True, methods=["get", "post"], url_path="permissions")
     def permissions(self, request, pk=None):

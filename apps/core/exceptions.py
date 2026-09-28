@@ -180,7 +180,14 @@ class BusinessRuleViolation(EvenmoreAPIError):
 class RateLimited(EvenmoreAPIError):
     status_code = http_status.HTTP_429_TOO_MANY_REQUESTS
     default_code = Codes.RATE_LIMITED
-    default_message = "Too many requests. Please wait a moment."
+    default_message = "Request rate limit exceeded. Please try again later."
+
+    def __init__(self, message=None, *, wait=None, **kwargs):
+        super().__init__(message=message or self.default_message, **kwargs)
+        self.wait = wait
+
+    def body(self):
+        return {"detail": self.message}
 
 
 def _flatten_drf_detail(detail):
@@ -210,7 +217,10 @@ def api_exception_handler(exc, context):
     from rest_framework.views import exception_handler as drf_exception_handler
 
     if isinstance(exc, EvenmoreAPIError):
-        return Response(exc.body(), status=exc.status_code)
+        resp = Response(exc.body(), status=exc.status_code)
+        if getattr(exc, "wait", None) is not None:
+            resp["Retry-After"] = str(max(1, int(exc.wait)))
+        return resp
 
     if isinstance(exc, Http404):
         return Response(NotFound().body(), status=http_status.HTTP_404_NOT_FOUND)
@@ -263,8 +273,12 @@ def api_exception_handler(exc, context):
     elif response.status_code == http_status.HTTP_404_NOT_FOUND:
         code = Codes.NOT_FOUND
     elif response.status_code == http_status.HTTP_429_TOO_MANY_REQUESTS:
-        code = Codes.RATE_LIMITED
-        message = "Too many requests. Please wait a moment."
+        if getattr(exc, "wait", None) is not None:
+            response["Retry-After"] = str(max(1, int(exc.wait)))
+        response.data = {
+            "detail": "Request rate limit exceeded. Please try again later.",
+        }
+        return response
 
     body = {"message": message, "code": code}
     if field_errors:
