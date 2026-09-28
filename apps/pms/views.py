@@ -47,6 +47,10 @@ from .serializers import (
     ApprovalSerializer,
     AssignStageSerializer,
     CompleteProjectSerializer,
+    CustomerDocumentSerializer,
+    CustomerProjectStageSerializer,
+    CustomerProjectTrackingListSerializer,
+    CustomerProjectTrackingSerializer,
     DecideSerializer,
     DelaySerializer,
     DepartmentSerializer,
@@ -458,6 +462,7 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
         "write": ["create_pms_project"],
         "complete": ["complete_project"],
         "apply_stage_template": ["assign_stage"],
+        "customer_tracking": [("view_pms", "view_projects")],
         # Anyone who can see the project can take part in its proof review.
         "document_comments": ["view_pms"],
         **CHAT_PERMISSIONS,
@@ -774,6 +779,13 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
             "requested_by", "document"
         )
         return Response(envelope(ApprovalSerializer(rows, many=True).data))
+
+    @action(detail=True, methods=["get"], url_path="customer-tracking")
+    def customer_tracking(self, request, pk=None):
+        project = self.get_object()
+        check_customer_tracking_permission(request.user, project)
+        ctx = _customer_tracking_context(project, request=request)
+        return Response(CustomerProjectTrackingSerializer(project, context=ctx).data)
 
     # -- stages ------------------------------------------------------------
     def _get_stage(self, project, stage_id):
@@ -1941,3 +1953,135 @@ class RevokeShareView(APIView):
         share.revoked_reason = request.data.get("reason")
         share.save(update_fields=["status", "revoked_at", "revoked_reason", "updated_at"])
         return Response(ProofShareSerializer(share).data)
+
+
+# ---------------------------------------------------------------------------
+# Customer Project Tracking (api.md §10 & Role-Based Customer Tracking View)
+# ---------------------------------------------------------------------------
+def check_customer_tracking_permission(user, project=None):
+    """Enforce role-based access & customer data isolation.
+    - Superuser: Full access.
+    - Admin (AD) / Project Manager (PM): Full access.
+    - User holding view_pms: Full access.
+    - Customer role (CU / is_customer) or view_projects:
+      - If project provided: project.party_id must match user's linked customer party.
+      - If no match: PermissionDenied('You do not have access to this project.', code='CUSTOMER_PROJECT_DENIED').
+    - Other internal roles without view_pms or view_projects:
+      - PermissionDenied('You do not have permission to view customer project tracking.', code='NO_TRACKING_PERMISSION').
+    """
+    if getattr(user, "is_superuser", False):
+        return True
+
+    role_code = getattr(getattr(user, "role", None), "code", "")
+    role_name = str(getattr(getattr(user, "role", None), "name", "")).lower()
+
+    if role_code in ("AD", "PM") or "admin" in role_name or "project manager" in role_name:
+        return True
+
+    from apps.core.permissions import granted_permissions
+    granted = granted_permissions(user)
+    if "view_pms" in granted:
+        return True
+
+    is_customer = (
+        getattr(user, "is_customer", False)
+        or role_code == "CU"
+        or "customer" in role_name
+        or "view_projects" in granted
+    )
+    if is_customer:
+        if project is not None:
+            allowed_parties = user.get_customer_party_ids() if hasattr(user, "get_customer_party_ids") else set()
+            if not project.party_id or project.party_id not in allowed_parties:
+                raise PermissionDenied(
+                    "You do not have permission to view this customer project.",
+                    code="CUSTOMER_PROJECT_DENIED",
+                )
+        return True
+
+    raise PermissionDenied(
+        "You do not have permission to view customer project tracking.",
+        code="NO_TRACKING_PERMISSION",
+    )
+
+
+def _customer_tracking_context(project, request=None):
+    stages = list(
+        project.stages.filter(deleted_at__isnull=True)
+        .select_related("department", "stage_config")
+        .order_by("sequence")
+    )
+    stage_ids = [s.id for s in stages]
+
+    def bucket(rows):
+        grouped = {}
+        for row in rows:
+            grouped.setdefault(row.stage_id, []).append(row)
+        return grouped
+
+    documents = list(
+        Document.objects.filter(stage_id__in=stage_ids, deleted_at__isnull=True).select_related("file")
+    )
+    delays = list(
+        Delay.objects.filter(stage_id__in=stage_ids, deleted_at__isnull=True)
+    )
+
+    return {
+        "request": request,
+        "stages": stages,
+        "documents_by_stage": bucket(documents),
+        "delays_by_stage": bucket(delays),
+        "all_documents": documents,
+    }
+
+
+class CustomerTrackingView(APIView):
+    """Role-based customer project tracking endpoint (api.md §10)."""
+
+    def get(self, request, pk=None):
+        user = request.user
+        client_id = request.client_id
+
+        # 1. Detail tracking view if pk provided
+        if pk is not None:
+            project = Project.objects.filter(client_id=client_id, code=pk, deleted_at__isnull=True).select_related(
+                "party", "current_stage", "sales_order"
+            ).first()
+            if project is None:
+                try:
+                    project = Project.objects.filter(client_id=client_id, pk=pk, deleted_at__isnull=True).select_related(
+                        "party", "current_stage", "sales_order"
+                    ).first()
+                except Exception:
+                    project = None
+            if project is None:
+                raise NotFound("That project no longer exists.")
+
+            check_customer_tracking_permission(user, project)
+            ctx = _customer_tracking_context(project, request=request)
+            return Response(CustomerProjectTrackingSerializer(project, context=ctx).data)
+
+        # 2. List tracking view
+        check_customer_tracking_permission(user, project=None)
+        role_code = getattr(getattr(user, "role", None), "code", "")
+        role_name = str(getattr(getattr(user, "role", None), "name", "")).lower()
+        from apps.core.permissions import granted_permissions
+        granted = granted_permissions(user)
+
+        is_staff_manager = (
+            getattr(user, "is_superuser", False)
+            or role_code in ("AD", "PM")
+            or "admin" in role_name
+            or "project manager" in role_name
+            or "view_pms" in granted
+        )
+
+        qs = Project.objects.filter(client_id=client_id, deleted_at__isnull=True).select_related(
+            "party", "current_stage", "sales_order"
+        ).order_by("-created_at")
+
+        if not is_staff_manager:
+            customer_party_ids = user.get_customer_party_ids() if hasattr(user, "get_customer_party_ids") else set()
+            qs = qs.filter(party_id__in=customer_party_ids)
+
+        return Response(envelope(CustomerProjectTrackingListSerializer(qs, many=True).data))

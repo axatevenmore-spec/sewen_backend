@@ -35,5 +35,15 @@ urlpatterns = [
         views.RevokeShareView.as_view(),
         name="pms-share-revoke",
     ),
+    path(
+        "customer-tracking/",
+        views.CustomerTrackingView.as_view(),
+        name="pms-customer-tracking-list",
+    ),
+    path(
+        "customer-tracking/<str:pk>/",
+        views.CustomerTrackingView.as_view(),
+        name="pms-customer-tracking-detail",
+    ),
     path("", include(router.urls)),
 ]

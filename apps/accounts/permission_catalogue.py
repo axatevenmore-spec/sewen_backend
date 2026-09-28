@@ -365,6 +365,12 @@ DEFAULT_ROLES = [
         "Self-service access only.",
         ["apply_leave", "view_own_payslip", "mark_attendance", "view_task"],
     ),
+    (
+        "CU",
+        "Customer",
+        "Customer portal access to track projects.",
+        ["view_projects"],
+    ),
 ]
 
 

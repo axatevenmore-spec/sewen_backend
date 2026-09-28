@@ -32,12 +32,16 @@ class MeUserSerializer(BaseModelSerializer):
     avatar = serializers.SerializerMethodField()
     reportingManager = serializers.SerializerMethodField()
     lastLogin = serializers.DateTimeField(source="last_login_at", read_only=True)
+    partyId = serializers.CharField(source="party_id", read_only=True, allow_null=True)
+    partyName = serializers.SerializerMethodField()
+    isCustomer = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = [
             "id", "name", "email", "phone", "avatar", "employeeId", "role",
             "department", "location", "reportingManager", "status", "lastLogin",
+            "partyId", "partyName", "isCustomer",
         ]
 
     def get_employeeId(self, user):
@@ -48,6 +52,12 @@ class MeUserSerializer(BaseModelSerializer):
 
     def get_reportingManager(self, user):
         return user.reporting_manager.name if user.reporting_manager_id else None
+
+    def get_partyName(self, user):
+        return user.party.name if user.party_id else None
+
+    def get_isCustomer(self, user):
+        return user.is_customer
 
 
 class TenantSerializer(BaseModelSerializer):
@@ -164,6 +174,11 @@ class UserSerializer(BaseModelSerializer):
     avatar = serializers.CharField(source="avatar_url", required=False, allow_null=True)
     joinedDate = serializers.DateField(source="joined_date", required=False, allow_null=True)
     lastLogin = serializers.DateTimeField(source="last_login_at", read_only=True)
+    partyId = TenantPrimaryKeyRelatedField(
+        source="party", model="masters.Party", required=False, allow_null=True
+    )
+    partyName = serializers.CharField(source="party.name", read_only=True, allow_null=True)
+    isCustomer = serializers.SerializerMethodField()
     permissions = serializers.SerializerMethodField()
     password = serializers.CharField(write_only=True, required=False, allow_blank=True)
 
@@ -173,6 +188,7 @@ class UserSerializer(BaseModelSerializer):
             "id", "name", "email", "phone", "role", "roleId", "department", "status",
             "joinedDate", "lastLogin", "employeeId", "location", "reportingManager",
             "reportingManagerId", "avatar", "permissions", "crm_roles", "password",
+            "partyId", "partyName", "isCustomer",
             "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
@@ -185,6 +201,9 @@ class UserSerializer(BaseModelSerializer):
 
     def get_reportingManager(self, user):
         return user.reporting_manager.name if user.reporting_manager_id else None
+
+    def get_isCustomer(self, user):
+        return user.is_customer
 
     def get_permissions(self, user):
         """Role-derived plus overrides (api.md §3.1: "permissions[]" on detail)."""

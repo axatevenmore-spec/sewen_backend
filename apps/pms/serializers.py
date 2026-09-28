@@ -709,3 +709,250 @@ class StartConversationSerializer(BaseSerializer):
 
     kind = serializers.ChoiceField(choices=["Direct"])
     userId = serializers.CharField()
+
+
+# ---------------------------------------------------------------------------
+# Customer Project Tracking (api.md §10 & Role-Based Customer Tracking View)
+# ---------------------------------------------------------------------------
+class CustomerDocumentSerializer(BaseModelSerializer):
+    """Customer-safe document / proof view without internal comments or audit info."""
+
+    previewUrl = serializers.SerializerMethodField()
+    fileName = serializers.CharField(source="file_name", read_only=True)
+    fileSize = serializers.IntegerField(source="file_size", read_only=True)
+    approvalStatus = serializers.CharField(source="approval_status", read_only=True)
+    uploadedAt = serializers.DateTimeField(source="uploaded_at", read_only=True)
+    isProof = serializers.BooleanField(source="is_proof", read_only=True)
+
+    class Meta:
+        model = Document
+        fields = [
+            "id", "version", "fileName", "fileSize", "previewUrl",
+            "uploadedAt", "approvalStatus", "isProof",
+        ]
+
+    def get_previewUrl(self, document):
+        from apps.core.files import public_url
+        return public_url(document.file, self.context.get("request"))
+
+
+class CustomerProjectStageSerializer(BaseModelSerializer):
+    """Customer-safe view of a dynamic stage: preserves percentages, status, and dates."""
+
+    department = serializers.CharField(source="department.name", read_only=True)
+    percentage = serializers.DecimalField(
+        source="weight_pct", max_digits=5, decimal_places=2,
+        coerce_to_string=False, read_only=True,
+    )
+    completionPct = serializers.IntegerField(source="completion_pct", read_only=True)
+    plannedDuration = serializers.DecimalField(
+        source="planned_duration", max_digits=9, decimal_places=2,
+        coerce_to_string=False, read_only=True, allow_null=True,
+    )
+    durationUnit = serializers.CharField(source="duration_unit", read_only=True, allow_null=True)
+    startDateTime = serializers.DateTimeField(source="start_datetime", read_only=True, allow_null=True)
+    actualStartDateTime = serializers.DateTimeField(source="actual_start_datetime", read_only=True, allow_null=True)
+    expectedCompletionDateTime = serializers.DateTimeField(source="expected_completion_datetime", read_only=True, allow_null=True)
+    actualCompletionDateTime = serializers.DateTimeField(source="actual_completion_datetime", read_only=True, allow_null=True)
+    isOverdue = serializers.SerializerMethodField()
+    isDelayed = serializers.SerializerMethodField()
+    delayNotice = serializers.SerializerMethodField()
+    description = serializers.SerializerMethodField()
+    documents = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ProjectStage
+        fields = [
+            "id", "name", "sequence", "department", "status",
+            "completionPct", "percentage", "plannedDuration", "durationUnit",
+            "startDateTime", "actualStartDateTime", "expectedCompletionDateTime",
+            "actualCompletionDateTime", "isOverdue", "isDelayed", "delayNotice",
+            "description", "documents",
+        ]
+
+    def get_isOverdue(self, stage):
+        return services.is_stage_overdue(stage)
+
+    def _get_open_delay(self, stage):
+        delays_map = self.context.get("delays_by_stage")
+        if delays_map is not None:
+            delays = delays_map.get(stage.id, [])
+            return next((d for d in delays if d.resolved_at is None), None)
+        return stage.delays.filter(resolved_at__isnull=True, deleted_at__isnull=True).first()
+
+    def get_isDelayed(self, stage):
+        if stage.status == "Delayed":
+            return True
+        return self._get_open_delay(stage) is not None
+
+    def get_delayNotice(self, stage):
+        """Safe delay notification with new expected date and NO internal blame or reasons."""
+        open_delay = self._get_open_delay(stage)
+        if stage.status == "Delayed" or open_delay is not None:
+            new_date = None
+            if open_delay and open_delay.expected_recovery_date:
+                new_date = open_delay.expected_recovery_date.isoformat()
+            elif stage.expected_completion_datetime:
+                new_date = stage.expected_completion_datetime.isoformat()
+            return {
+                "message": "Delayed",
+                "newExpectedDate": new_date,
+            }
+        return None
+
+    def get_description(self, stage):
+        if stage.stage_config and stage.stage_config.description:
+            return stage.stage_config.description
+        return None
+
+    def get_documents(self, stage):
+        docs_map = self.context.get("documents_by_stage")
+        if docs_map is not None:
+            docs = docs_map.get(stage.id, [])
+        else:
+            docs = stage.documents.filter(deleted_at__isnull=True).select_related("file")
+        safe_docs = [
+            d for d in docs
+            if d.is_current and (d.is_proof or d.approval_status in ("Approved", "Pending"))
+        ]
+        return CustomerDocumentSerializer(safe_docs, many=True, context=self.context).data
+
+
+class CustomerProjectTrackingListSerializer(BaseModelSerializer):
+    """Compact summary of a project for customer tracking overview list."""
+
+    orderNumber = serializers.SerializerMethodField()
+    productName = serializers.SerializerMethodField()
+    overallCompletionPct = serializers.IntegerField(source="overall_completion_pct", read_only=True)
+    customerName = serializers.CharField(source="customer_name", read_only=True)
+    startDate = serializers.DateTimeField(source="start_date", read_only=True, allow_null=True)
+    expectedDeliveryDate = serializers.SerializerMethodField()
+    currentStage = serializers.SerializerMethodField()
+    stagesCount = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Project
+        fields = [
+            "id", "code", "orderNumber", "productName", "overallCompletionPct",
+            "status", "customerName", "startDate", "expectedDeliveryDate",
+            "currentStage", "stagesCount", "created_at",
+        ]
+
+    def get_orderNumber(self, project):
+        if project.sales_order_id and project.sales_order:
+            return project.sales_order.order_number
+        return None
+
+    def get_productName(self, project):
+        if project.product_name:
+            return project.product_name
+        if project.sales_order_id and project.sales_order:
+            first_line = project.sales_order.line_items.filter(deleted_at__isnull=True).order_by("line_no").first()
+            if first_line and first_line.item_name:
+                return first_line.item_name
+        return project.code
+
+    def get_expectedDeliveryDate(self, project):
+        if project.expected_completion_date:
+            return project.expected_completion_date.isoformat()
+        if project.sales_order_id and project.sales_order and project.sales_order.delivery_date:
+            return project.sales_order.delivery_date.isoformat()
+        return None
+
+    def get_currentStage(self, project):
+        stage = project.current_stage
+        if not stage:
+            return None
+        return {
+            "id": str(stage.id),
+            "name": stage.name,
+            "status": stage.status,
+            "completionPct": stage.completion_pct or 0,
+        }
+
+    def get_stagesCount(self, project):
+        return project.stages.filter(deleted_at__isnull=True).count()
+
+
+class CustomerProjectTrackingSerializer(BaseModelSerializer):
+    """Detailed customer-safe tracking view of a PMS project."""
+
+    orderNumber = serializers.SerializerMethodField()
+    productName = serializers.SerializerMethodField()
+    productImage = serializers.SerializerMethodField()
+    specifications = serializers.CharField(read_only=True)
+    quantity = serializers.DecimalField(max_digits=18, decimal_places=4, coerce_to_string=False, read_only=True)
+    overallCompletionPct = serializers.IntegerField(source="overall_completion_pct", read_only=True)
+    customerName = serializers.CharField(source="customer_name", read_only=True)
+    startDate = serializers.DateTimeField(source="start_date", read_only=True, allow_null=True)
+    expectedDeliveryDate = serializers.SerializerMethodField()
+    actualCompletionDate = serializers.DateTimeField(source="actual_completion_date", read_only=True, allow_null=True)
+    currentStage = serializers.SerializerMethodField()
+    stages = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Project
+        fields = [
+            "id", "code", "orderNumber", "productName", "productImage",
+            "specifications", "quantity", "overallCompletionPct", "status",
+            "customerName", "startDate", "expectedDeliveryDate", "actualCompletionDate",
+            "currentStage", "stages", "created_at", "updated_at",
+        ]
+
+    def get_orderNumber(self, project):
+        if project.sales_order_id and project.sales_order:
+            return project.sales_order.order_number
+        return None
+
+    def get_productName(self, project):
+        if project.product_name:
+            return project.product_name
+        if project.sales_order_id and project.sales_order:
+            first_line = project.sales_order.line_items.filter(deleted_at__isnull=True).order_by("line_no").first()
+            if first_line and first_line.item_name:
+                return first_line.item_name
+        return project.code
+
+    def get_productImage(self, project):
+        from apps.core.files import public_url
+        docs = self.context.get("all_documents")
+        if docs is None:
+            docs = Document.objects.filter(project=project, deleted_at__isnull=True).select_related("file")
+        image_extensions = (".png", ".jpg", ".jpeg", ".webp", ".svg", ".gif")
+        for doc in docs:
+            name = (doc.file_name or "").lower()
+            if any(name.endswith(ext) for ext in image_extensions):
+                return public_url(doc.file, self.context.get("request"))
+        return None
+
+    def get_expectedDeliveryDate(self, project):
+        if project.expected_completion_date:
+            return project.expected_completion_date.isoformat()
+        if project.sales_order_id and project.sales_order and project.sales_order.delivery_date:
+            return project.sales_order.delivery_date.isoformat()
+        return None
+
+    def get_currentStage(self, project):
+        stage = project.current_stage
+        stages = self.context.get("stages") or []
+        if not stage and stages:
+            stage = next((s for s in stages if s.status in ("In Progress", "Assigned", "Under Review")), None)
+            if not stage:
+                stage = stages[0]
+        if not stage:
+            return None
+        return {
+            "id": str(stage.id),
+            "name": stage.name,
+            "status": stage.status,
+            "sequence": stage.sequence,
+            "completionPct": stage.completion_pct or 0,
+            "percentage": float(stage.weight_pct or 0),
+            "expectedCompletionDate": stage.expected_completion_datetime.isoformat() if stage.expected_completion_datetime else None,
+        }
+
+    def get_stages(self, project):
+        stages = self.context.get("stages")
+        if stages is None:
+            stages = list(project.stages.filter(deleted_at__isnull=True).select_related("department", "stage_config").order_by("sequence"))
+        return CustomerProjectStageSerializer(stages, many=True, context=self.context).data
