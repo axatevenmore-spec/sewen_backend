@@ -160,7 +160,10 @@ class OwnEmployeeScopeMixin:
     def check_own_employee(self, employee):
         if self.has_team_scope():
             return
-        own = getattr(self.request.user, "employee_id", None)
+        resolved = None
+        if hasattr(self, "_resolve_employee"):
+            resolved = self._resolve_employee(self.request)
+        own = resolved.pk if resolved else getattr(self.request.user, "employee_id", None)
         if employee is None or own is None or employee.pk != own:
             raise PermissionDenied(
                 "You can only do this for your own employee record.",
@@ -433,7 +436,7 @@ class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
         # Marking a whole day for many people is a team action.
         "bulk": ["mark_attendance", "view_team_attendance"],
         "today": [],
-        "punch": ["mark_attendance"],
+        "punch": [],
         "correct_punch": ["regularize_attendance", "mark_attendance"],
         "punches": [],
         "punch_timeline": [],
@@ -603,6 +606,20 @@ class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
                 client_id=request.client_id, email__iexact=request.user.email, deleted_at__isnull=True
             ).first()
             if emp:
+                if not getattr(request.user, "employee_id", None) and hasattr(request.user, "save"):
+                    request.user.employee = emp
+                    request.user.save(update_fields=["employee"])
+                return emp
+
+        # Fallback to match user name with employee name
+        if getattr(request.user, "name", None):
+            emp = Employee.objects.filter(
+                client_id=request.client_id, name__iexact=request.user.name, deleted_at__isnull=True
+            ).first()
+            if emp:
+                if not getattr(request.user, "employee_id", None) and hasattr(request.user, "save"):
+                    request.user.employee = emp
+                    request.user.save(update_fields=["employee"])
                 return emp
 
         return None

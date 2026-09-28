@@ -234,8 +234,12 @@ class AttendancePunchSerializer(BaseModelSerializer):
 class AttendanceSerializer(BaseModelSerializer):
     employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
     employeeName = serializers.CharField(source="employee.name", read_only=True)
+    name = serializers.CharField(source="employee.name", read_only=True)
     employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
+    empId = serializers.CharField(source="employee.employee_code", read_only=True)
     department = serializers.CharField(source="employee.department.name", read_only=True)
+    dept = serializers.CharField(source="employee.department.name", read_only=True)
+    shift = serializers.CharField(source="employee.shift", read_only=True)
     date = serializers.DateField(source="work_date")
     checkIn = serializers.DateTimeField(source="check_in", required=False, allow_null=True)
     checkOut = serializers.DateTimeField(source="check_out", required=False, allow_null=True)
@@ -252,7 +256,8 @@ class AttendanceSerializer(BaseModelSerializer):
     class Meta:
         model = Attendance
         fields = [
-            "id", "employeeId", "employeeName", "employeeCode", "department",
+            "id", "employeeId", "employeeName", "name", "employeeCode", "empId",
+            "department", "dept", "shift",
             "date", "checkIn", "checkOut", "firstPunch", "lastPunch",
             "hours", "workingHours", "lateMinutes", "overtimeHours",
             "status", "source", "remark", "leave_request",
@@ -286,8 +291,16 @@ class AttendanceSerializer(BaseModelSerializer):
         ]
 
     def get_formattedWorkingHours(self, obj):
-        hours = obj.working_hours or obj.hours or 0
-        total_minutes = int(float(hours) * 60)
+        hours = float(obj.working_hours or obj.hours or 0)
+        if obj.work_date == timezone.localdate() and obj.check_out is None:
+            last_p = obj.punches.order_by("-punch_time").first()
+            if last_p and last_p.punch_type == "IN":
+                active_secs = max(0, (timezone.now() - last_p.punch_time).total_seconds())
+                total_minutes = int(hours * 60 + (active_secs // 60))
+                h = total_minutes // 60
+                m = total_minutes % 60
+                return f"{h:02d}h {m:02d}m"
+        total_minutes = int(hours * 60)
         h = total_minutes // 60
         m = total_minutes % 60
         return f"{h:02d}h {m:02d}m"

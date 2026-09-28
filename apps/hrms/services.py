@@ -281,7 +281,11 @@ def calculate_punch_metrics(client_id, employee, work_date, punches=None, now=No
 
     if not punches:
         status = "Absent"
-    elif working_hours < half_day_threshold and not is_punched_in:
+    elif is_punched_in:
+        status = "Late" if late_minutes > 0 else "Present"
+    elif working_hours == 0:
+        status = "Absent"
+    elif working_hours < half_day_threshold:
         status = "Half Day"
     elif late_minutes > 0:
         status = "Late"
@@ -448,6 +452,9 @@ def record_punch(
     first_punch_time = metrics["first_punch"].punch_time if metrics["first_punch"] else None
     last_punch_time = metrics["last_punch"].punch_time if metrics["last_punch"] else None
 
+    check_in_time = first_in or first_punch_time
+    check_out_time = None if metrics["is_punched_in"] else last_out
+
     # Upsert Attendance row
     att_row = Attendance.objects.select_for_update().filter(
         client_id=client_id, employee=employee, work_date=work_date
@@ -460,8 +467,8 @@ def record_punch(
     if att_row is not None:
         att_row.first_punch = first_punch_time
         att_row.last_punch = last_punch_time
-        att_row.check_in = first_in or first_punch_time
-        att_row.check_out = last_out or last_punch_time
+        att_row.check_in = check_in_time
+        att_row.check_out = check_out_time
         att_row.hours = metrics["working_hours"]
         att_row.working_hours = metrics["working_hours"]
         att_row.late_minutes = metrics["late_minutes"]
@@ -477,8 +484,8 @@ def record_punch(
             work_date=work_date,
             first_punch=first_punch_time,
             last_punch=last_punch_time,
-            check_in=first_in or first_punch_time,
-            check_out=last_out or last_punch_time,
+            check_in=check_in_time,
+            check_out=check_out_time,
             hours=metrics["working_hours"],
             working_hours=metrics["working_hours"],
             late_minutes=metrics["late_minutes"],
@@ -518,25 +525,49 @@ def correct_punch(*, client, employee, work_date, punch_type, punch_time, reason
 
     first_in = metrics["first_in"].punch_time if metrics["first_in"] else None
     last_out = metrics["last_out"].punch_time if metrics["last_out"] else None
+    first_punch_time = metrics["first_punch"].punch_time if metrics["first_punch"] else None
+    last_punch_time = metrics["last_punch"].punch_time if metrics["last_punch"] else None
+
+    check_in_time = first_in or first_punch_time
+    check_out_time = None if metrics["is_punched_in"] else last_out
 
     att_row = Attendance.objects.select_for_update().filter(
         client_id=client_id, employee=employee, work_date=work_date
     ).first()
 
     if att_row is not None:
-        att_row.first_punch = metrics["first_punch"].punch_time if metrics["first_punch"] else None
-        att_row.last_punch = metrics["last_punch"].punch_time if metrics["last_punch"] else None
-        att_row.check_in = first_in
-        att_row.check_out = last_out
+        att_row.first_punch = first_punch_time
+        att_row.last_punch = last_punch_time
+        att_row.check_in = check_in_time
+        att_row.check_out = check_out_time
         att_row.hours = metrics["working_hours"]
         att_row.working_hours = metrics["working_hours"]
         att_row.late_minutes = metrics["late_minutes"]
         att_row.overtime_hours = metrics["overtime_hours"]
         att_row.status = metrics["status"]
         att_row.source = "regularization"
+        att_row.updated_by = user if getattr(user, "is_authenticated", False) else None
         att_row.save()
-        punch.attendance = att_row
-        punch.save(update_fields=["attendance"])
+    else:
+        att_row = Attendance.objects.create(
+            client_id=client_id,
+            employee=employee,
+            work_date=work_date,
+            first_punch=first_punch_time,
+            last_punch=last_punch_time,
+            check_in=check_in_time,
+            check_out=check_out_time,
+            hours=metrics["working_hours"],
+            working_hours=metrics["working_hours"],
+            late_minutes=metrics["late_minutes"],
+            overtime_hours=metrics["overtime_hours"],
+            status=metrics["status"],
+            source="regularization",
+            created_by=user if getattr(user, "is_authenticated", False) else None,
+        )
+
+    punch.attendance = att_row
+    punch.save(update_fields=["attendance"])
 
     if getattr(user, "is_authenticated", False):
         record_audit(

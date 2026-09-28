@@ -159,3 +159,61 @@ class PunchSystemTests(TestCase):
         # Present for 1 day
         self.assertEqual(payslip.attended_days, Decimal("1.00"))
         self.assertTrue(payslip.net_payable > 0)
+
+    def test_punch_in_check_out_is_none_until_punch_out(self):
+        work_date = date(2026, 9, 28)
+        t1 = timezone.make_aware(datetime.combine(work_date, time(9, 30)))
+        services.record_punch(client=self.client_obj, employee=self.employee, punch_type="IN", punch_time=t1, user=self.user)
+        att = Attendance.objects.get(client=self.client_obj, employee=self.employee, work_date=work_date)
+        self.assertIsNotNone(att.check_in)
+        self.assertIsNone(att.check_out)
+
+        # After punch out, check_out is set
+        t2 = timezone.make_aware(datetime.combine(work_date, time(13, 0)))
+        services.record_punch(client=self.client_obj, employee=self.employee, punch_type="OUT", punch_time=t2, user=self.user)
+        att.refresh_from_db()
+        self.assertEqual(att.check_out, t2)
+
+        # After second punch in (e.g. back from lunch), check_out is None while on duty
+        t3 = timezone.make_aware(datetime.combine(work_date, time(14, 0)))
+        services.record_punch(client=self.client_obj, employee=self.employee, punch_type="IN", punch_time=t3, user=self.user)
+        att.refresh_from_db()
+        self.assertIsNone(att.check_out)
+
+        # After final punch out, check_out is the latest out time
+        t4 = timezone.make_aware(datetime.combine(work_date, time(18, 30)))
+        services.record_punch(client=self.client_obj, employee=self.employee, punch_type="OUT", punch_time=t4, user=self.user)
+        att.refresh_from_db()
+        self.assertEqual(att.check_out, t4)
+
+    def test_rapid_duplicate_punch_idempotent(self):
+        work_date = date(2026, 9, 28)
+        t1 = timezone.make_aware(datetime.combine(work_date, time(9, 30)))
+        p1, s1 = services.record_punch(client=self.client_obj, employee=self.employee, punch_type="IN", punch_time=t1, user=self.user)
+        # 2 seconds later accidental duplicate click
+        t2 = t1 + timedelta(seconds=2)
+        p2, s2 = services.record_punch(client=self.client_obj, employee=self.employee, punch_type="IN", punch_time=t2, user=self.user)
+        self.assertEqual(p1.id, p2.id)
+        self.assertEqual(AttendancePunch.objects.filter(employee=self.employee, work_date=work_date).count(), 1)
+
+    def test_half_day_rule_under_threshold(self):
+        work_date = date(2026, 9, 28)
+        # Worked 2.5 hours (under 4h threshold)
+        t1 = timezone.make_aware(datetime.combine(work_date, time(9, 30)))
+        t2 = timezone.make_aware(datetime.combine(work_date, time(12, 0)))
+        services.record_punch(client=self.client_obj, employee=self.employee, punch_type="IN", punch_time=t1, user=self.user)
+        services.record_punch(client=self.client_obj, employee=self.employee, punch_type="OUT", punch_time=t2, user=self.user)
+        att = Attendance.objects.get(client=self.client_obj, employee=self.employee, work_date=work_date)
+        self.assertEqual(att.status, "Half Day")
+        self.assertEqual(att.hours, Decimal("2.50"))
+
+    def test_overtime_calculation(self):
+        work_date = date(2026, 9, 28)
+        # Worked 9.5 hours (8h full day + 1.5h overtime)
+        t1 = timezone.make_aware(datetime.combine(work_date, time(9, 0)))
+        t2 = timezone.make_aware(datetime.combine(work_date, time(18, 30)))
+        services.record_punch(client=self.client_obj, employee=self.employee, punch_type="IN", punch_time=t1, user=self.user)
+        p, status = services.record_punch(client=self.client_obj, employee=self.employee, punch_type="OUT", punch_time=t2, user=self.user)
+        self.assertEqual(status["overtime_hours"], 1.5)
+        att = Attendance.objects.get(client=self.client_obj, employee=self.employee, work_date=work_date)
+        self.assertEqual(att.overtime_hours, Decimal("1.50"))
