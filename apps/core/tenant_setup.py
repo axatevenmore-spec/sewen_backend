@@ -31,6 +31,7 @@ KEPT_MODELS = {
     "accounts.UserPermission",
     "accounts.UserSession",
     "accounts.PasswordResetToken",
+    "accounts.PasswordResetOTP",
     # Workspace configuration.
     "core.NumberSeries",
     "core.Setting",

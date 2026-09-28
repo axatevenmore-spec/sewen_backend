@@ -81,8 +81,16 @@ class ForgotPasswordSerializer(BaseSerializer):
     email = serializers.EmailField()
 
 
+class VerifyOTPSerializer(BaseSerializer):
+    email = serializers.EmailField()
+    otp = serializers.CharField(min_length=6, max_length=6, trim_whitespace=True)
+
+
 class ResetPasswordSerializer(BaseSerializer):
-    token = serializers.CharField()
+    token = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    resetToken = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    email = serializers.EmailField(required=False, allow_blank=True, allow_null=True)
+    otp = serializers.CharField(required=False, allow_blank=True, allow_null=True, min_length=6, max_length=6, trim_whitespace=True)
     newPassword = serializers.CharField(write_only=True, trim_whitespace=False)
 
     def validate_newPassword(self, value):
@@ -91,6 +99,18 @@ class ResetPasswordSerializer(BaseSerializer):
         except DjangoValidationError as exc:
             raise serializers.ValidationError(list(exc.messages))
         return value
+
+    def validate(self, attrs):
+        token = attrs.get("resetToken") or attrs.get("token")
+        email = attrs.get("email")
+        otp = attrs.get("otp")
+
+        if not token and not (email and otp):
+            raise serializers.ValidationError(
+                "Either a reset token or both email and OTP are required to reset password."
+            )
+        return attrs
+
 
 
 class UpdateMeSerializer(BaseModelSerializer):

@@ -339,3 +339,27 @@ class PasswordResetToken(models.Model):
     @property
     def is_usable(self):
         return self.used_at is None and self.expires_at > timezone.now()
+
+
+class PasswordResetOTP(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="reset_otps")
+    email = models.EmailField(db_index=True)
+    otp_hash = models.CharField(max_length=128)
+    expires_at = models.DateTimeField()
+    used_at = models.DateTimeField(null=True, blank=True)
+    attempts = models.PositiveSmallIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "password_reset_otps"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["email", "expires_at"]),
+            models.Index(fields=["user", "created_at"]),
+        ]
+
+    @property
+    def is_usable(self):
+        return self.used_at is None and self.expires_at > timezone.now() and self.attempts < 5
+

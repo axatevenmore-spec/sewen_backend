@@ -38,9 +38,12 @@ from apps.core.throttling import LoginThrottle
 from apps.core.viewsets import TenantModelViewSet
 from apps.core.tenancy import set_current_client_id
 
+from django.conf import settings
+
 from .authentication import build_tokens
 from .models import (
     Client,
+    PasswordResetOTP,
     PasswordResetToken,
     Permission,
     Role,
@@ -65,7 +68,9 @@ from .serializers import (
     UserPermissionOverrideSerializer,
     UserSerializer,
     UserSessionSerializer,
+    VerifyOTPSerializer,
 )
+from apps.core.emails import send_password_reset_otp_email
 
 MAX_FAILED_LOGINS = 8
 LOCKOUT = timedelta(minutes=15)
@@ -73,6 +78,12 @@ LOCKOUT = timedelta(minutes=15)
 
 def _hash(token):
     return hashlib.sha256(token.encode()).hexdigest()
+
+
+def _hash_otp(user_id, otp):
+    secret = getattr(settings, "SECRET_KEY", "fallback-secret")
+    return hashlib.sha256(f"{user_id}:{otp}:{secret}".encode()).hexdigest()
+
 
 
 def _me_payload(user, request=None):
@@ -298,7 +309,7 @@ class ChangePasswordView(APIView):
 
 
 class ForgotPasswordView(APIView):
-    """api.md §2 -- always 204, never leak whether the address exists."""
+    """Sends a 6-digit OTP code to the user's email if an active account exists."""
 
     authentication_classes = []
     permission_classes = [AllowPublic]
@@ -313,20 +324,129 @@ class ForgotPasswordView(APIView):
             email=email, deleted_at__isnull=True, status="Active"
         ).first()
         if user is not None:
+            # 6-digit numeric OTP (100000 - 999999)
+            otp = f"{secrets.randbelow(900000) + 100000:06d}"
+
+            # Invalidate any previously pending OTPs for this user
+            PasswordResetOTP.objects.filter(user=user, used_at__isnull=True).update(
+                used_at=timezone.now()
+            )
+
+            # Store fresh OTP valid for 15 minutes
+            PasswordResetOTP.objects.create(
+                user=user,
+                email=email,
+                otp_hash=_hash_otp(user.id, otp),
+                expires_at=timezone.now() + timedelta(minutes=15),
+            )
+
+            # Also store reset token for fallback / backward compatibility
             token = secrets.token_urlsafe(48)
             PasswordResetToken.objects.create(
                 user=user,
                 token_hash=_hash(token),
-                expires_at=timezone.now() + timedelta(hours=2),
+                expires_at=timezone.now() + timedelta(minutes=15),
             )
-            # Delivery is the notification service's job; in dev the token is
-            # logged rather than emailed.
-            import logging
 
-            logging.getLogger(__name__).info(
-                "Password reset token for %s: %s", email, token
+            # Send OTP email
+            send_password_reset_otp_email(
+                email=email,
+                otp=otp,
+                user_name=user.name or "",
+                expiry_minutes=15,
             )
-        return Response(status=status.HTTP_204_NO_CONTENT)
+
+            import logging
+            logging.getLogger(__name__).info("Password reset OTP for %s: %s", email, otp)
+
+        return Response(
+            {
+                "message": "If that email address is registered with an active account, a 6-digit verification code has been sent.",
+                "email": email,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class VerifyOTPView(APIView):
+    """Verify the 6-digit OTP code sent to the user's email."""
+
+    authentication_classes = []
+    permission_classes = [AllowPublic]
+    throttle_classes = [LoginThrottle]
+
+    def post(self, request):
+        serializer = VerifyOTPSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        email = serializer.validated_data["email"].lower()
+        otp = serializer.validated_data["otp"].strip()
+
+        user = User.objects.filter(
+            email=email, deleted_at__isnull=True, status="Active"
+        ).first()
+
+        if user is None:
+            raise ValidationFailed(
+                "Invalid or expired verification code.",
+                code=Codes.INVALID_OTP,
+                field_errors={"otp": ["Invalid or expired verification code."]},
+            )
+
+        otp_record = (
+            PasswordResetOTP.objects.filter(
+                user=user,
+                used_at__isnull=True,
+                expires_at__gt=timezone.now(),
+            )
+            .order_by("-created_at")
+            .first()
+        )
+
+        if otp_record is None or not otp_record.is_usable:
+            raise ValidationFailed(
+                "Verification code has expired or was not requested. Please request a new code.",
+                code=Codes.OTP_EXPIRED,
+                field_errors={"otp": ["Verification code expired or not found."]},
+            )
+
+        if otp_record.attempts >= 5:
+            raise ValidationFailed(
+                "Too many incorrect attempts. Please request a new verification code.",
+                code=Codes.TOO_MANY_ATTEMPTS,
+                field_errors={"otp": ["Maximum attempts exceeded. Please request a new code."]},
+            )
+
+        expected_hash = _hash_otp(user.id, otp)
+        if otp_record.otp_hash != expected_hash:
+            otp_record.attempts += 1
+            otp_record.save(update_fields=["attempts"])
+            remaining = max(0, 5 - otp_record.attempts)
+            raise ValidationFailed(
+                f"Invalid verification code. {remaining} attempt(s) remaining.",
+                code=Codes.INVALID_OTP,
+                field_errors={"otp": ["Invalid verification code."]},
+            )
+
+        # OTP is verified! Generate a single-use reset token valid for 15 minutes
+        reset_token = secrets.token_urlsafe(48)
+        PasswordResetToken.objects.create(
+            user=user,
+            token_hash=_hash(reset_token),
+            expires_at=timezone.now() + timedelta(minutes=15),
+        )
+
+        # Mark OTP as used
+        otp_record.used_at = timezone.now()
+        otp_record.save(update_fields=["used_at"])
+
+        return Response(
+            {
+                "valid": True,
+                "message": "Verification code verified successfully.",
+                "resetToken": reset_token,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class ResetPasswordView(APIView):
@@ -337,29 +457,98 @@ class ResetPasswordView(APIView):
     def post(self, request):
         serializer = ResetPasswordSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        record = PasswordResetToken.objects.filter(
-            token_hash=_hash(serializer.validated_data["token"])
-        ).select_related("user").first()
+        new_password = serializer.validated_data["newPassword"]
+        token_str = serializer.validated_data.get("resetToken") or serializer.validated_data.get("token")
+        email = serializer.validated_data.get("email")
+        otp = serializer.validated_data.get("otp")
 
-        if record is None or not record.is_usable:
+        user = None
+        token_record = None
+        otp_record = None
+
+        if token_str:
+            token_record = PasswordResetToken.objects.filter(
+                token_hash=_hash(token_str)
+            ).select_related("user").first()
+
+            if token_record is None or not token_record.is_usable:
+                raise ValidationFailed(
+                    "That reset link or session is no longer valid. Please request a new one.",
+                    code=Codes.TOKEN_EXPIRED,
+                    field_errors={"token": ["Expired or already used."]},
+                )
+            user = token_record.user
+        elif email and otp:
+            email = email.lower().strip()
+            otp = otp.strip()
+            user = User.objects.filter(
+                email=email, deleted_at__isnull=True, status="Active"
+            ).first()
+
+            if user is None:
+                raise ValidationFailed(
+                    "Invalid or expired verification code.",
+                    code=Codes.INVALID_OTP,
+                    field_errors={"otp": ["Invalid or expired verification code."]},
+                )
+
+            otp_record = (
+                PasswordResetOTP.objects.filter(
+                    user=user,
+                    used_at__isnull=True,
+                    expires_at__gt=timezone.now(),
+                )
+                .order_by("-created_at")
+                .first()
+            )
+
+            if otp_record is None or not otp_record.is_usable:
+                raise ValidationFailed(
+                    "That verification code is no longer valid. Please request a new one.",
+                    code=Codes.OTP_EXPIRED,
+                    field_errors={"otp": ["Expired or already used."]},
+                )
+
+            if otp_record.otp_hash != _hash_otp(user.id, otp):
+                otp_record.attempts += 1
+                otp_record.save(update_fields=["attempts"])
+                raise ValidationFailed(
+                    "Invalid verification code.",
+                    code=Codes.INVALID_OTP,
+                    field_errors={"otp": ["Invalid verification code."]},
+                )
+            user = otp_record.user
+        else:
             raise ValidationFailed(
-                "That reset link is no longer valid. Request a new one.",
-                code=Codes.TOKEN_EXPIRED,
-                field_errors={"token": ["Expired or already used."]},
+                "Either a valid reset token or email and OTP are required.",
+                code=Codes.VALIDATION_FAILED,
             )
 
         with transaction.atomic():
-            user = record.user
-            user.set_password(serializer.validated_data["newPassword"])
+            user.set_password(new_password)
             user.failed_login_count = 0
             user.locked_until = None
             user.save(update_fields=["password", "failed_login_count", "locked_until"])
-            record.used_at = timezone.now()
-            record.save(update_fields=["used_at"])
+
+            if token_record:
+                token_record.used_at = timezone.now()
+                token_record.save(update_fields=["used_at"])
+
+            if otp_record:
+                otp_record.used_at = timezone.now()
+                otp_record.save(update_fields=["used_at"])
+
             UserSession.objects.filter(user=user, revoked_at__isnull=True).update(
                 revoked_at=timezone.now(), revoked_reason="password_reset"
             )
-        return Response(status=status.HTTP_204_NO_CONTENT)
+
+        return Response(
+            {
+                "message": "Password has been reset successfully. You can now sign in with your new password.",
+            },
+            status=status.HTTP_200_OK,
+        )
+
 
 
 class SessionListView(APIView):
@@ -533,15 +722,31 @@ class UserViewSet(TenantModelViewSet):
     def reset_password(self, request, pk=None):
         user = self.get_object()
         self._guard_target(user)
+
+        otp = f"{secrets.randbelow(900000) + 100000:06d}"
+        PasswordResetOTP.objects.filter(user=user, used_at__isnull=True).update(used_at=timezone.now())
+        PasswordResetOTP.objects.create(
+            user=user,
+            email=user.email,
+            otp_hash=_hash_otp(user.id, otp),
+            expires_at=timezone.now() + timedelta(minutes=30),
+        )
+
         token = secrets.token_urlsafe(48)
         PasswordResetToken.objects.create(
             user=user, token_hash=_hash(token), expires_at=timezone.now() + timedelta(hours=24)
         )
+        send_password_reset_otp_email(
+            email=user.email,
+            otp=otp,
+            user_name=getattr(user, "name", "") or "",
+            expiry_minutes=30,
+        )
         self.write_audit("reset_password", user, description="Admin-triggered password reset")
         import logging
 
-        logging.getLogger(__name__).info("Admin reset token for %s: %s", user.email, token)
-        return Response({"message": "A password reset email has been sent."})
+        logging.getLogger(__name__).info("Admin reset OTP for %s: %s (token: %s)", user.email, otp, token)
+        return Response({"message": f"A password reset verification code has been sent to {user.email}."})
 
     @action(detail=True, methods=["get", "post"], url_path="permissions")
     def permissions(self, request, pk=None):

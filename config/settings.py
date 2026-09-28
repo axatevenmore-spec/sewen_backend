@@ -231,6 +231,22 @@ PUBLIC_SHARE_DEFAULT_EXPIRY_DAYS = 14
 EXCHANGE_RATE_URL = env("EXCHANGE_RATE_URL", "https://open.er-api.com/v6/latest/USD")
 EXCHANGE_RATE_CACHE_SECONDS = 24 * 60 * 60
 
+# --------------------------------------------------------------------------
+# Email configuration
+# --------------------------------------------------------------------------
+EMAIL_BACKEND = env(
+    "EMAIL_BACKEND",
+    "django.core.mail.backends.console.EmailBackend" if DEBUG else "django.core.mail.backends.smtp.EmailBackend",
+)
+EMAIL_HOST = env("EMAIL_HOST", "smtp.gmail.com")
+EMAIL_PORT = int(env("EMAIL_PORT", "587"))
+EMAIL_USE_TLS = env_bool("EMAIL_USE_TLS", True)
+EMAIL_USE_SSL = env_bool("EMAIL_USE_SSL", False)
+EMAIL_HOST_USER = env("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", "")
+DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", "Evenmore ERP <noreply@evenmore.io>")
+EMAIL_TIMEOUT = int(env("EMAIL_TIMEOUT", "10"))
+
 CACHES = {
     "default": {
         "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
