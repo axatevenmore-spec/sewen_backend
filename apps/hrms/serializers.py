@@ -127,7 +127,7 @@ class EmployeeSerializer(BaseModelSerializer):
     locationId = TenantPrimaryKeyRelatedField(
         source="location", model="hrms.Location", required=False, allow_null=True
     )
-    joining = serializers.DateField(source="joining_date")
+    joining = serializers.DateField(source="joining_date", required=False, allow_null=True)
     employmentType = serializers.CharField(
         source="employment_type", required=False, allow_null=True
     )
@@ -151,7 +151,55 @@ class EmployeeSerializer(BaseModelSerializer):
         ]
         read_only_fields = ["employeeCode", "created_at", "updated_at"]
 
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            data = data.copy()
+            if "joining" not in data and "joiningDate" in data:
+                data["joining"] = data["joiningDate"]
+            elif "joining" not in data and "doj" in data:
+                data["joining"] = data["doj"]
+        return super().to_internal_value(data)
+
     def validate(self, attrs):
+        if not attrs.get("joining_date") and not self.instance:
+            attrs["joining_date"] = timezone.now().date()
+
+        # Resolve department / designation / location if names were passed instead of IDs
+        request = self.context.get("request")
+        client_id = getattr(request, "client_id", None) or (
+            getattr(getattr(request, "user", None), "client_id", None)
+        )
+        if client_id and hasattr(self, "initial_data") and isinstance(self.initial_data, dict):
+            if not attrs.get("department") and self.initial_data.get("department"):
+                d_name = str(self.initial_data["department"]).strip()
+                if d_name and d_name != "All":
+                    dept = Department.objects.filter(
+                        client_id=client_id, name__iexact=d_name, deleted_at__isnull=True
+                    ).first()
+                    if not dept:
+                        dept = Department.objects.create(client_id=client_id, name=d_name)
+                    attrs["department"] = dept
+
+            if not attrs.get("designation") and self.initial_data.get("designation"):
+                des_name = str(self.initial_data["designation"]).strip()
+                if des_name:
+                    desig = Designation.objects.filter(
+                        client_id=client_id, name__iexact=des_name, deleted_at__isnull=True
+                    ).first()
+                    if not desig:
+                        desig = Designation.objects.create(client_id=client_id, name=des_name)
+                    attrs["designation"] = desig
+
+            if not attrs.get("location") and self.initial_data.get("location"):
+                loc_name = str(self.initial_data["location"]).strip()
+                if loc_name:
+                    loc = Location.objects.filter(
+                        client_id=client_id, name__iexact=loc_name, deleted_at__isnull=True
+                    ).first()
+                    if not loc:
+                        loc = Location.objects.create(client_id=client_id, name=loc_name)
+                    attrs["location"] = loc
+
         manager = attrs.get("manager")
         if manager is not None and self.instance is not None:
             services.assert_no_manager_cycle(self.instance, manager.id)

@@ -144,7 +144,7 @@ class UserManager(BaseUserManager):
         if password and str(password).strip():
             user.set_password(str(password).strip())
         else:
-            user.set_password("Password@123")
+            user.set_password("")
         user.save(using=self._db)
         return user
 

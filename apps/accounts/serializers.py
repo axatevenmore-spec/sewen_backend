@@ -209,6 +209,43 @@ class UserSerializer(BaseModelSerializer):
         """Role-derived plus overrides (api.md §3.1: "permissions[]" on detail)."""
         return sorted(user.effective_permissions())
 
+    def to_internal_value(self, data):
+        ret = super().to_internal_value(data)
+        if isinstance(data, dict):
+            if "employeeId" in data and data["employeeId"]:
+                ret["_employee_id_input"] = str(data["employeeId"]).strip()
+        return ret
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        emp_input = attrs.pop("_employee_id_input", None)
+        client_id = self.context.get("client_id")
+        if client_id:
+            from apps.hrms.models import Employee
+            target_employee = None
+            if emp_input:
+                from uuid import UUID
+                try:
+                    target_uuid = UUID(str(emp_input))
+                    target_employee = Employee.objects.filter(
+                        client_id=client_id, id=target_uuid, deleted_at__isnull=True
+                    ).first()
+                except (ValueError, TypeError):
+                    target_employee = None
+                if not target_employee:
+                    target_employee = Employee.objects.filter(
+                        client_id=client_id, employee_code__iexact=emp_input, deleted_at__isnull=True
+                    ).first()
+
+            if not target_employee and attrs.get("email"):
+                target_employee = Employee.objects.filter(
+                    client_id=client_id, email__iexact=attrs["email"].strip(), deleted_at__isnull=True
+                ).first()
+
+            if target_employee:
+                attrs["employee"] = target_employee
+        return attrs
+
     def validate_email(self, value):
         value = value.lower()
         client_id = self.context.get("client_id")

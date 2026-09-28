@@ -267,6 +267,7 @@ class Task(TenantModel, LegacyIdMixin):
     start_date = models.DateField(null=True, blank=True)
     due_date = models.DateField(null=True, blank=True)
     completion_pct = models.SmallIntegerField(default=0)
+    weight_pct = models.DecimalField(decimal_places=2, default=0, max_digits=5)
     priority = models.TextField(choices=PRIORITIES, default="Medium")
     status = models.TextField(choices=TASK_STATUSES, default="Not Started")
 
@@ -277,7 +278,11 @@ class Task(TenantModel, LegacyIdMixin):
             models.CheckConstraint(
                 condition=models.Q(completion_pct__gte=0, completion_pct__lte=100),
                 name="ck_pms_task_pct",
-            )
+            ),
+            models.CheckConstraint(
+                condition=models.Q(weight_pct__gte=0, weight_pct__lte=100),
+                name="ck_pms_task_weight_pct",
+            ),
         ]
         indexes = [
             models.Index(

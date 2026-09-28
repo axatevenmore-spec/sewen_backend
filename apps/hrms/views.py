@@ -206,27 +206,47 @@ class EmployeeViewSet(TenantModelViewSet):
         )
         employee = super().perform_create(serializer)
 
-        # api.md §11.1 -- "also provisions a user account when asked".
-        if self.request.data.get("createUserAccount") and employee.email:
-            from apps.accounts.models import User
+        # api.md §11.1 -- Connect employee with Administration user account
+        if employee.email:
+            from apps.accounts.models import User, Role
+            client_id = self.get_client_id()
+            normalized_email = employee.email.strip().lower()
 
-            if not User.objects.filter(
-                client_id=self.get_client_id(), email=employee.email.lower(),
+            existing_user = User.objects.filter(
+                client_id=client_id, email=normalized_email,
                 deleted_at__isnull=True,
-            ).exists():
+            ).first()
+
+            if existing_user:
+                if not existing_user.employee_id:
+                    existing_user.employee = employee
+                    existing_user.save(update_fields=["employee", "updated_at"])
+                    self.write_audit(
+                        "link_user", employee,
+                        description=f"Linked user account {existing_user.email} to employee {employee.employee_code}",
+                    )
+            elif self.request.data.get("createUserAccount", True):
                 emp_password = (
                     self.request.data.get("password")
                     or self.request.data.get("userPassword")
                     or "Password@123"
                 )
+                role_id = self.request.data.get("roleId")
+                emp_role = None
+                if role_id:
+                    emp_role = Role.objects.filter(client_id=client_id, pk=role_id).first()
+                if not emp_role:
+                    emp_role = Role.objects.filter(client_id=client_id, code__in=["EM", "EMP"]).first()
+
                 user = User.objects.create_user(
-                    email=employee.email,
+                    email=normalized_email,
                     password=emp_password,
-                    client_id=self.get_client_id(),
+                    client_id=client_id,
                     name=employee.name,
                     phone=employee.phone,
                     employee=employee,
                     department=employee.department.name if employee.department_id else None,
+                    role=emp_role,
                     status="Active",
                 )
                 self.write_audit(
