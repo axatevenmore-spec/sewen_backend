@@ -167,8 +167,48 @@ class OwnEmployeeScopeMixin:
         if employee is None or own is None or employee.pk != own:
             raise PermissionDenied(
                 "You can only do this for your own employee record.",
-                code=self.team_scope_permissions[0],
+                code=self.team_scope_permissions[0] if self.team_scope_permissions else "PERMISSION_DENIED",
             )
+
+    def _resolve_employee(self, request, employee_id=None):
+        client_id = getattr(request, "client_id", None) or getattr(request.user, "client_id", None)
+        if employee_id:
+            try:
+                emp = Employee.objects.filter(
+                    pk=employee_id, client_id=client_id, deleted_at__isnull=True
+                ).first()
+                if emp:
+                    return emp
+            except (ValueError, TypeError, Exception):
+                pass
+            return Employee.objects.filter(
+                employee_code=employee_id, client_id=client_id, deleted_at__isnull=True
+            ).first()
+
+        if getattr(request.user, "employee", None):
+            return request.user.employee
+
+        if getattr(request.user, "email", None):
+            emp = Employee.objects.filter(
+                client_id=client_id, email__iexact=request.user.email, deleted_at__isnull=True
+            ).first()
+            if emp:
+                if not getattr(request.user, "employee_id", None) and hasattr(request.user, "save"):
+                    request.user.employee = emp
+                    request.user.save(update_fields=["employee"])
+                return emp
+
+        if getattr(request.user, "name", None):
+            emp = Employee.objects.filter(
+                client_id=client_id, name__iexact=request.user.name, deleted_at__isnull=True
+            ).first()
+            if emp:
+                if not getattr(request.user, "employee_id", None) and hasattr(request.user, "save"):
+                    request.user.employee = emp
+                    request.user.save(update_fields=["employee"])
+                return emp
+
+        return None
 
 # ---------------------------------------------------------------------------
 # Organisation (api.md §11.1)
@@ -676,6 +716,16 @@ class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
 
         remark = request.data.get("remark") or request.data.get("notes")
         source = request.data.get("source") or "web"
+        early_reason = (
+            request.data.get("earlyReason")
+            or request.data.get("early_reason")
+            or request.data.get("reason")
+        )
+        request_regularization = bool(
+            request.data.get("requestRegularization")
+            or request.data.get("request_regularization")
+            or request.data.get("createRegularization")
+        )
 
         punch_obj, status_data = services.record_punch(
             client=request.user.client,
@@ -683,6 +733,8 @@ class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
             punch_type=punch_type,
             source=source,
             remark=remark,
+            early_reason=early_reason,
+            request_regularization=request_regularization,
             user=request.user,
         )
         return Response(
@@ -769,7 +821,7 @@ class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
         return Response(AttendancePunchSerializer(punches, many=True).data)
 
 
-class RegularizationViewSet(TenantModelViewSet):
+class RegularizationViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
     queryset = AttendanceRegularization.objects.select_related("employee")
     serializer_class = RegularizationSerializer
     audit_entity_type = "AttendanceRegularization"
@@ -777,7 +829,18 @@ class RegularizationViewSet(TenantModelViewSet):
     default_date_field = "work_date"
     ordering = ["-work_date"]
     filter_map = {"employeeId": "employee_id"}
-    permission_map = {"read": ["view_team_attendance"], "write": ["regularize_attendance"]}
+    team_scope_permissions = ("view_team_attendance",)
+    permission_map = {"read": [], "create": [], "write": ["regularize_attendance"]}
+
+    def perform_create(self, serializer):
+        employee = serializer.validated_data.get("employee")
+        if not employee:
+            resolved = self._resolve_employee(self.request)
+            if resolved:
+                serializer.validated_data["employee"] = resolved
+                employee = resolved
+        self.check_own_employee(employee)
+        return super().perform_create(serializer)
 
     @transaction.atomic
     def perform_update(self, serializer):

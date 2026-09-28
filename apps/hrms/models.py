@@ -300,6 +300,7 @@ class Attendance(TenantModel):
     last_punch = models.DateTimeField(null=True, blank=True)
     working_hours = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
     late_minutes = models.IntegerField(default=0)
+    early_leaving_minutes = models.IntegerField(default=0)
     overtime_hours = models.DecimalField(max_digits=6, decimal_places=2, default=0)
     #: DERIVED from check-in/out plus the attendance_flexibility policy.
     hours = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)

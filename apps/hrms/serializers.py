@@ -247,10 +247,13 @@ class AttendanceSerializer(BaseModelSerializer):
     lastPunch = serializers.DateTimeField(source="last_punch", required=False, allow_null=True)
     workingHours = serializers.DecimalField(source="working_hours", max_digits=6, decimal_places=2, required=False, allow_null=True)
     lateMinutes = serializers.IntegerField(source="late_minutes", required=False)
+    earlyLeavingMinutes = serializers.IntegerField(source="early_leaving_minutes", required=False)
     overtimeHours = serializers.DecimalField(source="overtime_hours", max_digits=6, decimal_places=2, required=False)
     punches = serializers.SerializerMethodField()
     formattedWorkingHours = serializers.SerializerMethodField()
     lateDisplay = serializers.SerializerMethodField()
+    earlyDisplay = serializers.SerializerMethodField()
+    isEarlyOut = serializers.SerializerMethodField()
     overtimeDisplay = serializers.SerializerMethodField()
 
     class Meta:
@@ -259,16 +262,17 @@ class AttendanceSerializer(BaseModelSerializer):
             "id", "employeeId", "employeeName", "name", "employeeCode", "empId",
             "department", "dept", "shift",
             "date", "checkIn", "checkOut", "firstPunch", "lastPunch",
-            "hours", "workingHours", "lateMinutes", "overtimeHours",
+            "hours", "workingHours", "lateMinutes", "earlyLeavingMinutes", "overtimeHours",
             "status", "source", "remark", "leave_request",
-            "punches", "formattedWorkingHours", "lateDisplay", "overtimeDisplay",
+            "punches", "formattedWorkingHours", "lateDisplay", "earlyDisplay", "isEarlyOut", "overtimeDisplay",
             "created_at", "updated_at",
         ]
         # `hours` and the Late / Half Day verdict come from the flexibility
         # policy, applied server-side (api.md §11.2).
         read_only_fields = [
             "hours", "workingHours", "firstPunch", "lastPunch", "lateMinutes",
-            "overtimeHours", "punches", "formattedWorkingHours", "lateDisplay", "overtimeDisplay",
+            "earlyLeavingMinutes", "overtimeHours", "punches", "formattedWorkingHours",
+            "lateDisplay", "earlyDisplay", "isEarlyOut", "overtimeDisplay",
             "source", "leave_request", "created_at", "updated_at"
         ]
 
@@ -317,6 +321,20 @@ class AttendanceSerializer(BaseModelSerializer):
             m = total_minutes % 60
             return f"+{h:02d}h {m:02d}m"
         return "0h 00m"
+
+    def get_earlyDisplay(self, obj):
+        mins = getattr(obj, "early_leaving_minutes", 0) or 0
+        if mins > 0:
+            return f"{mins} min early"
+        return "-"
+
+    def get_isEarlyOut(self, obj):
+        mins = getattr(obj, "early_leaving_minutes", 0) or 0
+        if mins > 0:
+            return True
+        if obj.check_out is not None and obj.working_hours is not None and obj.working_hours < 8:
+            return True
+        return False
 
     def to_internal_value(self, data):
         data = data.copy() if hasattr(data, "copy") else dict(data)
