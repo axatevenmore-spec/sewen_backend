@@ -16,6 +16,7 @@ auth_urlpatterns = [
     path("me/", views.MeView.as_view(), name="auth-me"),
     path("change-password/", views.ChangePasswordView.as_view(), name="auth-change-password"),
     path("forgot-password/", views.ForgotPasswordView.as_view(), name="auth-forgot-password"),
+    path("verify-otp/", views.VerifyOTPView.as_view(), name="auth-verify-otp"),
     path("reset-password/", views.ResetPasswordView.as_view(), name="auth-reset-password"),
     path("sessions/", views.SessionListView.as_view(), name="auth-sessions"),
     path("sessions/<uuid:pk>/", views.SessionDetailView.as_view(), name="auth-session-detail"),

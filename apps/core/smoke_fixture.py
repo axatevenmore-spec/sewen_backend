@@ -1,71 +1,54 @@
 """
-Seed a demo tenant (api.md §13, db.md §14).
+Fixture data for ``manage.py smoke_test`` -- never for a real tenant.
 
-Follows the seeder rules of db.md §14.1:
+The smoke test provisions a throwaway tenant, fills it through ``build()``,
+exercises the API against it and deletes it again, so none of these rows ever
+reach a workspace people use. Real tenants are provisioned empty by
+``manage.py setup_tenant`` (see ``apps.core.tenant_setup``).
 
-  1. Dates are ISO -- nothing here emits the mock files' ``"27/08/2026"``.
-  2. Every row keeps its mock id in ``legacy_id`` so cross-references resolve.
+Rules the fixture follows (db.md §14.1):
+
+  1. Dates are ISO.
+  2. Every row keeps a fixture id in ``legacy_id`` so cross-references resolve.
   3. **Derive, do not copy, derived fields.** Stock, balances and document
      totals are produced by posting the underlying rows -- movements, ledger
      entries, lines -- not by writing a snapshot figure.
-  4. Seeds in dependency order: tenant -> permissions/roles/users -> masters ->
+  4. Builds in dependency order: tenant -> roles/users -> masters ->
      accounts -> documents -> movements/ledger -> CRM -> PMS -> HRMS.
-  5. Idempotent: every insert is keyed on ``(client_id, legacy_id)``.
 """
 from datetime import timedelta
 from decimal import Decimal
 
-from django.core.management.base import BaseCommand
 from django.db import transaction
 from django.utils import timezone
 
-from apps.core.numbering import allocate_number, seed_series_for_client
+from apps.core.numbering import allocate_number
 from apps.core.tenancy import tenant_context
 
 
-class Command(BaseCommand):
-    help = "Create or refresh a demo tenant with representative data."
+class _Quiet:
+    def write(self, *args, **kwargs):
+        pass
 
-    def add_arguments(self, parser):
-        parser.add_argument("--tenant", default="sweven", help="Tenant slug.")
-        parser.add_argument("--name", default="Sweven Fabricators", help="Tenant name.")
-        parser.add_argument(
-            "--email", default="admin@sweven.test", help="Administrator email."
-        )
-        parser.add_argument("--password", default="Sweven@2026", help="Administrator password.")
-        parser.add_argument(
-            "--reset",
-            action="store_true",
-            help="Delete the tenant's existing demo rows before seeding.",
-        )
 
-    def handle(self, *args, **options):
-        from apps.accounts.models import Client
+def build(client, email, password):
+    """Fill ``client`` with the fixture and return its administrator."""
+    return SmokeFixture().build(client, {"email": email, "password": password})
 
-        slug = options["tenant"]
-        client, created = Client.objects.get_or_create(
-            slug=slug,
-            defaults={
-                "name": options["name"],
-                "plan": "Enterprise",
-                "currency": "INR",
-                "fy_start_month": 4,
-                "is_demo": True,
-                "onboarded_on": timezone.localdate(),
-            },
-        )
-        self.stdout.write(
-            self.style.SUCCESS(f"{'Created' if created else 'Using'} tenant {client.name}")
-        )
 
-        if options["reset"]:
-            self._reset(client)
+class SmokeFixture:
+    stdout = _Quiet()
+
+    def build(self, client, options):
+        from apps.core.tenant_setup import bootstrap_configuration
 
         with tenant_context(client.id, push_to_db=False):
             with transaction.atomic():
-                seed_series_for_client(client)
                 admin = self._seed_access(client, options)
+                # Company first: bootstrap only fills a profile that is missing,
+                # and the fixture's state code drives CGST+SGST vs IGST.
                 self._seed_company(client)
+                bootstrap_configuration(client)
                 accounts = self._seed_accounts(client)
                 masters = self._seed_masters(client, admin)
                 self._seed_opening_stock(client, masters, admin)
@@ -74,39 +57,13 @@ class Command(BaseCommand):
                 self._seed_crm(client, admin)
                 self._seed_pms(client, admin)
                 self._seed_hrms(client, admin)
-
-        self.stdout.write(self.style.SUCCESS("\nDemo data ready."))
-        self.stdout.write(f"  Tenant   : {client.name} ({client.slug})")
-        self.stdout.write(f"  Sign in  : {options['email']} / {options['password']}")
-
-    # -- reset -------------------------------------------------------------
-    def _reset(self, client):
-        """Truncate the tenant's rows in reverse dependency order (db.md §14.1)."""
-        from apps.core.snapshot import SNAPSHOT_MODELS
-        from django.apps import apps as django_apps
-
-        self.stdout.write("Resetting demo data...")
-        for label in reversed(SNAPSHOT_MODELS):
-            model = django_apps.get_model(label)
-            if label == "accounts.User":
-                model.objects.filter(client=client, is_superuser=False).delete()
-                continue
-            if hasattr(model, "client_id"):
-                model.objects.filter(client=client).delete()
-
-        from apps.core.models import AuditLog, File, Notification
-
-        AuditLog.objects.filter(client=client).delete()
-        Notification.objects.filter(client=client).delete()
-        File.objects.filter(client=client).delete()
+        return admin
 
     # -- §14.1 step 4, in order --------------------------------------------
     def _seed_access(self, client, options):
         from apps.accounts.models import Role, User
-        from apps.accounts.permission_catalogue import seed_roles, sync_permissions
+        from apps.accounts.permission_catalogue import seed_roles
 
-        created, updated = sync_permissions()
-        self.stdout.write(f"  permissions: +{created} ~{updated}")
         seed_roles(client)
 
         role_by_code = {role.code: role for role in Role.objects.filter(client=client)}
@@ -115,7 +72,7 @@ class Command(BaseCommand):
             client=client,
             email=options["email"].lower(),
             defaults={
-                "name": "Demo Administrator",
+                "name": "Smoke Administrator",
                 "role": role_by_code.get("AD"),
                 "status": "Active",
                 "joined_date": timezone.localdate(),

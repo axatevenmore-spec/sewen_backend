@@ -363,37 +363,39 @@ class CompleteTaskSerializer(BaseSerializer):
     completedBy = serializers.CharField(required=False, allow_null=True)
 
 
-class TaskAllocationAuditSerializer(BaseModelSerializer):
-    at = serializers.DateTimeField(source="created_at", read_only=True)
+# Hidden: Task Allocation duplicates CRM Tasks -- restore by uncommenting this block.
+# class TaskAllocationAuditSerializer(BaseModelSerializer):
+#     at = serializers.DateTimeField(source="created_at", read_only=True)
 
-    class Meta:
-        model = TaskAllocationAudit
-        fields = ["id", "action", "text", "at"]
+#     class Meta:
+#         model = TaskAllocationAudit
+#         fields = ["id", "action", "text", "at"]
 
 
-class TaskAllocationSerializer(BaseModelSerializer):
-    """A separate entity from lead tasks -- internal work assignment (api.md §9.3)."""
+# Hidden: Task Allocation duplicates CRM Tasks -- restore by uncommenting this block.
+# class TaskAllocationSerializer(BaseModelSerializer):
+#     """A separate entity from lead tasks -- internal work assignment (api.md §9.3)."""
 
-    assignee = serializers.CharField(source="assignee.name", read_only=True)
-    assigneeId = TenantPrimaryKeyRelatedField(
-        source="assignee", model="accounts.User", required=False, allow_null=True
-    )
-    assignedBy = serializers.CharField(source="assigned_by.name", read_only=True)
-    fileName = serializers.CharField(
-        source="file_name", required=False, allow_null=True, allow_blank=True
-    )
-    audit = TaskAllocationAuditSerializer(
-        source="audit_entries", many=True, read_only=True
-    )
+#     assignee = serializers.CharField(source="assignee.name", read_only=True)
+#     assigneeId = TenantPrimaryKeyRelatedField(
+#         source="assignee", model="accounts.User", required=False, allow_null=True
+#     )
+#     assignedBy = serializers.CharField(source="assigned_by.name", read_only=True)
+#     fileName = serializers.CharField(
+#         source="file_name", required=False, allow_null=True, allow_blank=True
+#     )
+#     audit = TaskAllocationAuditSerializer(
+#         source="audit_entries", many=True, read_only=True
+#     )
 
-    class Meta:
-        model = TaskAllocation
-        fields = [
-            "id", "title", "description", "department", "assignee", "assigneeId",
-            "assignedBy", "priority", "deadline", "status", "fileName", "audit",
-            "created_at", "updated_at",
-        ]
-        read_only_fields = ["created_at", "updated_at"]
+#     class Meta:
+#         model = TaskAllocation
+#         fields = [
+#             "id", "title", "description", "department", "assignee", "assigneeId",
+#             "assignedBy", "priority", "deadline", "status", "fileName", "audit",
+#             "created_at", "updated_at",
+#         ]
+#         read_only_fields = ["created_at", "updated_at"]
 
 
 # ---------------------------------------------------------------------------
@@ -490,25 +492,27 @@ class CrmProjectSerializer(BaseModelSerializer):
         ]
 
 
-class UserAllocationSerializer(BaseModelSerializer):
-    userId = TenantPrimaryKeyRelatedField(source="user", model="accounts.User")
-    userName = serializers.CharField(source="user.name", read_only=True)
+# Hidden: User Tracking out of scope (Sweven spec) -- restore by uncommenting this block.
+# class UserAllocationSerializer(BaseModelSerializer):
+#     userId = TenantPrimaryKeyRelatedField(source="user", model="accounts.User")
+#     userName = serializers.CharField(source="user.name", read_only=True)
 
-    class Meta:
-        model = UserAllocation
-        fields = [
-            "id", "userId", "userName", "territory", "city", "state",
-            "industry", "weight", "is_active",
-        ]
+#     class Meta:
+#         model = UserAllocation
+#         fields = [
+#             "id", "userId", "userName", "territory", "city", "state",
+#             "industry", "weight", "is_active",
+#         ]
 
 
-class UserLocationSerializer(BaseModelSerializer):
-    userId = serializers.CharField(source="user_id")
-    recordedAt = serializers.DateTimeField(source="recorded_at")
+# Hidden: User Tracking / field GPS map out of scope (Sweven spec) -- restore by uncommenting this block.
+# class UserLocationSerializer(BaseModelSerializer):
+#     userId = serializers.CharField(source="user_id")
+#     recordedAt = serializers.DateTimeField(source="recorded_at")
 
-    class Meta:
-        model = UserLocation
-        fields = ["id", "userId", "latitude", "longitude", "accuracy", "recordedAt"]
+#     class Meta:
+#         model = UserLocation
+#         fields = ["id", "userId", "latitude", "longitude", "accuracy", "recordedAt"]
 
 
 class FormSerializer(BaseModelSerializer):

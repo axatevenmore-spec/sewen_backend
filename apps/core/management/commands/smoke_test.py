@@ -11,6 +11,11 @@ serializers rather than by calling services directly:
   4. confirm the list envelope and the error contract
 
 Run with:  python manage.py smoke_test
+
+By default the test builds a throwaway tenant from ``apps.core.smoke_fixture``,
+runs against it and deletes it afterwards, so no real workspace is touched.
+``--email``/``--password`` run it against an existing tenant instead; that
+tenant then needs the fixture's items, customer, lead, project and employees.
 """
 import json
 import uuid
@@ -26,11 +31,14 @@ class SmokeFailure(Exception):
 
 
 class Command(BaseCommand):
-    help = "Run an end-to-end HTTP smoke test against the seeded demo tenant."
+    help = "Run an end-to-end HTTP smoke test against a throwaway fixture tenant."
 
     def add_arguments(self, parser):
-        parser.add_argument("--email", default="admin@sweven.test")
-        parser.add_argument("--password", default="Sweven@2026")
+        parser.add_argument("--email", help="Run against this existing administrator instead.")
+        parser.add_argument("--password")
+        parser.add_argument(
+            "--keep", action="store_true", help="Keep the throwaway tenant for inspection."
+        )
 
     def handle(self, *args, **options):
         from django.conf import settings
@@ -49,6 +57,74 @@ class Command(BaseCommand):
         self.token = None
         self.passed = 0
         self.failed = 0
+
+        fixture_client = None
+        if not options.get("email"):
+            fixture_client = self._build_fixture_tenant()
+        try:
+            self._run_steps()
+        finally:
+            if fixture_client is not None and not options.get("keep"):
+                self._drop_fixture_tenant(fixture_client)
+
+    def _build_fixture_tenant(self):
+        from apps.accounts.models import Client, Permission
+        from apps.accounts.permission_catalogue import sync_permissions
+        from apps.core import smoke_fixture
+
+        # Only a database that has never been provisioned lacks the catalogue.
+        if not Permission.objects.exists():
+            sync_permissions()
+        slug = f"smoke-{self.run_id}"
+        client = Client.objects.create(
+            slug=slug, name=f"Smoke {self.run_id}", plan="Enterprise", currency="INR",
+            fy_start_month=4, onboarded_on=timezone.localdate(),
+        )
+        self.options_email = f"admin@{slug}.test"
+        self.options_password = uuid.uuid4().hex
+        smoke_fixture.build(client, self.options_email, self.options_password)
+        self.stdout.write(f"Fixture tenant {slug}")
+        return client
+
+    def _drop_fixture_tenant(self, client):
+        """Delete the throwaway tenant, its rows and its own media folder only."""
+        import shutil
+        from pathlib import Path
+
+        from django.apps import apps
+        from django.conf import settings
+        from django.db import transaction
+        from django.db.models import ProtectedError, RestrictedError
+
+        from apps.core.tenancy import tenant_context
+        from apps.core.tenant_setup import clear_business_data
+
+        with tenant_context(client.id, push_to_db=False):
+            clear_business_data(client)
+            with transaction.atomic():
+                pending = [
+                    model for model in apps.get_models()
+                    if "client" in {field.name for field in model._meta.fields}
+                ]
+                while pending:
+                    blocked = []
+                    for model in pending:
+                        try:
+                            with transaction.atomic():
+                                model._base_manager.filter(client=client).delete()
+                        except (ProtectedError, RestrictedError):
+                            blocked.append(model)
+                    if len(blocked) == len(pending):
+                        raise SmokeFailure("could not drop the fixture tenant")
+                    pending = blocked
+                client.delete()
+
+        folder = Path(settings.MEDIA_ROOT) / str(client.id)
+        if folder.is_dir():
+            shutil.rmtree(folder)
+        self.stdout.write(f"Dropped fixture tenant {client.slug}")
+
+    def _run_steps(self):
 
         steps = [
             ("auth: login", self.step_login),
@@ -470,8 +546,8 @@ class Command(BaseCommand):
         return f"{len(response.content) // 1024} KB OpenAPI document"
 
     # -- option plumbing ---------------------------------------------------
-    options_email = "admin@sweven.test"
-    options_password = "Sweven@2026"
+    options_email = None
+    options_password = None
 
     def execute(self, *args, **options):
         self.options_email = options.get("email") or self.options_email

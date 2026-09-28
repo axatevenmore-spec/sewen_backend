@@ -1,5 +1,5 @@
 """
-Company profile, backup / restore and demo-data reset (api.md §3.4).
+Company profile, backup / restore and data reset (api.md §3.4).
 
 These replace ``exportDatabaseSnapshot()``, ``importDatabaseSnapshot()`` and
 ``resetDemoData()``, which today serialise the whole of ``localStorage``.
@@ -124,7 +124,12 @@ class RestoreView(APIView):
 
 
 class ResetDemoDataView(APIView):
-    """``POST /settings/reset-demo-data/`` -- non-production only (api.md §3.4)."""
+    """``POST /settings/reset-demo-data/`` -- non-production only (api.md §3.4).
+
+    Erases the tenant's business data and leaves an empty workspace: users,
+    roles, permissions, company profile, settings and stage catalogues stay.
+    Nothing is re-seeded.
+    """
 
     permission_classes = [HasModulePermission]
     required_permissions = ["system_backup"]
@@ -133,11 +138,15 @@ class ResetDemoDataView(APIView):
         client = request.user.client
         if not client.is_demo and not django_settings.DEBUG:
             raise PermissionDenied(
-                "Demo data can only be reset on a demo workspace.",
+                "Data can only be reset on a demo or development workspace.",
                 code="NOT_A_DEMO_TENANT",
             )
 
-        from django.core.management import call_command
+        from .tenant_setup import bootstrap_configuration, clear_business_data
 
-        call_command("seed_demo", tenant=client.slug, reset=True, verbosity=0)
-        return Response({"message": "Demo data has been reset."})
+        deleted = clear_business_data(client)
+        with transaction.atomic():
+            bootstrap_configuration(client)
+        return Response(
+            {"message": "All business data has been erased.", "deleted": sum(deleted.values())}
+        )

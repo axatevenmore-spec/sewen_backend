@@ -194,59 +194,62 @@ class FaultyPartSerializer(BaseModelSerializer):
         ]
 
 
-class ServiceUsageSerializer(BaseModelSerializer):
-    itemId = TenantPrimaryKeyRelatedField(source="item", queryset=Item.objects.all())
-    sku = serializers.CharField(source="item.sku", read_only=True)
-    qty = QuantityField(source="quantity")
-    date = serializers.DateField(source="used_on")
+# Hidden: Service Usage out of scope (Sweven spec) -- restore by uncommenting this block.
+# class ServiceUsageSerializer(BaseModelSerializer):
+#     itemId = TenantPrimaryKeyRelatedField(source="item", queryset=Item.objects.all())
+#     sku = serializers.CharField(source="item.sku", read_only=True)
+#     qty = QuantityField(source="quantity")
+#     date = serializers.DateField(source="used_on")
 
-    class Meta:
-        model = ServiceUsage
-        fields = [
-            "id", "ticket_number", "technician", "itemId", "sku", "qty", "date",
-            "notes", "job_reference", "chargeable", "created_at",
-        ]
-        read_only_fields = ["ticket_number", "created_at"]
-
-
-class ZoneRequestLineSerializer(BaseModelSerializer):
-    itemId = TenantPrimaryKeyRelatedField(source="item", queryset=Item.objects.all())
-    sku = serializers.CharField(source="item.sku", read_only=True)
-    product = serializers.CharField(source="item.name", read_only=True)
-    qty = QuantityField(source="requested_qty")
-    warehouseStock = serializers.SerializerMethodField()
-
-    class Meta:
-        model = ZoneRequestLine
-        fields = ["id", "itemId", "sku", "product", "qty", "issued_qty", "warehouseStock"]
-
-    def get_warehouseStock(self, line):
-        """api.md §7.3 -- ``warehouseStock`` is the available quantity *at the
-        time the request is read*, so it is computed on read."""
-        from . import services as stock
-
-        client_id = self.context.get("client_id") or line.client_id
-        return stock.calculate_item_stock(client_id, line.item_id)["available"]
+#     class Meta:
+#         model = ServiceUsage
+#         fields = [
+#             "id", "ticket_number", "technician", "itemId", "sku", "qty", "date",
+#             "notes", "job_reference", "chargeable", "created_at",
+#         ]
+#         read_only_fields = ["ticket_number", "created_at"]
 
 
-class ZoneRequestSerializer(BaseModelSerializer):
-    lines = ZoneRequestLineSerializer(many=True, required=False)
-    zone = serializers.CharField(source="zone_location.name", read_only=True)
-    zoneLocationId = TenantPrimaryKeyRelatedField(
-        source="zone_location", queryset=Location.objects.all()
-    )
-    requestedBy = serializers.CharField(source="requested_by_name", required=False, allow_null=True)
-    date = serializers.DateField(source="request_date", required=False, allow_null=True)
+# Hidden: Zone Requests out of scope (Sweven spec) -- restore by uncommenting this block.
+# class ZoneRequestLineSerializer(BaseModelSerializer):
+#     itemId = TenantPrimaryKeyRelatedField(source="item", queryset=Item.objects.all())
+#     sku = serializers.CharField(source="item.sku", read_only=True)
+#     product = serializers.CharField(source="item.name", read_only=True)
+#     qty = QuantityField(source="requested_qty")
+#     warehouseStock = serializers.SerializerMethodField()
 
-    class Meta:
-        model = ZoneRequest
-        fields = [
-            "id", "request_number", "requestedBy", "zone", "zoneLocationId",
-            "target_sector", "date", "requested_at", "status", "notes",
-            "manager_signoff_needed", "reject_reason", "lines",
-            "created_at", "updated_at",
-        ]
-        read_only_fields = ["request_number", "requested_at", "created_at", "updated_at"]
+#     class Meta:
+#         model = ZoneRequestLine
+#         fields = ["id", "itemId", "sku", "product", "qty", "issued_qty", "warehouseStock"]
+
+#     def get_warehouseStock(self, line):
+#         """api.md §7.3 -- ``warehouseStock`` is the available quantity *at the
+#         time the request is read*, so it is computed on read."""
+#         from . import services as stock
+
+#         client_id = self.context.get("client_id") or line.client_id
+#         return stock.calculate_item_stock(client_id, line.item_id)["available"]
+
+
+# Hidden: Zone Requests out of scope (Sweven spec) -- restore by uncommenting this block.
+# class ZoneRequestSerializer(BaseModelSerializer):
+#     lines = ZoneRequestLineSerializer(many=True, required=False)
+#     zone = serializers.CharField(source="zone_location.name", read_only=True)
+#     zoneLocationId = TenantPrimaryKeyRelatedField(
+#         source="zone_location", queryset=Location.objects.all()
+#     )
+#     requestedBy = serializers.CharField(source="requested_by_name", required=False, allow_null=True)
+#     date = serializers.DateField(source="request_date", required=False, allow_null=True)
+
+#     class Meta:
+#         model = ZoneRequest
+#         fields = [
+#             "id", "request_number", "requestedBy", "zone", "zoneLocationId",
+#             "target_sector", "date", "requested_at", "status", "notes",
+#             "manager_signoff_needed", "reject_reason", "lines",
+#             "created_at", "updated_at",
+#         ]
+#         read_only_fields = ["request_number", "requested_at", "created_at", "updated_at"]
 
 
 class StockAuditLineSerializer(BaseModelSerializer):

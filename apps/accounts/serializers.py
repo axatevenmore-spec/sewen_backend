@@ -4,7 +4,11 @@ from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import serializers
 
 from apps.core.exceptions import ValidationFailed
-from apps.core.serializers import BaseModelSerializer, BaseSerializer
+from apps.core.serializers import (
+    BaseModelSerializer,
+    BaseSerializer,
+    TenantPrimaryKeyRelatedField,
+)
 
 from .models import Client, Permission, Role, RolePermission, User, UserPermission, UserSession
 
@@ -28,12 +32,16 @@ class MeUserSerializer(BaseModelSerializer):
     avatar = serializers.SerializerMethodField()
     reportingManager = serializers.SerializerMethodField()
     lastLogin = serializers.DateTimeField(source="last_login_at", read_only=True)
+    partyId = serializers.CharField(source="party_id", read_only=True, allow_null=True)
+    partyName = serializers.SerializerMethodField()
+    isCustomer = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = [
             "id", "name", "email", "phone", "avatar", "employeeId", "role",
             "department", "location", "reportingManager", "status", "lastLogin",
+            "partyId", "partyName", "isCustomer",
         ]
 
     def get_employeeId(self, user):
@@ -44,6 +52,12 @@ class MeUserSerializer(BaseModelSerializer):
 
     def get_reportingManager(self, user):
         return user.reporting_manager.name if user.reporting_manager_id else None
+
+    def get_partyName(self, user):
+        return user.party.name if user.party_id else None
+
+    def get_isCustomer(self, user):
+        return user.is_customer
 
 
 class TenantSerializer(BaseModelSerializer):
@@ -77,8 +91,16 @@ class ForgotPasswordSerializer(BaseSerializer):
     email = serializers.EmailField()
 
 
+class VerifyOTPSerializer(BaseSerializer):
+    email = serializers.EmailField()
+    otp = serializers.CharField(min_length=6, max_length=6, trim_whitespace=True)
+
+
 class ResetPasswordSerializer(BaseSerializer):
-    token = serializers.CharField()
+    token = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    resetToken = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    email = serializers.EmailField(required=False, allow_blank=True, allow_null=True)
+    otp = serializers.CharField(required=False, allow_blank=True, allow_null=True, min_length=6, max_length=6, trim_whitespace=True)
     newPassword = serializers.CharField(write_only=True, trim_whitespace=False)
 
     def validate_newPassword(self, value):
@@ -87,6 +109,18 @@ class ResetPasswordSerializer(BaseSerializer):
         except DjangoValidationError as exc:
             raise serializers.ValidationError(list(exc.messages))
         return value
+
+    def validate(self, attrs):
+        token = attrs.get("resetToken") or attrs.get("token")
+        email = attrs.get("email")
+        otp = attrs.get("otp")
+
+        if not token and not (email and otp):
+            raise serializers.ValidationError(
+                "Either a reset token or both email and OTP are required to reset password."
+            )
+        return attrs
+
 
 
 class UpdateMeSerializer(BaseModelSerializer):
@@ -125,12 +159,13 @@ class UserSerializer(BaseModelSerializer):
     """
 
     role = serializers.SerializerMethodField()
-    roleId = serializers.PrimaryKeyRelatedField(
+    # Tenant-scoped: a role or manager id from another tenant must not resolve.
+    roleId = TenantPrimaryKeyRelatedField(
         source="role", queryset=Role.objects.all(), allow_null=True, required=False
     )
     employeeId = serializers.SerializerMethodField()
     reportingManager = serializers.SerializerMethodField()
-    reportingManagerId = serializers.PrimaryKeyRelatedField(
+    reportingManagerId = TenantPrimaryKeyRelatedField(
         source="reporting_manager",
         queryset=User.objects.all(),
         allow_null=True,
@@ -139,6 +174,11 @@ class UserSerializer(BaseModelSerializer):
     avatar = serializers.CharField(source="avatar_url", required=False, allow_null=True)
     joinedDate = serializers.DateField(source="joined_date", required=False, allow_null=True)
     lastLogin = serializers.DateTimeField(source="last_login_at", read_only=True)
+    partyId = TenantPrimaryKeyRelatedField(
+        source="party", model="masters.Party", required=False, allow_null=True
+    )
+    partyName = serializers.CharField(source="party.name", read_only=True, allow_null=True)
+    isCustomer = serializers.SerializerMethodField()
     permissions = serializers.SerializerMethodField()
     password = serializers.CharField(write_only=True, required=False, allow_blank=True)
 
@@ -148,6 +188,7 @@ class UserSerializer(BaseModelSerializer):
             "id", "name", "email", "phone", "role", "roleId", "department", "status",
             "joinedDate", "lastLogin", "employeeId", "location", "reportingManager",
             "reportingManagerId", "avatar", "permissions", "crm_roles", "password",
+            "partyId", "partyName", "isCustomer",
             "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
@@ -160,6 +201,9 @@ class UserSerializer(BaseModelSerializer):
 
     def get_reportingManager(self, user):
         return user.reporting_manager.name if user.reporting_manager_id else None
+
+    def get_isCustomer(self, user):
+        return user.is_customer
 
     def get_permissions(self, user):
         """Role-derived plus overrides (api.md §3.1: "permissions[]" on detail)."""

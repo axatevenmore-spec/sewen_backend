@@ -24,7 +24,7 @@ from .audit import mark_read, request_ip
 from .exceptions import NotFound, ValidationFailed
 from .models import AuditLog, CompanyProfile, File, Notification, Setting, SupportTicket
 from .pagination import envelope
-from .permissions import AllowPublic, HasModulePermission
+from .permissions import AllowPublic, HasModulePermission, has_permission
 from .serializers_platform import (
     AuditLogSerializer,
     FileSerializer,
@@ -178,6 +178,16 @@ class FileViewSet(ReadOnlyTenantViewSet):
     status_field = "status"
     search_fields = ["file_name"]
     ordering = ["-created_at"]
+
+    def get_queryset(self):
+        """The caller's own uploads. Every row carries a signed download URL,
+        so a tenant-wide list would hand out HR documents, contracts and
+        exports to anyone signed in. Module screens reach their files through
+        their own records."""
+        queryset = super().get_queryset()
+        if getattr(self.request.user, "is_superuser", False):
+            return queryset
+        return queryset.filter(uploaded_by=self.request.user)
 
 
 # ---------------------------------------------------------------------------
@@ -481,6 +491,19 @@ SEARCH_TYPES = [
     "task", "page",
 ]
 
+#: Result types a caller only sees with the permission that opens them.
+#: Items and parties are reference data, readable by every role.
+SEARCH_TYPE_PERMISSIONS = {
+    "salesOrder": "view_sales",
+    "invoice": "view_sales",
+    "challan": "view_sales",
+    "proforma": "view_sales",
+    "purchaseOrder": "view_purchase",
+    "lead": "view_lead",
+    "project": "view_pms",
+    "employee": "view_staff",
+}
+
 
 class GlobalSearchView(APIView):
     """``GET /search/?q=`` -- a flat ranked list ``{ type, id, label, sublabel, url }``.
@@ -490,6 +513,9 @@ class GlobalSearchView(APIView):
     (api-integration.md §9.1.3).
     """
 
+    # No requirement of its own; this brings in the no-role refusal.
+    permission_classes = [HasModulePermission]
+
     def get(self, request):
         query = (request.query_params.get("q") or "").strip()
         if len(query) < 2:
@@ -498,6 +524,11 @@ class GlobalSearchView(APIView):
         wanted = set(
             filter(None, (request.query_params.get("types") or "").split(","))
         ) or set(SEARCH_TYPES)
+        wanted = {
+            kind for kind in wanted
+            if kind not in SEARCH_TYPE_PERMISSIONS
+            or has_permission(request.user, SEARCH_TYPE_PERMISSIONS[kind])
+        }
         limit = min(int(request.query_params.get("limit") or 8), 25)
         client_id = request.client_id
         results = []

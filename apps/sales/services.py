@@ -37,17 +37,22 @@ from apps.core.money import (
     totals_match,
 )
 from apps.core.numbering import allocate_number
+from apps.accounting.models import BankAccount
 from apps.core.permissions import has_permission
 from apps.inventory import services as stock
 
 from .models import (
+    CHALLAN_SHIPPED_STATUSES,
     NON_RESERVING_STAGES,
+    CashPaymentReceipt,
     DeliveryChallan,
     PaymentAllocation,
     PaymentIn,
     SalesInvoice,
+    SalesInvoiceRevision,
     SalesOrder,
     SalesOrderLine,
+    SalesReturn,
 )
 
 #: api.md §5.7 -- dueDate defaults to invoice date + 30 days.
@@ -128,7 +133,7 @@ def recalculate_document(document, *, lines=None, save=True):
         if line_rows:
             type(line_rows[0]).objects.bulk_update(
                 line_rows,
-                ["amount", "discount_amount", "tax_amount", "line_total", "updated_at"],
+                ["rate", "amount", "discount_amount", "tax_amount", "line_total", "updated_at"],
             )
         document.save(
             update_fields=[
@@ -280,14 +285,272 @@ def invoice_outstanding(invoice):
         if invoice.due_date and outstanding > ZERO
         else 0
     )
+
+    # Without-Bill Cash received for this specific invoice (audit defect fix: do not match unrelated customer receipts)
+    without_bill_cash = round2(
+        CashPaymentReceipt.objects.filter(
+            client_id=invoice.client_id,
+            status="RECEIVED",
+            deleted_at__isnull=True,
+            invoice_id=invoice.id,
+        ).aggregate(
+            val=Coalesce(Sum("amount"), Value(Decimal("0.00")),
+                         output_field=DecimalField(max_digits=18, decimal_places=2))
+        )["val"]
+    )
+    total_received = round2(paid + without_bill_cash)
+
+    total_sales_value = round2(
+        invoice.total_sales_value
+        if invoice.total_sales_value is not None
+        else (invoice.total + (invoice.cash_amount or Decimal("0.00")))
+    )
+    formal_invoice_amount = round2(invoice.total)
+    cash_amount = round2(invoice.cash_amount if invoice.cash_amount is not None else without_bill_cash)
+    total_allocated = round2(formal_invoice_amount + cash_amount)
+    remaining = max(ZERO, round2(total_sales_value - total_allocated))
+
     return {
         "total": round2(invoice.total),
+        "totalSalesValue": total_sales_value,
+        "formalInvoiceAmount": formal_invoice_amount,
+        "cashAmount": cash_amount,
+        "totalAllocated": total_allocated,
+        "remaining": remaining,
+        "taxableAmount": round2(invoice.taxable_value),
+        "gst": round2(invoice.total_tax),
         "paid": paid,
+        "paidAgainstInvoice": paid,
+        "withoutBillCash": without_bill_cash,
+        "totalReceived": total_received,
         "outstanding": outstanding,
         "dueDate": invoice.due_date,
         "daysOverdue": max(days_overdue, 0),
         "ageingBucket": ageing_bucket(days_overdue),
     }
+
+
+@transaction.atomic
+def update_sales_allocation(
+    invoice,
+    *,
+    formal_invoice_amount=None,
+    cash_amount=None,
+    total_sales_value=None,
+    reason=None,
+    user=None,
+):
+    """api.md §5.7 -- Sales Invoice + Cash Receipt Allocation workflow.
+
+    Maintains a Total Sales Value split between:
+    - Formal Sales Invoice (tax invoice)
+    - Cash Receipt (unbilled cash receipt)
+
+    Recalculates item-level invoice lines proportionally, handles rounding,
+    automatically updates the linked CashPaymentReceipt, records revision history,
+    and preserves accounting consistency.
+    """
+    invoice = SalesInvoice.objects.select_for_update().get(pk=invoice.pk)
+    if invoice.status == "Cancelled":
+        raise BusinessRuleViolation("Cannot reallocate a cancelled invoice.", code=Codes.INVOICE_CANCELLED)
+
+    old_inv = round2(invoice.total)
+    old_cash = round2(invoice.cash_amount or ZERO)
+
+    # 1. Determine Total Sales Value
+    if total_sales_value is not None:
+        total_sales = round2(total_sales_value)
+    elif invoice.total_sales_value is not None and invoice.total_sales_value > ZERO:
+        total_sales = round2(invoice.total_sales_value)
+    else:
+        total_sales = round2(invoice.total + (invoice.cash_amount or ZERO))
+        if total_sales <= ZERO and invoice.line_items.exists():
+            total_sales = round2(sum((l.line_total for l in invoice.line_items.all()), ZERO))
+
+    # 2. Determine split amounts
+    if formal_invoice_amount is not None:
+        formal_inv = round2(formal_invoice_amount)
+        if cash_amount is not None:
+            cash = round2(cash_amount)
+        else:
+            cash = round2(total_sales - formal_inv)
+    elif cash_amount is not None:
+        cash = round2(cash_amount)
+        formal_inv = round2(total_sales - cash)
+    else:
+        formal_inv = old_inv
+        cash = round2(total_sales - formal_inv)
+
+    # 3. Validation (Section 14)
+    if formal_inv < ZERO:
+        raise ValidationFailed(
+            "Formal Invoice amount must be non-negative.",
+            field_errors={"formalInvoiceAmount": ["Cannot be negative."]},
+        )
+    if cash < ZERO:
+        raise ValidationFailed(
+            "Cash Receipt amount must be non-negative.",
+            field_errors={"cashReceiptAmount": ["Cannot be negative."]},
+        )
+    if round2(formal_inv + cash) > round2(total_sales + ROUNDING_TOLERANCE):
+        raise ValidationFailed(
+            "Formal Invoice + Cash Receipt cannot exceed Total Sales Value.",
+            field_errors={
+                "formalInvoiceAmount": [
+                    f"Formal ({formal_inv}) + Cash ({cash}) exceeds Total Sales ({total_sales})."
+                ]
+            },
+        )
+
+    # 4. Item-level invoice calculation (Section 7)
+    lines = list(invoice.line_items.select_related("item").all())
+    if lines:
+        needs_orig_save = False
+        for line in lines:
+            if line.original_rate is None or line.original_rate == ZERO:
+                line.original_rate = line.rate
+                line.original_amount = line.amount
+                line.original_line_total = line.line_total
+                needs_orig_save = True
+        if needs_orig_save:
+            type(lines[0]).objects.bulk_update(
+                lines, ["original_rate", "original_amount", "original_line_total"]
+            )
+
+        orig_total = sum((l.original_line_total or l.line_total for l in lines), ZERO)
+        if orig_total > ZERO:
+            ratio = formal_inv / orig_total
+        else:
+            ratio = Decimal("1.0") if total_sales == ZERO else (formal_inv / total_sales)
+
+        for line in lines:
+            base_rate = line.original_rate if line.original_rate is not None and line.original_rate > ZERO else line.rate
+            line.rate = round4(base_rate * ratio)
+            totals = compute_line(line.qty, line.rate, line.discount_pct, line.tax_pct)
+            line.amount = totals.line_sub
+            line.discount_amount = totals.discount_amount
+            line.tax_amount = totals.tax_amount
+            line.line_total = totals.line_total
+
+        sum_line_totals = round2(sum((l.line_total for l in lines), ZERO))
+        round_diff = round2(formal_inv - sum_line_totals)
+        invoice.round_off = round_diff
+        recalculate_document(invoice, lines=lines, save=True)
+    else:
+        invoice.total = formal_inv
+        invoice.taxable_value = formal_inv
+        invoice.save(update_fields=["total", "taxable_value", "updated_at"])
+
+    invoice.total_sales_value = total_sales
+    invoice.cash_amount = cash
+    invoice.save(update_fields=["total_sales_value", "cash_amount", "updated_at"])
+
+    # 5. Cash Receipt adjustment (Section 5, 6)
+    existing_receipt = (
+        CashPaymentReceipt.objects.select_for_update()
+        .filter(invoice=invoice, deleted_at__isnull=True)
+        .exclude(status__in=["CANCELLED", "VOIDED"])
+        .first()
+    )
+
+    receipt = None
+    if cash > ZERO:
+        if existing_receipt:
+            existing_receipt.amount = cash
+            existing_receipt.save(update_fields=["amount", "updated_at"])
+            if existing_receipt.payment_id:
+                pay = existing_receipt.payment
+                pay.amount = cash
+                pay.save(update_fields=["amount", "updated_at"])
+                if pay.journal_entry_id:
+                    ledger.reverse_entry(pay.journal_entry, user=user, narration="Adjusted cash allocation")
+                    entry = ledger.post_payment_in(pay, user=user)
+                    pay.journal_entry = entry
+                    pay.save(update_fields=["journal_entry", "updated_at"])
+            ledger.recalculate_party_balance(invoice.client_id, invoice.party_id)
+            receipt = existing_receipt
+        else:
+            payment = record_payment_in(
+                client=invoice.client,
+                party=invoice.party,
+                amount=cash,
+                payment_date=invoice.doc_date,
+                payment_type="WITHOUT_BILL",
+                mode="Cash",
+                invoice=invoice,
+                description=f"Cash Receipt for Invoice {invoice.invoice_number or invoice.id}",
+                user=user,
+            )
+            receipt = payment.cash_receipt
+    else:
+        if existing_receipt:
+            cancel_cash_receipt(existing_receipt, reason="Cash allocation reduced to zero", user=user)
+        receipt = None
+
+    # 6. Revision / History (Section 8)
+    last_rev = invoice.revisions.order_by("-revision_number").first()
+    rev_no = (last_rev.revision_number + 1) if last_rev else 1
+    difference = round2(formal_inv - old_inv)
+
+    SalesInvoiceRevision.objects.create(
+        client=invoice.client,
+        invoice=invoice,
+        cash_receipt=receipt,
+        revision_number=rev_no,
+        old_invoice_amount=old_inv,
+        new_invoice_amount=formal_inv,
+        old_cash_amount=old_cash,
+        new_cash_amount=cash,
+        difference=difference,
+        reason=reason or f"Allocation revision #{rev_no}",
+        changed_by=user if getattr(user, "is_authenticated", False) else None,
+    )
+
+    # 7. Finalized Invoice Handling (Section 9)
+    if invoice.posted_at is not None and difference != ZERO:
+        if difference < ZERO:
+            # Invoice decreased: issue Credit Note for abs(difference)
+            cn_number = allocate_number(invoice.client, "CRN", invoice.doc_date)
+            ret_number = allocate_number(invoice.client, "RET", invoice.doc_date)
+            ret = SalesReturn.objects.create(
+                client=invoice.client,
+                return_number=ret_number,
+                credit_note_number=cn_number,
+                party=invoice.party,
+                party_name=invoice.party_name,
+                doc_date=invoice.doc_date,
+                sales_invoice=invoice,
+                status="Posted",
+                total=abs(difference),
+                subtotal=abs(difference),
+                total_tax=ZERO,
+                reason=reason or f"Invoice split revision: reduced by {abs(difference)}",
+                posted_at=timezone.now(),
+                posted_by=user if getattr(user, "is_authenticated", False) else None,
+            )
+            entry = ledger.post_sales_return(ret, user=user)
+            if entry is not None:
+                ret.journal_entry = entry
+                ret.save(update_fields=["journal_entry", "updated_at"])
+        else:
+            # Invoice increased: post debit adjustment entry Dr Debtors, Cr Sales
+            entry = ledger.post_entry(
+                client=invoice.client,
+                postings=[
+                    ledger.debit(ledger.system_account(invoice.client_id, "debtors"), difference, party=invoice.party, description=f"Debit adjustment on {invoice.invoice_number}"),
+                    ledger.credit(ledger.system_account(invoice.client_id, "sales"), difference),
+                ],
+                entry_date=invoice.doc_date,
+                narration=f"Debit adjustment on invoice {invoice.invoice_number}: {reason or 'Split revised'}",
+                source_document_type="SalesInvoice",
+                source_document_id=invoice.id,
+                user=user,
+            )
+
+        ledger.recalculate_party_balance(invoice.client_id, invoice.party_id)
+
+    refresh_invoice_payment_status(invoice)
+    return invoice
 
 
 def display_status(invoice):
@@ -418,7 +681,7 @@ def _already_dispatched(sales_order_line_id):
     return DeliveryChallanLine.objects.filter(
         sales_order_line_id=sales_order_line_id,
         deleted_at__isnull=True,
-        delivery_challan__status__in=["Dispatched", "In Transit", "Delivered"],
+        delivery_challan__status__in=CHALLAN_SHIPPED_STATUSES,
     ).exists()
 
 
@@ -511,6 +774,13 @@ def dispatch_challan(challan, *, user=None):
     )
 
     for line in lines:
+        # Fulfilment counts every order line shipped, stock-holding or not --
+        # a service or free-text line is delivered too, and skipping it here
+        # left the order stuck short of Delivered and open to re-dispatch.
+        # (Invoicing already counts every line; see _bump_order_invoiced_qty.)
+        if line.sales_order_line_id:
+            _bump_order_dispatched_qty(line)
+
         if line.item_id is None or not line.item.holds_stock:
             continue
 
@@ -538,9 +808,6 @@ def dispatch_challan(challan, *, user=None):
         )
         if resolved:
             stock.set_serial_status(resolved, "sold", movement=movement)
-
-        if line.sales_order_line_id:
-            _bump_order_dispatched_qty(line)
 
     challan.status = "Dispatched"
     challan.dispatch_date = challan.dispatch_date or timezone.localdate()
@@ -752,15 +1019,10 @@ def _restore_serials(client_id, reference_type, reference_id):
 # ---------------------------------------------------------------------------
 @transaction.atomic
 def record_payment_in(
-    *, client, party, amount, payment_date, mode, bank_account=None,
-    reference_number=None, notes=None, allocations=None, invoice=None, user=None,
+    *, client, party, amount, payment_date, mode, payment_type="WITH_BILL", bank_account=None,
+    reference_number=None, notes=None, description=None, allocations=None, invoice=None, user=None,
 ):
-    """api.md §5.8 -- all five validations moved server-side.
-
-    The frontend credits the first bank account when none is given; api.md is
-    explicit that the server must require an explicit ``bankAccountId`` for
-    non-cash modes instead.
-    """
+    """api.md §5.8 + With-Bill / GST & Without-Bill / Cash payments."""
     amount = round2(amount)
     if amount <= ZERO:
         raise BusinessRuleViolation(
@@ -768,11 +1030,73 @@ def record_payment_in(
             code="PAYMENT_AMOUNT_INVALID",
         )
 
-    if mode != "Cash" and bank_account is None:
-        raise ValidationFailed(
-            "Choose the bank account this payment was received into.",
-            field_errors={"bankAccountId": ["Required for non-cash payments."]},
+    mode_str = str(mode or "Cash").strip()
+    if mode_str.lower() in ("cash", "cash payment"):
+        mode = "Cash"
+    elif any(k in mode_str.lower() for k in ("bank", "wire", "transfer", "neft", "rtgs", "imps")):
+        mode = "Bank"
+    elif "cheque" in mode_str.lower() or "check" in mode_str.lower():
+        mode = "Cheque"
+    elif "upi" in mode_str.lower():
+        mode = "UPI"
+    elif "card" in mode_str.lower():
+        mode = "Card"
+    else:
+        mode = mode_str if mode_str in ("Cash", "Bank", "UPI", "Cheque", "Card", "Net Banking") else "Cash"
+
+    if payment_type == "WITHOUT_BILL":
+        cpr_number = allocate_number(client, "CPR", payment_date)
+        payment = PaymentIn.objects.create(
+            client=client,
+            payment_number=allocate_number(client, "PAY-IN", payment_date),
+            party=party,
+            payment_date=payment_date,
+            amount=amount,
+            mode=mode,
+            payment_type="WITHOUT_BILL",
+            bank_account=bank_account,
+            reference_number=reference_number or cpr_number,
+            description=description,
+            notes=notes,
+            invoice=invoice,
+            created_by=user if getattr(user, "is_authenticated", False) else None,
         )
+
+        CashPaymentReceipt.objects.create(
+            client=client,
+            receipt_number=cpr_number,
+            payment=payment,
+            party=party,
+            invoice=invoice,
+            amount=amount,
+            payment_date=payment_date,
+            mode=mode,
+            reference_number=reference_number or cpr_number,
+            description=description or "Without-Bill Cash Payment",
+            notes=notes,
+            status="RECEIVED",
+            created_by=user if getattr(user, "is_authenticated", False) else None,
+        )
+
+        entry = ledger.post_payment_in(payment, user=user)
+        if entry is not None:
+            payment.journal_entry = entry
+            payment.save(update_fields=["journal_entry", "updated_at"])
+
+        ledger.recalculate_party_balance(client.id, party)
+        return payment
+
+    # WITH_BILL flow
+    if mode != "Cash" and bank_account is None:
+        bank_account = (
+            BankAccount.objects.filter(client=client, is_default=True).first()
+            or BankAccount.objects.filter(client=client).first()
+        )
+        if bank_account is None:
+            raise ValidationFailed(
+                "Choose the bank account this payment was received into.",
+                field_errors={"bankAccountId": ["Required for non-cash payments."]},
+            )
 
     payment = PaymentIn.objects.create(
         client=client,
@@ -781,9 +1105,12 @@ def record_payment_in(
         payment_date=payment_date,
         amount=amount,
         mode=mode,
+        payment_type="WITH_BILL",
         bank_account=bank_account,
         reference_number=reference_number,
+        description=description,
         notes=notes,
+        invoice=invoice,
         created_by=user if getattr(user, "is_authenticated", False) else None,
     )
 
@@ -805,6 +1132,11 @@ def record_payment_in(
 @transaction.atomic
 def allocate_payment_in(payment, allocations, *, user=None):
     """Apply a payment against invoices, enforcing the api.md §5.8 table."""
+    if getattr(payment, "payment_type", None) == "WITHOUT_BILL":
+        raise BusinessRuleViolation(
+            "Without-bill cash payments cannot be allocated to formal GST tax invoices.",
+            code="CASH_PAYMENT_NOT_ALLOCATABLE",
+        )
     allocated = ZERO
     for row in allocations or []:
         invoice_id = row.get("invoiceId") or row.get("invoice_id") or row.get("documentId")
@@ -901,6 +1233,21 @@ def cancel_payment_in(payment, *, reason=None, user=None):
                        "cancellation_reason", "updated_at"]
     )
 
+    # If linked cash receipt, cancel it too
+    try:
+        if hasattr(payment, "cash_receipt") and payment.cash_receipt:
+            receipt = payment.cash_receipt
+            if receipt.status not in ("CANCELLED", "VOIDED"):
+                receipt.status = "CANCELLED"
+                receipt.cancelled_at = timezone.now()
+                receipt.cancelled_by = user if getattr(user, "is_authenticated", False) else None
+                receipt.cancellation_reason = reason
+                receipt.save(
+                    update_fields=["status", "cancelled_at", "cancelled_by", "cancellation_reason", "updated_at"]
+                )
+    except Exception:
+        pass
+
     ledger.reverse_document_entries(
         client_id=payment.client_id,
         source_document_type="PaymentIn",
@@ -913,6 +1260,28 @@ def cancel_payment_in(payment, *, reason=None, user=None):
     return payment
 
 
+@transaction.atomic
+def cancel_cash_receipt(receipt, *, reason=None, user=None, void=False):
+    """Cancel or void a Cash Payment Receipt and reverse ledger/balance effects."""
+    receipt = CashPaymentReceipt.objects.select_for_update().get(pk=receipt.pk)
+    if receipt.status in ("CANCELLED", "VOIDED"):
+        raise Conflict("This cash receipt is already cancelled or voided.", code=Codes.ALREADY_CANCELLED)
+
+    receipt.status = "VOIDED" if void else "CANCELLED"
+    receipt.cancelled_at = timezone.now()
+    receipt.cancelled_by = user if getattr(user, "is_authenticated", False) else None
+    receipt.cancellation_reason = reason
+    receipt.save(
+        update_fields=["status", "cancelled_at", "cancelled_by", "cancellation_reason", "updated_at"]
+    )
+
+    if receipt.payment_id:
+        cancel_payment_in(receipt.payment, reason=reason, user=user)
+    else:
+        ledger.recalculate_party_balance(receipt.client_id, receipt.party_id)
+    return receipt
+
+
 def unallocated_payments(client_id, party_id=None):
     """``GET /sales/payments/unallocated/`` -- customer advances.
 
@@ -920,7 +1289,7 @@ def unallocated_payments(client_id, party_id=None):
     (db.md §5.4).
     """
     queryset = PaymentIn.objects.filter(
-        client_id=client_id, status="Active", deleted_at__isnull=True
+        client_id=client_id, status="Active", deleted_at__isnull=True, payment_type="WITH_BILL"
     ).filter(allocated_amount__lt=F("amount"))
     if party_id:
         queryset = queryset.filter(party_id=party_id)
@@ -959,49 +1328,51 @@ def order_fulfilment(order):
     }
 
 
-# ---------------------------------------------------------------------------
-# Warranty coverage (api.md §5.10)
-# ---------------------------------------------------------------------------
-def coverage_status(card, today=None):
-    """Derived on every read (api.md §5.10, from ``utils/warrantyUtils.js``).
+# Hidden: Warranty Cards out of scope (Sweven spec) -- restore by uncommenting this block.
+# # ---------------------------------------------------------------------------
+# # Warranty coverage (api.md §5.10)
+# # ---------------------------------------------------------------------------
+# def coverage_status(card, today=None):
+#     """Derived on every read (api.md §5.10, from ``utils/warrantyUtils.js``).
 
-    ``documentStatus`` of Cancelled/Suspended wins outright; a future or
-    missing ``startDate`` -> Pending Activation; past ``expiryDate`` ->
-    Expired; inside the expiring-soon window -> Expiring Soon; else Active.
-    """
-    today = today or timezone.localdate()
+#     ``documentStatus`` of Cancelled/Suspended wins outright; a future or
+#     missing ``startDate`` -> Pending Activation; past ``expiryDate`` ->
+#     Expired; inside the expiring-soon window -> Expiring Soon; else Active.
+#     """
+#     today = today or timezone.localdate()
 
-    if card.document_status == "Cancelled":
-        return "Cancelled"
-    if card.document_status == "Suspended":
-        return "Suspended"
-    if card.document_status in ("Draft", "Void"):
-        return "Pending Activation"
+#     if card.document_status == "Cancelled":
+#         return "Cancelled"
+#     if card.document_status == "Suspended":
+#         return "Suspended"
+#     if card.document_status in ("Draft", "Void"):
+#         return "Pending Activation"
 
-    if card.start_date is None or card.start_date > today:
-        return "Pending Activation"
-    if card.expiry_date is None:
-        return "Active"
-    if card.expiry_date < today:
-        return "Expired"
-    if (card.expiry_date - today).days <= (card.expiring_soon_days or 30):
-        return "Expiring Soon"
-    return "Active"
+#     if card.start_date is None or card.start_date > today:
+#         return "Pending Activation"
+#     if card.expiry_date is None:
+#         return "Active"
+#     if card.expiry_date < today:
+#         return "Expired"
+#     if (card.expiry_date - today).days <= (card.expiring_soon_days or 30):
+#         return "Expiring Soon"
+#     return "Active"
 
 
-def compute_expiry(start_date, period, unit):
-    """``warrantyPeriod`` + ``warrantyUnit`` -> an expiry date."""
-    if start_date is None:
-        return None
-    period = int(period or 0)
-    if unit == "Months":
-        month = start_date.month - 1 + period
-        year = start_date.year + month // 12
-        month = month % 12 + 1
-        day = min(start_date.day, [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
-                                   else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1])
-        return start_date.replace(year=year, month=month, day=day)
-    try:
-        return start_date.replace(year=start_date.year + period)
-    except ValueError:  # 29 Feb
-        return start_date.replace(year=start_date.year + period, day=28)
+# Hidden: Warranty Cards out of scope (Sweven spec) -- restore by uncommenting this block.
+# def compute_expiry(start_date, period, unit):
+#     """``warrantyPeriod`` + ``warrantyUnit`` -> an expiry date."""
+#     if start_date is None:
+#         return None
+#     period = int(period or 0)
+#     if unit == "Months":
+#         month = start_date.month - 1 + period
+#         year = start_date.year + month // 12
+#         month = month % 12 + 1
+#         day = min(start_date.day, [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
+#                                    else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][month - 1])
+#         return start_date.replace(year=year, month=month, day=day)
+#     try:
+#         return start_date.replace(year=start_date.year + period)
+#     except ValueError:  # 29 Feb
+#         return start_date.replace(year=start_date.year + period, day=28)

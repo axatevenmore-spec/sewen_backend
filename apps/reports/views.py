@@ -19,7 +19,8 @@ from apps.accounting import reports as financial
 from apps.core.exceptions import NotFound, ValidationFailed
 from apps.core.money import ZERO, D, round2, round4
 from apps.core.pagination import envelope
-from apps.core.permissions import HasModulePermission
+from apps.core.exceptions import PermissionDenied
+from apps.core.permissions import HasModulePermission, has_permission
 from apps.inventory import services as stock
 
 MONEY = DecimalField(max_digits=18, decimal_places=2)
@@ -54,7 +55,50 @@ REPORT_CATALOGUE = [
 ]
 
 
+#: The permission each report needs -- the same id its owning module's own
+#: screen requires. A tuple means any one of them. ``ReportView`` dispatches to
+#: the module views by calling their ``get`` directly, which skips their
+#: ``permission_classes``, so this map is the only gate on that path.
+REPORT_PERMISSIONS = {
+    "inventory-valuation": "view_inventory",
+    "stock-summary": "view_inventory",
+    "stock-movement": "view_inventory",
+    "customer-revenue": "view_sales",
+    "sales-register": "view_sales",
+    "vendor-allocation": "view_purchase",
+    "purchase-register": "view_purchase",
+    "ar-ap-ageing": "view_financial_reports",
+    "profit-and-loss": "view_financial_reports",
+    "balance-sheet": "view_financial_reports",
+    "gst-summary": "view_financial_reports",
+    "cash-flow": "view_financial_reports",
+    "trial-balance": "view_financial_reports",
+    "crm-pipeline": "view_lead",
+    "crm-conversion": "view_lead",
+    "on-time-velocity": "view_pms",
+    "stage-bottleneck": "view_pms",
+    "delay-reason-pareto": "view_pms",
+    "department-efficiency": "view_pms",
+    "hrms-attendance": "view_team_attendance",
+    # Same rule as the payslip list: team-wide pay needs a payroll permission.
+    "hrms-payroll-summary": ("generate_payroll", "approve_payroll"),
+    "hrms-attrition": "view_staff",
+}
+
+
+def check_report_permission(user, report_key):
+    """403 unless the caller may read ``report_key``. Unknown keys fall
+    through so the caller's 404 is what they see."""
+    required = REPORT_PERMISSIONS.get(report_key)
+    if required is None or has_permission(user, required):
+        return
+    code = required[0] if isinstance(required, tuple) else required
+    raise PermissionDenied("You don't have permission to view this report.", code=code)
+
+
 class ReportCatalogueView(APIView):
+    """Lists only the reports the caller can open."""
+
     permission_classes = [HasModulePermission]
 
     def get(self, request):
@@ -63,6 +107,7 @@ class ReportCatalogueView(APIView):
                 [
                     {"key": key, "name": name, "module": module, "parameters": params}
                     for key, name, module, params in REPORT_CATALOGUE
+                    if has_permission(request.user, REPORT_PERMISSIONS[key])
                 ]
             )
         )
@@ -74,6 +119,7 @@ class ReportView(APIView):
     permission_classes = [HasModulePermission]
 
     def get(self, request, report_key):
+        check_report_permission(request.user, report_key)
         client_id = request.client_id
         params = request.query_params
         date_from = params.get("date_from")
@@ -389,6 +435,9 @@ class ReportExportView(APIView):
     def post(self, request, report_key):
         import csv
         import io
+
+        # Before the job row exists, so a refusal is a 403 and not a failed job.
+        check_report_permission(request.user, report_key)
 
         from apps.core.files import build_storage_key, public_url, write_bytes
         from apps.core.models import ExportJob, File

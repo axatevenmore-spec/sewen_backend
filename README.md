@@ -32,18 +32,18 @@ psql -d evenmore_erp -c "create extension if not exists pgcrypto;
 # 3. Configuration
 cp .env.example .env          # then set DB_PASSWORD
 
-# 4. Schema and demo data
+# 4. Schema and your tenant (starts empty -- no sample data)
 python manage.py migrate
-python manage.py seed_demo
+python manage.py setup_tenant --tenant acme --name "Acme Pvt Ltd"     --email admin@acme.in --password '<choose one>'
 
 # 5. Verify
-python manage.py smoke_test   # 15 end-to-end checks over real HTTP
+python manage.py smoke_test   # 15 end-to-end checks over real HTTP, on a throwaway tenant
 
 # 6. Run
 python manage.py runserver
 ```
 
-Sign in with `admin@sweven.test` / `Sweven@2026`.
+Sign in with the administrator email and password you passed to `setup_tenant`.
 
 | URL | What |
 |---|---|
@@ -136,8 +136,8 @@ return 404, never 403 (api.md §1.11).
 
 | Command | Purpose |
 |---|---|
-| `seed_demo [--reset]` | Demo tenant built by posting real documents, so every derived number has a cause (db.md §14.1) |
-| `smoke_test` | The api-integration.md §12.3 checklist over real HTTP |
+| `setup_tenant --tenant <slug> [--reset]` | Provision a tenant: roles, administrator, numbering, chart of accounts, stage catalogues. No sample data. `--reset` erases business data and keeps users, roles and settings |
+| `smoke_test [--keep]` | The api-integration.md §12.3 checklist over real HTTP. Builds a throwaway fixture tenant (`apps/core/smoke_fixture.py`) and drops it afterwards |
 | `run_maintenance --job {hourly,nightly,all}` | The db.md §13 jobs. Reconcilers **alert, never auto-correct** |
 | `enable_rls [--dry-run] [--drop]` | Install row-level security on all 160 tenant tables |
 

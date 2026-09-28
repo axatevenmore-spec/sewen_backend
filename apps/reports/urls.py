@@ -50,6 +50,11 @@ public_urlpatterns = [
         public_views.PublicProofDecisionView.as_view(),
         name="public-proof-decide",
     ),
+    path(
+        "pms/approve/<str:token>/comments/",
+        public_views.PublicProofCommentView.as_view(),
+        name="public-proof-comments",
+    ),
     # Public lead forms (api.md §9.7)
     path(
         "forms/<slug:slug>/",
@@ -62,20 +67,21 @@ public_urlpatterns = [
         name="public-form-submit",
     ),
     # Career portal (api.md §11.5)
-    path("careers/", public_views.PublicCareersListView.as_view(), name="public-careers"),
-    path(
-        "careers/<str:job_id>/",
-        public_views.PublicCareerDetailView.as_view(),
-        name="public-career-detail",
-    ),
-    path(
-        "careers/<str:job_id>/apply/",
-        public_views.PublicCareerApplyView.as_view(),
-        name="public-career-apply",
-    ),
-    path(
-        "careers/<str:job_id>/upload-url/",
-        public_views.PublicUploadUrlView.as_view(),
-        name="public-career-upload-url",
-    ),
+    # Hidden: Career Portal out of scope (Sweven spec)
+    # path("careers/", public_views.PublicCareersListView.as_view(), name="public-careers"),
+    # path(
+    #     "careers/<str:job_id>/",
+    #     public_views.PublicCareerDetailView.as_view(),
+    #     name="public-career-detail",
+    # ),
+    # path(
+    #     "careers/<str:job_id>/apply/",
+    #     public_views.PublicCareerApplyView.as_view(),
+    #     name="public-career-apply",
+    # ),
+    # path(
+    #     "careers/<str:job_id>/upload-url/",
+    #     public_views.PublicUploadUrlView.as_view(),
+    #     name="public-career-upload-url",
+    # ),
 ]

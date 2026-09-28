@@ -24,15 +24,18 @@ from apps.core.exceptions import (
 from apps.core.numbering import allocate_number
 from apps.core.pagination import envelope
 from apps.core.permissions import HasModulePermission
+from apps.core.realtime import announce_project_change
 from apps.core.viewsets import TenantModelViewSet
 
-from . import services
+from . import chat, services
+from .chat_views import CHAT_PERMISSIONS, ProjectChatMixin
 from .models import (
     CLOSED_STAGE_STATUSES,
     Approval,
     Delay,
     Department,
     Document,
+    DocumentComment,
     Project,
     ProjectStage,
     ProofShare,
@@ -44,14 +47,20 @@ from .serializers import (
     ApprovalSerializer,
     AssignStageSerializer,
     CompleteProjectSerializer,
+    CustomerDocumentSerializer,
+    CustomerProjectStageSerializer,
+    CustomerProjectTrackingListSerializer,
+    CustomerProjectTrackingSerializer,
     DecideSerializer,
     DelaySerializer,
     DepartmentSerializer,
+    DocumentCommentSerializer,
     DocumentSerializer,
     FromOrderSerializer,
     HandoffSerializer,
     LogDelaySerializer,
     PmsSettingsSerializer,
+    PostDocumentCommentSerializer,
     ProgressSerializer,
     ProjectDetailSerializer,
     ProjectListSerializer,
@@ -81,7 +90,8 @@ class DepartmentViewSet(TenantModelViewSet):
     status_field = None
     search_fields = ["name"]
     ordering = ["name"]
-    permission_map = {"read": ["view_pms"], "write": ["view_pms"]}
+    # PMS configuration is a project-manager task, not a viewer's.
+    permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
 
     def check_delete_allowed(self, department):
         """409 when in use unless ``?reassignTo=`` (api.md §10.1)."""
@@ -148,7 +158,8 @@ class StageConfigViewSet(TenantModelViewSet):
     search_fields = ["name", "description"]
     ordering = ["sequence"]
     filter_map = {"departmentId": "department_id", "isActive": "is_active"}
-    permission_map = {"read": ["view_pms"], "write": ["view_pms"]}
+    # PMS configuration is a project-manager task, not a viewer's.
+    permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
 
     def perform_create(self, serializer):
         if not serializer.validated_data.get("sequence"):
@@ -251,7 +262,8 @@ class StageConfigViewSet(TenantModelViewSet):
 
 class PmsSettingsView(APIView):
     permission_classes = [HasModulePermission]
-    permission_map = {"read": ["view_pms"], "write": ["view_pms"]}
+    # PMS configuration is a project-manager task, not a viewer's.
+    permission_map = {"read": ["view_pms"], "write": ["create_pms_project"]}
 
     def get(self, request):
         return Response(services.settings_payload(request.client_id))
@@ -412,6 +424,7 @@ def apply_stage_template(project, config_ids, *, stage_weights=None, user=None):
         project.save(update_fields=["current_stage", "current_department", "status", "updated_at"])
 
     services.recalculate_project(project)
+    chat.ensure_conversations(project)
     record_audit(
         client=project.client_id,
         actor=user,
@@ -424,7 +437,7 @@ def apply_stage_template(project, config_ids, *, stage_weights=None, user=None):
     return created
 
 
-class ProjectViewSet(TenantModelViewSet):
+class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
     queryset = Project.objects.select_related(
         "party", "project_manager", "current_stage", "current_department", "sales_order"
     )
@@ -449,6 +462,10 @@ class ProjectViewSet(TenantModelViewSet):
         "write": ["create_pms_project"],
         "complete": ["complete_project"],
         "apply_stage_template": ["assign_stage"],
+        "customer_tracking": [("view_pms", "view_projects")],
+        # Anyone who can see the project can take part in its proof review.
+        "document_comments": ["view_pms"],
+        **CHAT_PERMISSIONS,
     }
     #: The UI uses ``code`` in URLs, so both a uuid and a code resolve.
     lookup_value_regex = "[^/]+"
@@ -465,7 +482,34 @@ class ProjectViewSet(TenantModelViewSet):
         if project is None:
             raise NotFound("That project no longer exists.")
         self.check_object_permissions(self.request, project)
+        self._realtime_project = project
         return project
+
+    #: Writes that do not change what a project screen shows. Chat announces
+    #: its own events (``chat.py``).
+    REALTIME_QUIET_ACTIONS = frozenset(CHAT_PERMISSIONS) | {"document_comments"}
+
+    def finalize_response(self, request, response, *args, **kwargs):
+        """Tell every PMS screen in the tenant that this project changed.
+
+        One hook for every write route on the project -- stages, tasks,
+        documents, delays, handoff, completion -- rather than one per action.
+        """
+        response = super().finalize_response(request, response, *args, **kwargs)
+        if (
+            request.method in ("GET", "HEAD", "OPTIONS")
+            or not 200 <= response.status_code < 300
+            or self.action in self.REALTIME_QUIET_ACTIONS
+        ):
+            return response
+        project = getattr(self, "_realtime_project", None)
+        if project is None and isinstance(getattr(response, "data", None), dict):
+            created_id = response.data.get("id")
+            if created_id:
+                project = Project.objects.filter(pk=created_id).first()
+        if project is not None:
+            announce_project_change(project, self.action or "update", request.user)
+        return response
 
     def get_serializer_class(self):
         if self.action in ("retrieve", "create", "update", "partial_update"):
@@ -736,6 +780,13 @@ class ProjectViewSet(TenantModelViewSet):
         )
         return Response(envelope(ApprovalSerializer(rows, many=True).data))
 
+    @action(detail=True, methods=["get"], url_path="customer-tracking")
+    def customer_tracking(self, request, pk=None):
+        project = self.get_object()
+        check_customer_tracking_permission(request.user, project)
+        ctx = _customer_tracking_context(project, request=request)
+        return Response(CustomerProjectTrackingSerializer(project, context=ctx).data)
+
     # -- stages ------------------------------------------------------------
     def _get_stage(self, project, stage_id):
         stage = project.stages.filter(pk=stage_id, deleted_at__isnull=True).first()
@@ -799,6 +850,7 @@ class ProjectViewSet(TenantModelViewSet):
             project.save(update_fields=["current_stage", "current_department", "status", "updated_at"])
 
         services.recalculate_project(project)
+        chat.ensure_conversations(project)
         record_audit(
             client=project.client_id,
             actor=request.user,
@@ -871,6 +923,7 @@ class ProjectViewSet(TenantModelViewSet):
         if stage.status == "Not Started" and stage.assigned_user_id:
             stage.status = "Assigned"
         stage.save()
+        chat.ensure_conversations(project)
 
         record_audit(
             client=request.client_id,
@@ -1461,7 +1514,8 @@ class ProjectViewSet(TenantModelViewSet):
             project=project,
             token_hash=hash_token(token),
             recipient_name=data.get("recipientName"),
-            recipient_email=data.get("recipientEmail"),
+            recipient_email=data.get("recipientEmail") or None,
+            message=(data.get("message") or "").strip() or None,
             expires_at=timezone.now() + timedelta(days=data["expiryDays"]),
             created_by=request.user,
         )
@@ -1474,6 +1528,37 @@ class ProjectViewSet(TenantModelViewSet):
             },
             status=status.HTTP_201_CREATED,
         )
+
+
+    @action(
+        detail=True,
+        methods=["get", "post"],
+        url_path=r"documents/(?P<doc_id>[^/.]+)/comments",
+    )
+    def document_comments(self, request, pk=None, doc_id=None):
+        """The review thread on one proof version -- the same thread the client
+        writes to through the approval link (``/public/pms/approve/{token}/comments/``)."""
+        project = self.get_object()
+        document = project.documents.filter(pk=doc_id, deleted_at__isnull=True).first()
+        if document is None:
+            raise NotFound("That document no longer exists.")
+
+        if request.method == "POST":
+            serializer = PostDocumentCommentSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            DocumentComment.objects.create(
+                client_id=request.client_id,
+                document=document,
+                project=project,
+                author_type="Staff",
+                author_name=getattr(request.user, "name", None) or request.user.email,
+                page=serializer.validated_data.get("page"),
+                text=serializer.validated_data["text"],
+                created_by=request.user,
+            )
+
+        rows = document.review_comments.filter(deleted_at__isnull=True)
+        return Response(envelope(DocumentCommentSerializer(rows, many=True).data))
 
 
 @transaction.atomic
@@ -1555,6 +1640,7 @@ def apply_document_decision(*, document, decision, comments=None, revision_reaso
             entity_id=document.id,
             actor=user,
         )
+    announce_project_change(project, "document_decided", user)
     return document
 
 
@@ -1643,7 +1729,7 @@ class DelayViewSet(TenantModelViewSet):
     serializer_class = DelaySerializer
     audit_entity_type = "PmsDelay"
     status_field = None
-    required_permissions = ["view_pms"]
+    permission_map = {"read": ["view_pms"], "write": ["log_delay"]}
     ordering = ["-created_at"]
     filter_map = {
         "projectId": "project_id",
@@ -1867,3 +1953,135 @@ class RevokeShareView(APIView):
         share.revoked_reason = request.data.get("reason")
         share.save(update_fields=["status", "revoked_at", "revoked_reason", "updated_at"])
         return Response(ProofShareSerializer(share).data)
+
+
+# ---------------------------------------------------------------------------
+# Customer Project Tracking (api.md §10 & Role-Based Customer Tracking View)
+# ---------------------------------------------------------------------------
+def check_customer_tracking_permission(user, project=None):
+    """Enforce role-based access & customer data isolation.
+    - Superuser: Full access.
+    - Admin (AD) / Project Manager (PM): Full access.
+    - User holding view_pms: Full access.
+    - Customer role (CU / is_customer) or view_projects:
+      - If project provided: project.party_id must match user's linked customer party.
+      - If no match: PermissionDenied('You do not have access to this project.', code='CUSTOMER_PROJECT_DENIED').
+    - Other internal roles without view_pms or view_projects:
+      - PermissionDenied('You do not have permission to view customer project tracking.', code='NO_TRACKING_PERMISSION').
+    """
+    if getattr(user, "is_superuser", False):
+        return True
+
+    role_code = getattr(getattr(user, "role", None), "code", "")
+    role_name = str(getattr(getattr(user, "role", None), "name", "")).lower()
+
+    if role_code in ("AD", "PM") or "admin" in role_name or "project manager" in role_name:
+        return True
+
+    from apps.core.permissions import granted_permissions
+    granted = granted_permissions(user)
+    if "view_pms" in granted:
+        return True
+
+    is_customer = (
+        getattr(user, "is_customer", False)
+        or role_code == "CU"
+        or "customer" in role_name
+        or "view_projects" in granted
+    )
+    if is_customer:
+        if project is not None:
+            allowed_parties = user.get_customer_party_ids() if hasattr(user, "get_customer_party_ids") else set()
+            if not project.party_id or project.party_id not in allowed_parties:
+                raise PermissionDenied(
+                    "You do not have permission to view this customer project.",
+                    code="CUSTOMER_PROJECT_DENIED",
+                )
+        return True
+
+    raise PermissionDenied(
+        "You do not have permission to view customer project tracking.",
+        code="NO_TRACKING_PERMISSION",
+    )
+
+
+def _customer_tracking_context(project, request=None):
+    stages = list(
+        project.stages.filter(deleted_at__isnull=True)
+        .select_related("department", "stage_config")
+        .order_by("sequence")
+    )
+    stage_ids = [s.id for s in stages]
+
+    def bucket(rows):
+        grouped = {}
+        for row in rows:
+            grouped.setdefault(row.stage_id, []).append(row)
+        return grouped
+
+    documents = list(
+        Document.objects.filter(stage_id__in=stage_ids, deleted_at__isnull=True).select_related("file")
+    )
+    delays = list(
+        Delay.objects.filter(stage_id__in=stage_ids, deleted_at__isnull=True)
+    )
+
+    return {
+        "request": request,
+        "stages": stages,
+        "documents_by_stage": bucket(documents),
+        "delays_by_stage": bucket(delays),
+        "all_documents": documents,
+    }
+
+
+class CustomerTrackingView(APIView):
+    """Role-based customer project tracking endpoint (api.md §10)."""
+
+    def get(self, request, pk=None):
+        user = request.user
+        client_id = request.client_id
+
+        # 1. Detail tracking view if pk provided
+        if pk is not None:
+            project = Project.objects.filter(client_id=client_id, code=pk, deleted_at__isnull=True).select_related(
+                "party", "current_stage", "sales_order"
+            ).first()
+            if project is None:
+                try:
+                    project = Project.objects.filter(client_id=client_id, pk=pk, deleted_at__isnull=True).select_related(
+                        "party", "current_stage", "sales_order"
+                    ).first()
+                except Exception:
+                    project = None
+            if project is None:
+                raise NotFound("That project no longer exists.")
+
+            check_customer_tracking_permission(user, project)
+            ctx = _customer_tracking_context(project, request=request)
+            return Response(CustomerProjectTrackingSerializer(project, context=ctx).data)
+
+        # 2. List tracking view
+        check_customer_tracking_permission(user, project=None)
+        role_code = getattr(getattr(user, "role", None), "code", "")
+        role_name = str(getattr(getattr(user, "role", None), "name", "")).lower()
+        from apps.core.permissions import granted_permissions
+        granted = granted_permissions(user)
+
+        is_staff_manager = (
+            getattr(user, "is_superuser", False)
+            or role_code in ("AD", "PM")
+            or "admin" in role_name
+            or "project manager" in role_name
+            or "view_pms" in granted
+        )
+
+        qs = Project.objects.filter(client_id=client_id, deleted_at__isnull=True).select_related(
+            "party", "current_stage", "sales_order"
+        ).order_by("-created_at")
+
+        if not is_staff_manager:
+            customer_party_ids = user.get_customer_party_ids() if hasattr(user, "get_customer_party_ids") else set()
+            qs = qs.filter(party_id__in=customer_party_ids)
+
+        return Response(envelope(CustomerProjectTrackingListSerializer(qs, many=True).data))

@@ -38,6 +38,9 @@ DEBUG = env_bool("DJANGO_DEBUG", True)
 ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1,0.0.0.0,testserver")
 
 INSTALLED_APPS = [
+    # First, so `manage.py runserver` serves the ASGI app -- Django plus the
+    # Socket.IO server mounted in config/asgi.py (apps/core/realtime.py).
+    "daphne",
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
@@ -204,6 +207,8 @@ CORS_ALLOW_HEADERS = (
     "x-requested-with",
     "idempotency-key",
     "if-unmodified-since",
+    # The proof viewer probes a signed file URL with a 1-byte Range GET.
+    "range",
 )
 CORS_EXPOSE_HEADERS = ("last-modified", "idempotency-replayed")
 
@@ -217,10 +222,30 @@ PMS_PROOF_MAX_BYTES = int(env("PMS_PROOF_MAX_BYTES", str(50 * 1024 * 1024)))
 UPLOAD_URL_TTL_SECONDS = 900
 #: Signed file download/preview URLs (``previewUrl`` on PMS documents). Long
 #: enough that a cached project still previews after days, not just an hour.
+# Socket.IO (apps/core/realtime.py). Leave empty for one process; behind several
+# workers, a Redis URL lets every worker reach every socket (install `redis`).
+SOCKETIO_MESSAGE_QUEUE = env("SOCKETIO_MESSAGE_QUEUE", "")
+
 FILE_DOWNLOAD_TTL_SECONDS = int(env("FILE_DOWNLOAD_TTL_SECONDS", str(7 * 24 * 3600)))
 PUBLIC_SHARE_DEFAULT_EXPIRY_DAYS = 14
 EXCHANGE_RATE_URL = env("EXCHANGE_RATE_URL", "https://open.er-api.com/v6/latest/USD")
 EXCHANGE_RATE_CACHE_SECONDS = 24 * 60 * 60
+
+# --------------------------------------------------------------------------
+# Email configuration
+# --------------------------------------------------------------------------
+EMAIL_BACKEND = env(
+    "EMAIL_BACKEND",
+    "django.core.mail.backends.console.EmailBackend" if DEBUG else "django.core.mail.backends.smtp.EmailBackend",
+)
+EMAIL_HOST = env("EMAIL_HOST", "smtp.gmail.com")
+EMAIL_PORT = int(env("EMAIL_PORT", "587"))
+EMAIL_USE_TLS = env_bool("EMAIL_USE_TLS", True)
+EMAIL_USE_SSL = env_bool("EMAIL_USE_SSL", False)
+EMAIL_HOST_USER = env("EMAIL_HOST_USER", "")
+EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", "")
+DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", "Evenmore ERP <noreply@evenmore.io>")
+EMAIL_TIMEOUT = int(env("EMAIL_TIMEOUT", "10"))
 
 CACHES = {
     "default": {

@@ -14,6 +14,7 @@ individual viewset has to remember it:
 """
 from django.db import transaction
 from django.utils import timezone
+from django.utils.cache import patch_cache_control
 from django.utils.http import parse_http_date_safe
 from rest_framework import mixins, status, viewsets
 from rest_framework.response import Response
@@ -106,6 +107,11 @@ class ConcurrencyMixin:
         updated_at = getattr(instance, "updated_at", None)
         if updated_at is not None and "Last-Modified" not in response:
             response["Last-Modified"] = updated_at.strftime("%a, %d %b %Y %H:%M:%S GMT")
+            # Last-Modified alone lets a browser reuse the response heuristically
+            # (10% of its age), so a re-read after a change -- or after a realtime
+            # "this changed" push -- could get the old copy. Always revalidate.
+            if "Cache-Control" not in response:
+                patch_cache_control(response, private=True, no_cache=True)
         return response
 
 

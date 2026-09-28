@@ -14,7 +14,7 @@ from apps.core.exceptions import Codes, Conflict, NotFound, ValidationFailed
 from apps.core.money import ZERO, round2
 from apps.core.numbering import allocate_number
 from apps.core.pagination import envelope
-from apps.core.permissions import HasModulePermission
+from apps.core.permissions import HasModulePermission, has_permission
 from apps.core.viewsets import BulkDeleteMixin, ReadOnlyTenantViewSet, TenantModelViewSet
 
 from . import services
@@ -71,10 +71,10 @@ from .serializers import (
     SourceSerializer,
     StageSerializer,
     StageTaskSerializer,
-    TaskAllocationSerializer,
+    # TaskAllocationSerializer,  # Hidden: out of scope
     TaskSerializer,
-    UserAllocationSerializer,
-    UserLocationSerializer,
+    # UserAllocationSerializer,  # Hidden: out of scope
+    # UserLocationSerializer,  # Hidden: out of scope
 )
 
 MONEY = DecimalField(max_digits=18, decimal_places=2)
@@ -106,14 +106,18 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
         "city": "city",
         "stageId": "stage_id",
     }
+    # Keys are DRF action names. The bulk-delete action is `bulk_delete_action`;
+    # it used to be keyed as `bulk_delete`, which matched nothing and left it
+    # open. Sub-resources (notes, calls, files, threads, ...) fall to the
+    # read/write buckets.
     permission_map = {
-        "list": ["view_lead"],
-        "retrieve": ["view_lead"],
+        "read": ["view_lead"],
         "create": ["create_lead"],
-        "update": ["edit_lead"],
-        "partial_update": ["edit_lead"],
+        "bulk_import": ["create_lead"],
+        "export": ["view_lead", "export_excel"],
         "destroy": ["delete_lead"],
-        "bulk_delete": ["delete_lead"],
+        "bulk_delete_action": ["delete_lead"],
+        "write": ["edit_lead"],
     }
 
     def filter_queryset(self, queryset):
@@ -590,7 +594,18 @@ class TaskViewSet(TenantModelViewSet):
         "update": ["edit_task"],
         "partial_update": ["edit_task"],
         "destroy": ["delete_task"],
+        "complete": ["view_task"],
     }
+
+    #: Holders of this see the whole team's tasks; everyone else sees the
+    #: tasks assigned to them (the record-level half of `view_task`).
+    TEAM_SCOPE_PERMISSION = "assign_task"
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if not has_permission(self.request.user, self.TEAM_SCOPE_PERMISSION):
+            queryset = queryset.filter(assignee=self.request.user)
+        return queryset
 
     def filter_queryset(self, queryset):
         queryset = super().filter_queryset(queryset)
@@ -648,64 +663,65 @@ class TaskViewSet(TenantModelViewSet):
         )
 
 
-class TaskAllocationViewSet(TenantModelViewSet):
-    queryset = TaskAllocation.objects.select_related("assignee", "assigned_by").prefetch_related(
-        "audit_entries"
-    )
-    serializer_class = TaskAllocationSerializer
-    audit_entity_type = "CrmTaskAllocation"
-    audit_label_field = "title"
-    status_field = "status"
-    search_fields = ["title", "description", "department"]
-    ordering = ["-created_at"]
-    filter_map = {"assigneeId": "assignee_id", "department": "department", "priority": "priority"}
-    permission_map = {"read": ["view_task"], "write": ["manage_task_allocation"]}
+# Hidden: Task Allocation duplicates CRM Tasks -- restore by uncommenting this block.
+# class TaskAllocationViewSet(TenantModelViewSet):
+#     queryset = TaskAllocation.objects.select_related("assignee", "assigned_by").prefetch_related(
+#         "audit_entries"
+#     )
+#     serializer_class = TaskAllocationSerializer
+#     audit_entity_type = "CrmTaskAllocation"
+#     audit_label_field = "title"
+#     status_field = "status"
+#     search_fields = ["title", "description", "department"]
+#     ordering = ["-created_at"]
+#     filter_map = {"assigneeId": "assignee_id", "department": "department", "priority": "priority"}
+#     permission_map = {"read": ["view_task"], "write": ["manage_task_allocation"]}
 
-    def _append_audit(self, allocation, action_name, text):
-        """Every assignment and status change appends a human-readable line;
-        the server generates the string from the structured record (api.md §9.3)."""
-        TaskAllocationAudit.objects.create(
-            client_id=allocation.client_id,
-            allocation=allocation,
-            action=action_name,
-            text=text,
-            actor=self.request.user,
-        )
+#     def _append_audit(self, allocation, action_name, text):
+#         """Every assignment and status change appends a human-readable line;
+#         the server generates the string from the structured record (api.md §9.3)."""
+#         TaskAllocationAudit.objects.create(
+#             client_id=allocation.client_id,
+#             allocation=allocation,
+#             action=action_name,
+#             text=text,
+#             actor=self.request.user,
+#         )
 
-    def perform_create(self, serializer):
-        serializer.validated_data.setdefault("assigned_by", self.request.user)
-        allocation = super().perform_create(serializer)
-        assignee = allocation.assignee.name if allocation.assignee_id else "nobody"
-        self._append_audit(
-            allocation, "assigned", f"{self.request.user.name} assigned this to {assignee}"
-        )
-        return allocation
+#     def perform_create(self, serializer):
+#         serializer.validated_data.setdefault("assigned_by", self.request.user)
+#         allocation = super().perform_create(serializer)
+#         assignee = allocation.assignee.name if allocation.assignee_id else "nobody"
+#         self._append_audit(
+#             allocation, "assigned", f"{self.request.user.name} assigned this to {assignee}"
+#         )
+#         return allocation
 
-    def perform_update(self, serializer):
-        previous_status = serializer.instance.status
-        previous_assignee = serializer.instance.assignee_id
-        allocation = super().perform_update(serializer)
+#     def perform_update(self, serializer):
+#         previous_status = serializer.instance.status
+#         previous_assignee = serializer.instance.assignee_id
+#         allocation = super().perform_update(serializer)
 
-        if allocation.status != previous_status:
-            self._append_audit(
-                allocation,
-                "status",
-                f"{self.request.user.name} moved this to {allocation.status}",
-            )
-        if allocation.assignee_id != previous_assignee:
-            name = allocation.assignee.name if allocation.assignee_id else "nobody"
-            self._append_audit(
-                allocation, "reassigned", f"{self.request.user.name} reassigned this to {name}"
-            )
-        return allocation
+#         if allocation.status != previous_status:
+#             self._append_audit(
+#                 allocation,
+#                 "status",
+#                 f"{self.request.user.name} moved this to {allocation.status}",
+#             )
+#         if allocation.assignee_id != previous_assignee:
+#             name = allocation.assignee.name if allocation.assignee_id else "nobody"
+#             self._append_audit(
+#                 allocation, "reassigned", f"{self.request.user.name} reassigned this to {name}"
+#             )
+#         return allocation
 
-    @action(detail=False, methods=["post"])
-    def assign(self, request):
-        """``POST /crm/task-allocations/assign/`` -- the AssignTaskModal."""
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        self.perform_create(serializer)
-        return Response(serializer.data, status=status.HTTP_201_CREATED)
+#     @action(detail=False, methods=["post"])
+#     def assign(self, request):
+#         """``POST /crm/task-allocations/assign/`` -- the AssignTaskModal."""
+#         serializer = self.get_serializer(data=request.data)
+#         serializer.is_valid(raise_exception=True)
+#         self.perform_create(serializer)
+#         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
 class TeamRosterView(APIView):
@@ -977,6 +993,7 @@ class SourceViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = None
     ordering = ["name"]
+    permission_map = {"read": ["view_lead"], "write": ["manage_pipeline"]}
 
 
 class IndustryViewSet(TenantModelViewSet):
@@ -986,6 +1003,7 @@ class IndustryViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = None
     ordering = ["name"]
+    permission_map = {"read": ["view_lead"], "write": ["manage_pipeline"]}
 
 
 class LostReasonViewSet(TenantModelViewSet):
@@ -995,48 +1013,51 @@ class LostReasonViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = None
     ordering = ["name"]
+    permission_map = {"read": ["view_lead"], "write": ["manage_pipeline"]}
 
 
-class UserAllocationViewSet(TenantModelViewSet):
-    queryset = UserAllocation.objects.select_related("user", "industry")
-    serializer_class = UserAllocationSerializer
-    audit_entity_type = "CrmUserAllocation"
-    status_field = None
-    ordering = ["user__name"]
-    permission_map = {"read": ["view_task"], "write": ["manage_task_allocation"]}
+# Hidden: User Tracking out of scope (Sweven spec) -- restore by uncommenting this block.
+# class UserAllocationViewSet(TenantModelViewSet):
+#     queryset = UserAllocation.objects.select_related("user", "industry")
+#     serializer_class = UserAllocationSerializer
+#     audit_entity_type = "CrmUserAllocation"
+#     status_field = None
+#     ordering = ["user__name"]
+#     permission_map = {"read": ["view_task"], "write": ["manage_task_allocation"]}
 
 
-class UserLocationViewSet(ReadOnlyTenantViewSet):
-    """Field-user location tracking (api.md §9.6)."""
+# Hidden: User Tracking / field GPS map out of scope (Sweven spec) -- restore by uncommenting this block.
+# class UserLocationViewSet(ReadOnlyTenantViewSet):
+#     """Field-user location tracking (api.md §9.6)."""
 
-    queryset = UserLocation.objects.select_related("user")
-    serializer_class = UserLocationSerializer
-    filter_soft_deleted = False
-    status_field = None
-    filter_map = {"userId": "user_id"}
-    ordering = ["-recorded_at"]
-    permission_map = {"read": ["view_staff"]}
+#     queryset = UserLocation.objects.select_related("user")
+#     serializer_class = UserLocationSerializer
+#     filter_soft_deleted = False
+#     status_field = None
+#     filter_map = {"userId": "user_id"}
+#     ordering = ["-recorded_at"]
+#     permission_map = {"read": ["view_staff"]}
 
-    def filter_queryset(self, queryset):
-        queryset = super().filter_queryset(queryset)
-        on_date = self.request.query_params.get("date")
-        if on_date:
-            queryset = queryset.filter(recorded_at__date=on_date)
-        return queryset
+#     def filter_queryset(self, queryset):
+#         queryset = super().filter_queryset(queryset)
+#         on_date = self.request.query_params.get("date")
+#         if on_date:
+#             queryset = queryset.filter(recorded_at__date=on_date)
+#         return queryset
 
-    def create(self, request):
-        """Mobile ping ``{ userId, lat, lng, accuracy, recordedAt }``."""
-        row = UserLocation.objects.create(
-            client_id=request.client_id,
-            user_id=request.data.get("userId") or request.user.id,
-            latitude=request.data.get("lat") or request.data.get("latitude"),
-            longitude=request.data.get("lng") or request.data.get("longitude"),
-            accuracy=request.data.get("accuracy"),
-            recorded_at=request.data.get("recordedAt") or timezone.now(),
-        )
-        return Response(
-            UserLocationSerializer(row).data, status=status.HTTP_201_CREATED
-        )
+#     def create(self, request):
+#         """Mobile ping ``{ userId, lat, lng, accuracy, recordedAt }``."""
+#         row = UserLocation.objects.create(
+#             client_id=request.client_id,
+#             user_id=request.data.get("userId") or request.user.id,
+#             latitude=request.data.get("lat") or request.data.get("latitude"),
+#             longitude=request.data.get("lng") or request.data.get("longitude"),
+#             accuracy=request.data.get("accuracy"),
+#             recorded_at=request.data.get("recordedAt") or timezone.now(),
+#         )
+#         return Response(
+#             UserLocationSerializer(row).data, status=status.HTTP_201_CREATED
+#         )
 
 
 class FormViewSet(TenantModelViewSet):

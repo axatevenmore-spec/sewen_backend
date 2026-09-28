@@ -27,6 +27,8 @@ from apps.inventory import services as stock
 
 from . import services
 from .models import (
+    CHALLAN_SHIPPED_STATUSES,
+    CashPaymentReceipt,
     DeliveryChallan,
     DeliveryChallanLine,
     Estimate,
@@ -47,6 +49,7 @@ from .models import (
 )
 from .serializers import (
     AllocateSerializer,
+    CashPaymentReceiptSerializer,
     ConvertLinesSerializer,
     DeliveryChallanSerializer,
     EstimateSerializer,
@@ -60,7 +63,7 @@ from .serializers import (
     SalesOrderSerializer,
     SalesReturnSerializer,
     ShareRequestSerializer,
-    WarrantyCardSerializer,
+    # WarrantyCardSerializer,  # Hidden: out of scope
 )
 
 MONEY = DecimalField(max_digits=18, decimal_places=2)
@@ -146,7 +149,8 @@ class EstimateViewSet(SalesDocumentViewSet):
     audit_label_field = "estimate_number"
     status_field = "status"
     print_title = "Estimate"
-    permission_map = {"read": ["view_sales"], "write": ["view_sales"]}
+    # An estimate is the draft of a quotation; writing one needs the quotation id.
+    permission_map = {"read": ["view_sales"], "write": ["create_quotation"]}
 
     def perform_create(self, serializer):
         # An estimate is numbered on creation: it is a quoting artefact, not a
@@ -446,6 +450,24 @@ class SalesOrderViewSet(SalesDocumentViewSet):
         self.write_audit("cancel", order, description=reason)
         return Response(self.get_serializer(order).data)
 
+    @action(detail=True, methods=["post"], url_path="allocate-split")
+    def allocate_split(self, request, pk=None):
+        order = self.get_object()
+        formal_amt = request.data.get("formalInvoiceAmount")
+        cash_amt = request.data.get("cashAmount")
+        total_val = request.data.get("totalSalesValue")
+
+        if total_val is not None:
+            order.total_sales_value = Decimal(str(total_val))
+        if formal_amt is not None:
+            order.formal_invoice_amount = Decimal(str(formal_amt))
+        if cash_amt is not None:
+            order.cash_amount = Decimal(str(cash_amt))
+
+        order.save(update_fields=["total_sales_value", "formal_invoice_amount", "cash_amount", "updated_at"])
+        self.write_audit("update", order, description="Updated Sales Order split allocation")
+        return Response(self.get_serializer(order).data, status=status.HTTP_200_OK)
+
     @action(detail=True, methods=["get"])
     def fulfilment(self, request, pk=None):
         return Response(services.order_fulfilment(self.get_object()))
@@ -622,7 +644,12 @@ class ProformaInvoiceViewSet(SalesDocumentViewSet):
     status_field = "status"
     print_title = "Proforma Invoice"
     filter_map = {"customerId": "party_id"}
-    permission_map = {"read": ["view_sales"], "write": ["view_sales"]}
+    # A proforma is raised against a sales order; converting it bills the order.
+    permission_map = {
+        "read": ["view_sales"],
+        "write": ["create_sales_order"],
+        "convert_to_invoice": ["create_invoice"],
+    }
     draft_values = ("Draft", "Sent")
 
     def perform_create(self, serializer):
@@ -663,6 +690,24 @@ class ProformaInvoiceViewSet(SalesDocumentViewSet):
             status=status.HTTP_201_CREATED,
         )
 
+    @action(detail=True, methods=["post"], url_path="allocate-split")
+    def allocate_split(self, request, pk=None):
+        proforma = self.get_object()
+        formal_amt = request.data.get("formalInvoiceAmount")
+        cash_amt = request.data.get("cashAmount")
+        total_val = request.data.get("totalSalesValue")
+
+        if total_val is not None:
+            proforma.total_sales_value = Decimal(str(total_val))
+        if formal_amt is not None:
+            proforma.formal_invoice_amount = Decimal(str(formal_amt))
+        if cash_amt is not None:
+            proforma.cash_amount = Decimal(str(cash_amt))
+
+        proforma.save(update_fields=["total_sales_value", "formal_invoice_amount", "cash_amount", "updated_at"])
+        self.write_audit("update", proforma, description="Updated Proforma Invoice split allocation")
+        return Response(self.get_serializer(proforma).data, status=status.HTTP_200_OK)
+
 
 # ---------------------------------------------------------------------------
 # Delivery challans (api.md §5.6)
@@ -699,6 +744,42 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
     def dispatch_action(self, request, pk=None):
         challan = services.dispatch_challan(self.get_object(), user=request.user)
         self.write_audit("dispatch", challan, description="Challan dispatched")
+        return Response(self.get_serializer(challan).data)
+
+    @action(detail=True, methods=["post"])
+    def track(self, request, pk=None):
+        """``{ status }`` -- carrier progress after dispatch (the challan tracker).
+
+        A dispatched challan is otherwise read-only (drafts only), so moving it
+        on to In Transit / Out for Delivery / Delivered has its own endpoint.
+        Moves are forward-only; repeating the current status is a no-op.
+        """
+        challan = self.get_object()
+        target = request.data.get("status")
+        if target not in CHALLAN_SHIPPED_STATUSES:
+            raise ValidationFailed(
+                "Unknown tracking status.",
+                field_errors={"status": [f"Must be one of: {', '.join(CHALLAN_SHIPPED_STATUSES)}."]},
+            )
+        if challan.status not in CHALLAN_SHIPPED_STATUSES:
+            raise Conflict(
+                f"A {challan.status} challan has not been dispatched.",
+                code=Codes.BAD_TARGET,
+            )
+        if challan.status == target:
+            return Response(self.get_serializer(challan).data)
+        if CHALLAN_SHIPPED_STATUSES.index(target) < CHALLAN_SHIPPED_STATUSES.index(challan.status):
+            raise Conflict(
+                f"This challan is already {challan.status}.", code=Codes.BAD_TARGET
+            )
+
+        challan.status = target
+        update_fields = ["status", "updated_at"]
+        if target == "Delivered":
+            challan.delivered_at = timezone.now()
+            update_fields.append("delivered_at")
+        challan.save(update_fields=update_fields)
+        self.write_audit("track", challan, description=f"Marked {target}")
         return Response(self.get_serializer(challan).data)
 
     @action(detail=True, methods=["post"])
@@ -772,80 +853,81 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
             status=status.HTTP_201_CREATED,
         )
 
-    @action(detail=True, methods=["post"], url_path="warranty-card")
-    @transaction.atomic
-    def warranty_card(self, request, pk=None):
-        """Issue a warranty card for the dispatched serials (api.md §5.6)."""
-        from .models import WarrantyCardItem, WarrantyCardSerial
+    # Hidden: Warranty Cards out of scope (Sweven spec) -- restore by uncommenting this block.
+    # @action(detail=True, methods=["post"], url_path="warranty-card")
+    # @transaction.atomic
+    # def warranty_card(self, request, pk=None):
+    #     """Issue a warranty card for the dispatched serials (api.md §5.6)."""
+    #     from .models import WarrantyCardItem, WarrantyCardSerial
 
-        challan = self.get_object()
-        if challan.status == "Draft":
-            raise Conflict(
-                "Dispatch the challan before issuing a warranty card.",
-                code=Codes.NOT_FINALIZED,
-            )
+    #     challan = self.get_object()
+    #     if challan.status == "Draft":
+    #         raise Conflict(
+    #             "Dispatch the challan before issuing a warranty card.",
+    #             code=Codes.NOT_FINALIZED,
+    #         )
 
-        period = int(request.data.get("warrantyPeriod") or 1)
-        unit = request.data.get("warrantyUnit") or "Years"
-        start_event = request.data.get("warrantyStartEvent") or "Delivery"
-        start_date = challan.dispatch_date or challan.doc_date
+    #     period = int(request.data.get("warrantyPeriod") or 1)
+    #     unit = request.data.get("warrantyUnit") or "Years"
+    #     start_event = request.data.get("warrantyStartEvent") or "Delivery"
+    #     start_date = challan.dispatch_date or challan.doc_date
 
-        card = WarrantyCard.objects.create(
-            client_id=challan.client_id,
-            card_number=allocate_number(challan.client, "WC"),
-            party=challan.party,
-            contact_person=request.data.get("contactPerson"),
-            billing_address=challan.billing_address,
-            shipping_address=challan.shipping_address,
-            gstin=challan.party_gstin,
-            delivery_challan=challan,
-            sales_order=challan.sales_order,
-            delivery_date=start_date,
-            delivery_location=challan.delivery_location,
-            warranty_period=period,
-            warranty_unit=unit,
-            warranty_start_event=start_event,
-            start_date=start_date,
-            expiry_date=services.compute_expiry(start_date, period, unit),
-            document_status="Generated",
-            created_by=request.user,
-        )
+    #     card = WarrantyCard.objects.create(
+    #         client_id=challan.client_id,
+    #         card_number=allocate_number(challan.client, "WC"),
+    #         party=challan.party,
+    #         contact_person=request.data.get("contactPerson"),
+    #         billing_address=challan.billing_address,
+    #         shipping_address=challan.shipping_address,
+    #         gstin=challan.party_gstin,
+    #         delivery_challan=challan,
+    #         sales_order=challan.sales_order,
+    #         delivery_date=start_date,
+    #         delivery_location=challan.delivery_location,
+    #         warranty_period=period,
+    #         warranty_unit=unit,
+    #         warranty_start_event=start_event,
+    #         start_date=start_date,
+    #         expiry_date=services.compute_expiry(start_date, period, unit),
+    #         document_status="Generated",
+    #         created_by=request.user,
+    #     )
 
-        line_ids = list(
-            challan.line_items.filter(deleted_at__isnull=True).values_list("id", flat=True)
-        )
-        serial_map = stock.serials_for_lines(
-            challan.client_id, "delivery_challan_lines", line_ids
-        )
-        for line in challan.line_items.filter(deleted_at__isnull=True):
-            WarrantyCardItem.objects.create(
-                client_id=challan.client_id,
-                warranty_card=card,
-                item_id=line.item_id,
-                sku=line.sku,
-                item_name=line.item_name,
-                qty=line.qty,
-            )
-            numbers = serial_map.get(line.id, [])
-            if numbers:
-                resolved = stock.resolve_serials(
-                    challan.client_id, line.item_id, numbers, expected_status=None
-                )
-                WarrantyCardSerial.objects.bulk_create(
-                    [
-                        WarrantyCardSerial(
-                            client_id=challan.client_id, warranty_card=card, serial=serial
-                        )
-                        for serial in resolved
-                    ],
-                    ignore_conflicts=True,
-                )
-                stock.set_serial_status(resolved, "sold", warranty_card=card)
+    #     line_ids = list(
+    #         challan.line_items.filter(deleted_at__isnull=True).values_list("id", flat=True)
+    #     )
+    #     serial_map = stock.serials_for_lines(
+    #         challan.client_id, "delivery_challan_lines", line_ids
+    #     )
+    #     for line in challan.line_items.filter(deleted_at__isnull=True):
+    #         WarrantyCardItem.objects.create(
+    #             client_id=challan.client_id,
+    #             warranty_card=card,
+    #             item_id=line.item_id,
+    #             sku=line.sku,
+    #             item_name=line.item_name,
+    #             qty=line.qty,
+    #         )
+    #         numbers = serial_map.get(line.id, [])
+    #         if numbers:
+    #             resolved = stock.resolve_serials(
+    #                 challan.client_id, line.item_id, numbers, expected_status=None
+    #             )
+    #             WarrantyCardSerial.objects.bulk_create(
+    #                 [
+    #                     WarrantyCardSerial(
+    #                         client_id=challan.client_id, warranty_card=card, serial=serial
+    #                     )
+    #                     for serial in resolved
+    #                 ],
+    #                 ignore_conflicts=True,
+    #             )
+    #             stock.set_serial_status(resolved, "sold", warranty_card=card)
 
-        return Response(
-            WarrantyCardSerializer(card, context=self.get_serializer_context()).data,
-            status=status.HTTP_201_CREATED,
-        )
+    #     return Response(
+    #         WarrantyCardSerializer(card, context=self.get_serializer_context()).data,
+    #         status=status.HTTP_201_CREATED,
+    #     )
 
 
 # ---------------------------------------------------------------------------
@@ -864,6 +946,7 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
         "write": ["create_invoice"],
         "finalize": ["finalize_invoice"],
         "cancel": ["cancel_invoice"],
+        "allocate_split": ["create_invoice"],
     }
 
     def filter_queryset(self, queryset):
@@ -893,6 +976,19 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
     def perform_create(self, serializer):
         """``POST /sales/invoices/`` -- Draft unless ``{ finalize: true }``."""
         invoice = super().perform_create(serializer)
+        formal_amount = self.request.data.get("formalInvoiceAmount") or self.request.data.get("formal_invoice_amount")
+        cash_amount = self.request.data.get("cashReceiptAmount") or self.request.data.get("cashAmount") or self.request.data.get("cash_amount")
+        total_sales = self.request.data.get("totalSalesValue") or self.request.data.get("total_sales_value")
+        if formal_amount is not None or cash_amount is not None or total_sales is not None:
+            invoice = services.update_sales_allocation(
+                invoice,
+                formal_invoice_amount=formal_amount,
+                cash_amount=cash_amount,
+                total_sales_value=total_sales,
+                reason="Initial allocation",
+                user=self.request.user,
+            )
+
         if self.request.data.get("finalize"):
             services.finalize_invoice(
                 invoice,
@@ -901,6 +997,41 @@ class SalesInvoiceViewSet(SalesDocumentViewSet):
             )
             invoice.refresh_from_db()
         return invoice
+
+    def perform_update(self, serializer):
+        invoice = super().perform_update(serializer)
+        formal_amount = self.request.data.get("formalInvoiceAmount") or self.request.data.get("formal_invoice_amount")
+        cash_amount = self.request.data.get("cashReceiptAmount") or self.request.data.get("cashAmount") or self.request.data.get("cash_amount")
+        total_sales = self.request.data.get("totalSalesValue") or self.request.data.get("total_sales_value")
+        reason = self.request.data.get("reason")
+        if formal_amount is not None or cash_amount is not None or total_sales is not None:
+            invoice = services.update_sales_allocation(
+                invoice,
+                formal_invoice_amount=formal_amount,
+                cash_amount=cash_amount,
+                total_sales_value=total_sales,
+                reason=reason,
+                user=self.request.user,
+            )
+        return invoice
+
+    @action(detail=True, methods=["post"], url_path="allocate-split")
+    def allocate_split(self, request, pk=None):
+        invoice = self.get_object()
+        formal_amount = request.data.get("formalInvoiceAmount") or request.data.get("formal_invoice_amount")
+        cash_amount = request.data.get("cashReceiptAmount") or request.data.get("cashAmount") or request.data.get("cash_amount")
+        total_sales = request.data.get("totalSalesValue") or request.data.get("total_sales_value")
+        reason = request.data.get("reason")
+        invoice = services.update_sales_allocation(
+            invoice,
+            formal_invoice_amount=formal_amount,
+            cash_amount=cash_amount,
+            total_sales_value=total_sales,
+            reason=reason,
+            user=request.user,
+        )
+        self.write_audit("allocate_split", invoice, description=reason or "Updated sales invoice/cash allocation")
+        return Response(self.get_serializer(invoice).data)
 
     @action(detail=True, methods=["post"])
     def finalize(self, request, pk=None):
@@ -960,6 +1091,8 @@ class PaymentInViewSet(TenantModelViewSet):
         rows = queryset.aggregate(
             count=Count("id"),
             totalReceived=money_sum("amount"),
+            withBillPayments=money_sum("amount", filter=Q(payment_type="WITH_BILL")),
+            withoutBillCash=money_sum("amount", filter=Q(payment_type="WITHOUT_BILL")),
             allocated=money_sum("allocated_amount"),
         )
         rows["unallocated"] = round2(rows["totalReceived"] - rows["allocated"])
@@ -968,6 +1101,13 @@ class PaymentInViewSet(TenantModelViewSet):
     @transaction.atomic
     def perform_create(self, serializer):
         data = serializer.validated_data
+        payment_type = (
+            self.request.data.get("paymentType")
+            or self.request.data.get("payment_type")
+            or data.get("payment_type")
+            or "WITH_BILL"
+        )
+        description = self.request.data.get("description") or data.get("description")
         allocations = self.request.data.get("allocations") or []
         invoice_id = self.request.data.get("invoiceId")
         invoice = None
@@ -975,7 +1115,7 @@ class PaymentInViewSet(TenantModelViewSet):
             invoice = SalesInvoice.objects.filter(
                 pk=invoice_id, client_id=self.get_client_id(), deleted_at__isnull=True
             ).first()
-            if invoice is None:
+            if invoice is None and payment_type == "WITH_BILL":
                 raise NotFound("That invoice no longer exists.")
 
         payment = services.record_payment_in(
@@ -984,8 +1124,10 @@ class PaymentInViewSet(TenantModelViewSet):
             amount=data["amount"],
             payment_date=data["payment_date"],
             mode=data["mode"],
+            payment_type=payment_type,
             bank_account=data.get("bank_account"),
             reference_number=data.get("reference_number"),
+            description=description,
             notes=data.get("notes"),
             allocations=allocations,
             invoice=invoice,
@@ -1026,6 +1168,86 @@ class PaymentInViewSet(TenantModelViewSet):
         )
         page = self.paginate_queryset(queryset)
         return self.get_paginated_response(self.get_serializer(page, many=True).data)
+
+
+# ---------------------------------------------------------------------------
+# Cash Payment Receipts (Without Bill / Cash)
+# ---------------------------------------------------------------------------
+class CashPaymentReceiptViewSet(TenantModelViewSet):
+    queryset = CashPaymentReceipt.objects.select_related("party", "invoice", "created_by", "cancelled_by")
+    serializer_class = CashPaymentReceiptSerializer
+    audit_entity_type = "CashPaymentReceipt"
+    audit_label_field = "receipt_number"
+    status_field = "status"
+    default_date_field = "payment_date"
+    search_fields = ["receipt_number", "reference_number", "party__name", "description"]
+    ordering = ["-payment_date", "-created_at"]
+    filter_map = {"customerId": "party_id", "mode": "mode", "status": "status", "invoiceId": "invoice_id"}
+    permission_map = {"read": ["view_sales"], "write": ["record_payment_in"]}
+
+    def get_aggregates(self, queryset):
+        rows = queryset.aggregate(
+            count=Count("id"),
+            totalAmount=money_sum("amount"),
+            receivedCount=Count("id", filter=Q(status="RECEIVED")),
+            cancelledCount=Count("id", filter=Q(status="CANCELLED")),
+            voidedCount=Count("id", filter=Q(status="VOIDED")),
+        )
+        return rows
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        data = serializer.validated_data
+        invoice = data.get("invoice")
+        party = data.get("party")
+        amount = data.get("amount")
+        payment_date = data.get("payment_date")
+        mode = data.get("mode") or "Cash"
+        description = data.get("description") or "Cash Payment Receipt"
+        notes = data.get("notes")
+        reference_number = data.get("reference_number")
+
+        payment = services.record_payment_in(
+            client=self.get_client(),
+            party=party,
+            amount=amount,
+            payment_date=payment_date,
+            mode=mode,
+            payment_type="WITHOUT_BILL",
+            invoice=invoice,
+            description=description,
+            notes=notes,
+            reference_number=reference_number,
+            user=self.request.user,
+        )
+        serializer.instance = payment.cash_receipt
+        return payment.cash_receipt
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        serializer = ReasonSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        receipt = services.cancel_cash_receipt(
+            self.get_object(),
+            reason=serializer.validated_data.get("reason"),
+            user=request.user,
+            void=False,
+        )
+        self.write_audit("cancel", receipt, description=serializer.validated_data.get("reason"))
+        return Response(self.get_serializer(receipt).data)
+
+    @action(detail=True, methods=["post"])
+    def void(self, request, pk=None):
+        serializer = ReasonSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        receipt = services.cancel_cash_receipt(
+            self.get_object(),
+            reason=serializer.validated_data.get("reason"),
+            user=request.user,
+            void=True,
+        )
+        self.write_audit("void", receipt, description=serializer.validated_data.get("reason"))
+        return Response(self.get_serializer(receipt).data)
 
 
 # ---------------------------------------------------------------------------
@@ -1155,95 +1377,96 @@ class SalesReturnViewSet(SalesDocumentViewSet):
         return Response(self.get_serializer(sales_return).data)
 
 
-# ---------------------------------------------------------------------------
-# Warranty cards (api.md §5.10)
-# ---------------------------------------------------------------------------
-class WarrantyCardViewSet(TenantModelViewSet):
-    queryset = WarrantyCard.objects.select_related(
-        "party", "delivery_challan", "sales_invoice"
-    ).prefetch_related("items")
-    serializer_class = WarrantyCardSerializer
-    audit_entity_type = "WarrantyCard"
-    audit_label_field = "card_number"
-    status_field = "document_status"
-    default_date_field = "start_date"
-    search_fields = ["card_number", "party__name", "contact_person"]
-    ordering = ["-created_at"]
-    filter_map = {"customerId": "party_id"}
-    permission_map = {"read": ["view_sales"], "write": ["view_sales"]}
-    draft_only_writes = True
-    draft_status_field = "document_status"
-    draft_values = ("Draft",)
+# Hidden: Warranty Cards out of scope (Sweven spec) -- restore by uncommenting this block.
+# # ---------------------------------------------------------------------------
+# # Warranty cards (api.md §5.10)
+# # ---------------------------------------------------------------------------
+# class WarrantyCardViewSet(TenantModelViewSet):
+#     queryset = WarrantyCard.objects.select_related(
+#         "party", "delivery_challan", "sales_invoice"
+#     ).prefetch_related("items")
+#     serializer_class = WarrantyCardSerializer
+#     audit_entity_type = "WarrantyCard"
+#     audit_label_field = "card_number"
+#     status_field = "document_status"
+#     default_date_field = "start_date"
+#     search_fields = ["card_number", "party__name", "contact_person"]
+#     ordering = ["-created_at"]
+#     filter_map = {"customerId": "party_id"}
+#     permission_map = {"read": ["view_sales"], "write": ["view_sales"]}
+#     draft_only_writes = True
+#     draft_status_field = "document_status"
+#     draft_values = ("Draft",)
 
-    def perform_create(self, serializer):
-        data = serializer.validated_data
-        data["card_number"] = allocate_number(self.request.user.client, "WC")
-        if not data.get("expiry_date") and data.get("start_date"):
-            data["expiry_date"] = services.compute_expiry(
-                data["start_date"],
-                data.get("warranty_period", 1),
-                data.get("warranty_unit", "Years"),
-            )
-        return super().perform_create(serializer)
+#     def perform_create(self, serializer):
+#         data = serializer.validated_data
+#         data["card_number"] = allocate_number(self.request.user.client, "WC")
+#         if not data.get("expiry_date") and data.get("start_date"):
+#             data["expiry_date"] = services.compute_expiry(
+#                 data["start_date"],
+#                 data.get("warranty_period", 1),
+#                 data.get("warranty_unit", "Years"),
+#             )
+#         return super().perform_create(serializer)
 
-    def _transition(self, request, target, reason_field=None, allowed_from=None):
-        card = self.get_object()
-        if allowed_from and card.document_status not in allowed_from:
-            raise Conflict(
-                f"A {card.document_status} card cannot be {target.lower()}.",
-                code=Codes.BAD_TARGET,
-            )
-        reason = request.data.get("reason")
-        card.document_status = target
-        if reason_field:
-            setattr(card, reason_field, reason)
-        card.save()
-        self.write_audit(target.lower(), card, description=reason)
-        return Response(self.get_serializer(card).data)
+#     def _transition(self, request, target, reason_field=None, allowed_from=None):
+#         card = self.get_object()
+#         if allowed_from and card.document_status not in allowed_from:
+#             raise Conflict(
+#                 f"A {card.document_status} card cannot be {target.lower()}.",
+#                 code=Codes.BAD_TARGET,
+#             )
+#         reason = request.data.get("reason")
+#         card.document_status = target
+#         if reason_field:
+#             setattr(card, reason_field, reason)
+#         card.save()
+#         self.write_audit(target.lower(), card, description=reason)
+#         return Response(self.get_serializer(card).data)
 
-    @action(detail=True, methods=["post"])
-    def cancel(self, request, pk=None):
-        return self._transition(request, "Cancelled", "cancelled_reason")
+#     @action(detail=True, methods=["post"])
+#     def cancel(self, request, pk=None):
+#         return self._transition(request, "Cancelled", "cancelled_reason")
 
-    @action(detail=True, methods=["post"])
-    def void(self, request, pk=None):
-        return self._transition(request, "Void", "void_reason")
+#     @action(detail=True, methods=["post"])
+#     def void(self, request, pk=None):
+#         return self._transition(request, "Void", "void_reason")
 
-    @action(detail=True, methods=["post"])
-    def suspend(self, request, pk=None):
-        return self._transition(
-            request, "Suspended", "suspended_reason", allowed_from=("Generated",)
-        )
+#     @action(detail=True, methods=["post"])
+#     def suspend(self, request, pk=None):
+#         return self._transition(
+#             request, "Suspended", "suspended_reason", allowed_from=("Generated",)
+#         )
 
-    @action(detail=True, methods=["post"])
-    def resume(self, request, pk=None):
-        return self._transition(request, "Generated", allowed_from=("Suspended",))
+#     @action(detail=True, methods=["post"])
+#     def resume(self, request, pk=None):
+#         return self._transition(request, "Generated", allowed_from=("Suspended",))
 
-    @action(detail=False, methods=["get"], url_path=r"by-challan/(?P<challan_id>[^/.]+)")
-    def by_challan(self, request, challan_id=None):
-        card = self.get_queryset().filter(delivery_challan_id=challan_id).first()
-        if card is None:
-            raise NotFound("No warranty card has been issued for that challan.")
-        return Response(self.get_serializer(card).data)
+#     @action(detail=False, methods=["get"], url_path=r"by-challan/(?P<challan_id>[^/.]+)")
+#     def by_challan(self, request, challan_id=None):
+#         card = self.get_queryset().filter(delivery_challan_id=challan_id).first()
+#         if card is None:
+#             raise NotFound("No warranty card has been issued for that challan.")
+#         return Response(self.get_serializer(card).data)
 
-    @action(detail=False, methods=["get"], url_path=r"by-serial/(?P<serial_no>[^/.]+)")
-    def by_serial(self, request, serial_no=None):
-        """Also used by service intake (api.md §5.10)."""
-        card = (
-            self.get_queryset()
-            .filter(serial_links__serial__serial_no=serial_no)
-            .distinct()
-            .first()
-        )
-        if card is None:
-            raise NotFound("No warranty card covers that serial number.")
-        return Response(self.get_serializer(card).data)
+#     @action(detail=False, methods=["get"], url_path=r"by-serial/(?P<serial_no>[^/.]+)")
+#     def by_serial(self, request, serial_no=None):
+#         """Also used by service intake (api.md §5.10)."""
+#         card = (
+#             self.get_queryset()
+#             .filter(serial_links__serial__serial_no=serial_no)
+#             .distinct()
+#             .first()
+#         )
+#         if card is None:
+#             raise NotFound("No warranty card covers that serial number.")
+#         return Response(self.get_serializer(card).data)
 
-    @action(detail=True, methods=["get"])
-    def print(self, request, pk=None):
-        card = self.get_object()
-        return Response(
-            print_payload(
-                card, self.get_serializer_class(), request=request, title="Warranty Card"
-            )
-        )
+#     @action(detail=True, methods=["get"])
+#     def print(self, request, pk=None):
+#         card = self.get_object()
+#         return Response(
+#             print_payload(
+#                 card, self.get_serializer_class(), request=request, title="Warranty Card"
+#             )
+#         )

@@ -195,6 +195,9 @@ class User(AbstractBaseUser, PermissionsMixin, AuditedModel):
     employee = models.ForeignKey(
         "hrms.Employee", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
+    party = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="users"
+    )
     department = models.TextField(null=True, blank=True)
     location = models.TextField(null=True, blank=True)
     reporting_manager = models.ForeignKey(
@@ -264,6 +267,36 @@ class User(AbstractBaseUser, PermissionsMixin, AuditedModel):
     @property
     def display_role(self):
         return self.role.name if self.role_id else None
+
+    @property
+    def is_customer(self):
+        if self.role and (self.role.code == "CU" or str(self.role.name).lower() == "customer"):
+            return True
+        return self.party_id is not None
+
+    def get_customer_party_ids(self):
+        ids = set()
+        if self.party_id:
+            ids.add(self.party_id)
+        if self.email:
+            try:
+                from apps.masters.models import Party, PartyContact
+                p_ids = Party.objects.filter(
+                    client_id=self.client_id,
+                    deleted_at__isnull=True,
+                    email__iexact=self.email,
+                ).values_list("id", flat=True)
+                ids.update(p_ids)
+
+                c_ids = PartyContact.objects.filter(
+                    client_id=self.client_id,
+                    deleted_at__isnull=True,
+                    email__iexact=self.email,
+                ).values_list("party_id", flat=True)
+                ids.update(c_ids)
+            except Exception:
+                pass
+        return ids
 
     def is_locked(self):
         return self.locked_until is not None and self.locked_until > timezone.now()
@@ -339,3 +372,27 @@ class PasswordResetToken(models.Model):
     @property
     def is_usable(self):
         return self.used_at is None and self.expires_at > timezone.now()
+
+
+class PasswordResetOTP(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="reset_otps")
+    email = models.EmailField(db_index=True)
+    otp_hash = models.CharField(max_length=128)
+    expires_at = models.DateTimeField()
+    used_at = models.DateTimeField(null=True, blank=True)
+    attempts = models.PositiveSmallIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "password_reset_otps"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["email", "expires_at"]),
+            models.Index(fields=["user", "created_at"]),
+        ]
+
+    @property
+    def is_usable(self):
+        return self.used_at is None and self.expires_at > timezone.now() and self.attempts < 5
+
