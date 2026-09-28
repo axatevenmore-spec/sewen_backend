@@ -24,6 +24,7 @@ from apps.core.numbering import allocate_number
 
 from .models import (
     Attendance,
+    AttendancePunch,
     CalendarEvent,
     Employee,
     Holiday,
@@ -188,6 +189,368 @@ def mark_attendance(
             after={"status": derived_status, "checkIn": check_in, "checkOut": check_out},
         )
     return row
+
+
+def format_duration_hm(seconds):
+    if not seconds or seconds < 0:
+        return "00h 00m"
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    return f"{hours:02d}h {minutes:02d}m"
+
+
+def format_time_ampm(dt):
+    if not dt:
+        return None
+    local_dt = timezone.localtime(dt) if timezone.is_aware(dt) else dt
+    return local_dt.strftime("%I:%M %p")
+
+
+def calculate_punch_metrics(client_id, employee, work_date, punches=None, now=None):
+    """Calculate working hours, pairs, late minutes, overtime from punch records."""
+    if punches is None:
+        punches = list(
+            AttendancePunch.objects.filter(
+                client_id=client_id,
+                employee=employee,
+                work_date=work_date,
+                deleted_at__isnull=True,
+            ).order_by("punch_time")
+        )
+
+    if now is None:
+        now = timezone.now()
+
+    pairs = []
+    pairs_display = []
+    current_in = None
+    total_completed_seconds = 0
+
+    for p in punches:
+        if p.punch_type == "IN":
+            current_in = p
+        elif p.punch_type == "OUT" and current_in:
+            delta = (p.punch_time - current_in.punch_time).total_seconds()
+            if delta > 0:
+                total_completed_seconds += delta
+                pairs.append((current_in, p, int(delta)))
+                pairs_display.append({
+                    "inTime": format_time_ampm(current_in.punch_time),
+                    "outTime": format_time_ampm(p.punch_time),
+                    "duration": format_duration_hm(delta),
+                    "durationSeconds": int(delta),
+                })
+            current_in = None
+
+    is_punched_in = bool(punches and punches[-1].punch_type == "IN")
+    active_seconds = 0
+    if is_punched_in and punches:
+        active_seconds = max(0, int((now - punches[-1].punch_time).total_seconds()))
+
+    total_working_seconds = int(total_completed_seconds + active_seconds)
+    working_hours = round(Decimal(total_working_seconds) / Decimal(3600), 2)
+    completed_hours = round(Decimal(total_completed_seconds) / Decimal(3600), 2)
+
+    first_punch = punches[0] if punches else None
+    last_punch = punches[-1] if punches else None
+    first_in = next((p for p in punches if p.punch_type == "IN"), None)
+    last_out = next((p for p in reversed(punches) if p.punch_type == "OUT"), None)
+
+    policy = flexibility_policy(client_id)
+    shift_start = _parse_time(policy.get("shiftStart"), time(9, 30))
+    grace = int(policy.get("graceMinutes") or 0)
+    half_day_threshold = Decimal(str(policy.get("halfDayThresholdHours") or 4))
+    full_day_hours = Decimal(str(policy.get("fullDayHours") or 8))
+    full_day_seconds = int(full_day_hours * 3600)
+
+    late_minutes = 0
+    if first_in:
+        local_first_in = (
+            timezone.localtime(first_in.punch_time)
+            if timezone.is_aware(first_in.punch_time)
+            else first_in.punch_time
+        )
+        shift_start_dt = datetime.combine(local_first_in.date(), shift_start)
+        grace_dt = shift_start_dt + timedelta(minutes=grace)
+        if local_first_in.replace(tzinfo=None) > grace_dt:
+            diff = (local_first_in.replace(tzinfo=None) - shift_start_dt).total_seconds()
+            late_minutes = max(0, int(diff // 60))
+
+    overtime_seconds = max(0, int(total_working_seconds - full_day_seconds))
+    overtime_hours = round(Decimal(overtime_seconds) / Decimal(3600), 2)
+
+    if not punches:
+        status = "Absent"
+    elif working_hours < half_day_threshold and not is_punched_in:
+        status = "Half Day"
+    elif late_minutes > 0:
+        status = "Late"
+    else:
+        status = "Present"
+
+    return {
+        "punches": punches,
+        "is_punched_in": is_punched_in,
+        "total_working_seconds": total_working_seconds,
+        "total_completed_seconds": int(total_completed_seconds),
+        "formatted_working_time": format_duration_hm(total_working_seconds),
+        "working_hours": working_hours,
+        "completed_hours": completed_hours,
+        "first_punch": first_punch,
+        "last_punch": last_punch,
+        "first_in": first_in,
+        "last_out": last_out,
+        "late_minutes": late_minutes,
+        "overtime_seconds": overtime_seconds,
+        "overtime_hours": overtime_hours,
+        "status": status,
+        "pairs_display": pairs_display,
+    }
+
+
+def get_today_punch_status(client, employee, work_date=None):
+    """Retrieve punch status, punch timeline, working duration, and metrics."""
+    client_id = getattr(client, "id", client)
+    if work_date is None:
+        work_date = timezone.localdate()
+
+    punches = list(
+        AttendancePunch.objects.filter(
+            client_id=client_id,
+            employee=employee,
+            work_date=work_date,
+            deleted_at__isnull=True,
+        ).order_by("punch_time")
+    )
+    metrics = calculate_punch_metrics(client_id, employee, work_date, punches=punches)
+
+    if metrics["is_punched_in"]:
+        status_label = "Punched In"
+    elif punches:
+        status_label = "Punched Out"
+    else:
+        status_label = "Not Punched In"
+
+    first_punch_time = format_time_ampm(metrics["first_punch"].punch_time) if metrics["first_punch"] else None
+    last_punch_time = format_time_ampm(metrics["last_punch"].punch_time) if metrics["last_punch"] else None
+
+    att_row = Attendance.objects.filter(
+        client_id=client_id, employee=employee, work_date=work_date
+    ).first()
+
+    return {
+        "has_employee": True,
+        "employee": {
+            "id": str(employee.id),
+            "name": employee.name,
+            "employeeCode": employee.employee_code,
+            "department": getattr(employee.department, "name", "") if employee.department else "",
+            "shift": employee.shift or "General",
+        },
+        "date": work_date.isoformat(),
+        "status": status_label,
+        "is_punched_in": metrics["is_punched_in"],
+        "attendance_status": att_row.status if att_row else metrics["status"],
+        "first_punch": first_punch_time,
+        "last_punch": last_punch_time,
+        "first_punch_iso": metrics["first_punch"].punch_time.isoformat() if metrics["first_punch"] else None,
+        "last_punch_iso": metrics["last_punch"].punch_time.isoformat() if metrics["last_punch"] else None,
+        "working_seconds": metrics["total_working_seconds"],
+        "formatted_working_time": metrics["formatted_working_time"],
+        "working_hours": float(metrics["working_hours"]),
+        "late_minutes": metrics["late_minutes"],
+        "overtime_seconds": metrics["overtime_seconds"],
+        "overtime_hours": float(metrics["overtime_hours"]),
+        "punches": [
+            {
+                "id": str(p.id),
+                "punchType": p.punch_type,
+                "punchTime": p.punch_time.isoformat(),
+                "timeDisplay": format_time_ampm(p.punch_time),
+                "source": p.source,
+                "remark": p.remark,
+            }
+            for p in punches
+        ],
+        "pairs": metrics["pairs_display"],
+    }
+
+
+@transaction.atomic
+def record_punch(
+    *, client, employee, punch_type, punch_time=None, source="web", remark=None, user=None
+):
+    """Record a Punch In or Punch Out event with validation, and update Attendance."""
+    client_id = getattr(client, "id", client)
+    punch_type = str(punch_type).upper().strip()
+    if punch_type not in ("IN", "OUT"):
+        raise ValidationFailed(
+            f"Invalid punch type: {punch_type}. Must be 'IN' or 'OUT'.",
+            field_errors={"punch_type": ["Must be IN or OUT."]},
+        )
+
+    if punch_time is None:
+        punch_time = timezone.now()
+    elif not timezone.is_aware(punch_time):
+        punch_time = timezone.make_aware(punch_time)
+
+    work_date = timezone.localdate(punch_time)
+
+    # Lock existing punches for this employee today
+    existing_punches = list(
+        AttendancePunch.objects.select_for_update()
+        .filter(client_id=client_id, employee=employee, work_date=work_date)
+        .order_by("punch_time")
+    )
+    last_punch = existing_punches[-1] if existing_punches else None
+
+    # Duplicate / validation checks
+    if last_punch:
+        time_diff = abs((punch_time - last_punch.punch_time).total_seconds())
+        if last_punch.punch_type == punch_type:
+            # If within 5 seconds of identical punch type, treat as duplicate click
+            if time_diff < 5:
+                return last_punch, get_today_punch_status(client_id, employee, work_date=work_date)
+            if punch_type == "IN":
+                raise ValidationFailed(
+                    "You are already punched in. Please punch out first.",
+                    code="ALREADY_PUNCHED_IN",
+                )
+            else:
+                raise ValidationFailed(
+                    "You are already punched out. Please punch in first.",
+                    code="ALREADY_PUNCHED_OUT",
+                )
+    elif punch_type == "OUT":
+        raise ValidationFailed(
+            "Cannot punch out without punching in first.",
+            code="CANNOT_PUNCH_OUT",
+        )
+
+    punch = AttendancePunch.objects.create(
+        client_id=client_id,
+        employee=employee,
+        work_date=work_date,
+        punch_type=punch_type,
+        punch_time=punch_time,
+        source=source,
+        remark=remark,
+        created_by=user if getattr(user, "is_authenticated", False) else None,
+    )
+
+    all_punches = existing_punches + [punch]
+    metrics = calculate_punch_metrics(
+        client_id, employee, work_date, punches=all_punches, now=punch_time
+    )
+
+    first_in = metrics["first_in"].punch_time if metrics["first_in"] else None
+    last_out = metrics["last_out"].punch_time if metrics["last_out"] else None
+    first_punch_time = metrics["first_punch"].punch_time if metrics["first_punch"] else None
+    last_punch_time = metrics["last_punch"].punch_time if metrics["last_punch"] else None
+
+    # Upsert Attendance row
+    att_row = Attendance.objects.select_for_update().filter(
+        client_id=client_id, employee=employee, work_date=work_date
+    ).first()
+
+    status_to_use = metrics["status"]
+    if att_row and att_row.status in ("On Leave", "Holiday", "Week Off"):
+        status_to_use = att_row.status
+
+    if att_row is not None:
+        att_row.first_punch = first_punch_time
+        att_row.last_punch = last_punch_time
+        att_row.check_in = first_in or first_punch_time
+        att_row.check_out = last_out or last_punch_time
+        att_row.hours = metrics["working_hours"]
+        att_row.working_hours = metrics["working_hours"]
+        att_row.late_minutes = metrics["late_minutes"]
+        att_row.overtime_hours = metrics["overtime_hours"]
+        att_row.status = status_to_use
+        att_row.source = "punch"
+        att_row.updated_by = user if getattr(user, "is_authenticated", False) else None
+        att_row.save()
+    else:
+        att_row = Attendance.objects.create(
+            client_id=client_id,
+            employee=employee,
+            work_date=work_date,
+            first_punch=first_punch_time,
+            last_punch=last_punch_time,
+            check_in=first_in or first_punch_time,
+            check_out=last_out or last_punch_time,
+            hours=metrics["working_hours"],
+            working_hours=metrics["working_hours"],
+            late_minutes=metrics["late_minutes"],
+            overtime_hours=metrics["overtime_hours"],
+            status=status_to_use,
+            source="punch",
+            created_by=user if getattr(user, "is_authenticated", False) else None,
+        )
+
+    punch.attendance = att_row
+    punch.save(update_fields=["attendance"])
+
+    return punch, get_today_punch_status(client_id, employee, work_date=work_date)
+
+
+@transaction.atomic
+def correct_punch(*, client, employee, work_date, punch_type, punch_time, reason, user=None):
+    """HR/Admin correction for missing punches (with audit trail)."""
+    client_id = getattr(client, "id", client)
+    punch = AttendancePunch.objects.create(
+        client_id=client_id,
+        employee=employee,
+        work_date=work_date,
+        punch_type=punch_type,
+        punch_time=punch_time,
+        source="manual",
+        remark=f"Correction: {reason}",
+        created_by=user if getattr(user, "is_authenticated", False) else None,
+    )
+
+    all_punches = list(
+        AttendancePunch.objects.select_for_update()
+        .filter(client_id=client_id, employee=employee, work_date=work_date)
+        .order_by("punch_time")
+    )
+    metrics = calculate_punch_metrics(client_id, employee, work_date, punches=all_punches)
+
+    first_in = metrics["first_in"].punch_time if metrics["first_in"] else None
+    last_out = metrics["last_out"].punch_time if metrics["last_out"] else None
+
+    att_row = Attendance.objects.select_for_update().filter(
+        client_id=client_id, employee=employee, work_date=work_date
+    ).first()
+
+    if att_row is not None:
+        att_row.first_punch = metrics["first_punch"].punch_time if metrics["first_punch"] else None
+        att_row.last_punch = metrics["last_punch"].punch_time if metrics["last_punch"] else None
+        att_row.check_in = first_in
+        att_row.check_out = last_out
+        att_row.hours = metrics["working_hours"]
+        att_row.working_hours = metrics["working_hours"]
+        att_row.late_minutes = metrics["late_minutes"]
+        att_row.overtime_hours = metrics["overtime_hours"]
+        att_row.status = metrics["status"]
+        att_row.source = "regularization"
+        att_row.save()
+        punch.attendance = att_row
+        punch.save(update_fields=["attendance"])
+
+    if getattr(user, "is_authenticated", False):
+        record_audit(
+            client=client_id,
+            actor=user,
+            action="attendance_correction",
+            entity_type="AttendancePunch",
+            entity_id=punch.id,
+            entity_label=f"{employee.employee_code} {work_date} {punch_type}",
+            description=f"Punch correction added: {punch_type} at {punch_time}. Reason: {reason}",
+            after={"punch_type": punch_type, "punch_time": punch_time.isoformat(), "reason": reason},
+        )
+
+    return punch, get_today_punch_status(client_id, employee, work_date=work_date)
 
 
 def working_days_in(client_id, start, end, location_id=None):

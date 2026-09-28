@@ -37,6 +37,7 @@ from .models import (
     AssetCategory,
     AssetRequest,
     Attendance,
+    AttendancePunch,
     AttendanceRegularization,
     CalendarEvent,
     Candidate,
@@ -84,6 +85,7 @@ from .serializers import (
     AssetCategorySerializer,
     AssetRequestSerializer,
     AssetSerializer,
+    AttendancePunchSerializer,
     AttendanceSerializer,
     BulkAttendanceSerializer,
     CalendarEventSerializer,
@@ -410,6 +412,11 @@ class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
         "write": ["mark_attendance"],
         # Marking a whole day for many people is a team action.
         "bulk": ["mark_attendance", "view_team_attendance"],
+        "today": [],
+        "punch": ["mark_attendance"],
+        "correct_punch": ["regularize_attendance", "mark_attendance"],
+        "punches": [],
+        "punch_timeline": [],
     }
     # Without it, `mark_attendance` covers the caller's own row only.
     team_scope_permissions = ("view_team_attendance",)
@@ -551,6 +558,178 @@ class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
             action__in=["attendance_edit", "attendance_mark"],
         )[:200]
         return Response(envelope(AuditLogSerializer(rows, many=True).data))
+
+    def _resolve_employee(self, request, employee_id=None):
+        if employee_id:
+            try:
+                emp = Employee.objects.filter(
+                    pk=employee_id, client_id=request.client_id, deleted_at__isnull=True
+                ).first()
+                if emp:
+                    return emp
+            except (ValueError, TypeError, Exception):
+                pass
+            return Employee.objects.filter(
+                employee_code=employee_id, client_id=request.client_id, deleted_at__isnull=True
+            ).first()
+
+        # Check request.user.employee
+        if getattr(request.user, "employee", None):
+            return request.user.employee
+
+        # Fallback to match user email with employee email
+        if getattr(request.user, "email", None):
+            emp = Employee.objects.filter(
+                client_id=request.client_id, email__iexact=request.user.email, deleted_at__isnull=True
+            ).first()
+            if emp:
+                return emp
+
+        return None
+
+    @action(detail=False, methods=["get"])
+    def today(self, request):
+        """``GET /hrms/attendance/today/`` -- punch state for current employee today."""
+        employee_id = request.query_params.get("employeeId")
+        employee = self._resolve_employee(request, employee_id)
+        if not employee:
+            return Response({
+                "has_employee": False,
+                "status": "Not Punched In",
+                "is_punched_in": False,
+                "punches": [],
+                "formatted_working_time": "00h 00m",
+                "working_seconds": 0,
+                "working_hours": 0.0,
+                "late_minutes": 0,
+                "overtime_hours": 0.0,
+                "first_punch": None,
+                "last_punch": None,
+                "date": timezone.localdate().isoformat(),
+            })
+        status_data = services.get_today_punch_status(request.client_id, employee)
+        return Response(status_data)
+
+    @action(detail=False, methods=["post"])
+    def punch(self, request):
+        """``POST /hrms/attendance/punch/`` -- record Punch In or Punch Out."""
+        punch_type = (
+            request.data.get("punch_type")
+            or request.data.get("punchType")
+            or request.data.get("type")
+        )
+        if not punch_type:
+            raise ValidationFailed(
+                "Punch type ('IN' or 'OUT') is required.",
+                field_errors={"punch_type": ["Required."]},
+            )
+
+        employee = self._resolve_employee(
+            request, request.data.get("employeeId") or request.data.get("employee_id")
+        )
+        if not employee:
+            raise ValidationFailed(
+                "No employee profile linked to current user account.",
+                code="NO_EMPLOYEE",
+            )
+
+        # Self-service scope: non-managers can only punch for their own employee
+        if not self.has_team_scope():
+            self.check_own_employee(employee)
+
+        remark = request.data.get("remark") or request.data.get("notes")
+        source = request.data.get("source") or "web"
+
+        punch_obj, status_data = services.record_punch(
+            client=request.user.client,
+            employee=employee,
+            punch_type=punch_type,
+            source=source,
+            remark=remark,
+            user=request.user,
+        )
+        return Response(
+            status_data,
+            status=status.HTTP_201_CREATED if punch_obj else status.HTTP_200_OK,
+        )
+
+    @action(detail=False, methods=["post"], url_path="correct-punch")
+    def correct_punch(self, request):
+        """``POST /hrms/attendance/correct-punch/`` -- HR/Admin manual punch correction."""
+        if not has_permission(request.user, ("regularize_attendance", "mark_attendance")):
+            raise PermissionDenied("You do not have permission to correct punches.")
+
+        employee_id = request.data.get("employeeId") or request.data.get("employee_id")
+        employee = self._resolve_employee(request, employee_id)
+        if not employee:
+            raise ValidationFailed(
+                "Employee not found.", field_errors={"employeeId": ["Invalid employee."]}
+            )
+
+        punch_type = request.data.get("punchType") or request.data.get("punch_type")
+        work_date_str = request.data.get("date") or request.data.get("work_date")
+        punch_time_str = request.data.get("punchTime") or request.data.get("punch_time")
+        reason = request.data.get("reason") or "Manual correction"
+
+        if not work_date_str or not punch_time_str or not punch_type:
+            raise ValidationFailed("Date, punch time, and punch type are required.")
+
+        try:
+            work_date = datetime.strptime(str(work_date_str)[:10], "%Y-%m-%d").date()
+        except ValueError:
+            raise ValidationFailed("Invalid date format. Expected YYYY-MM-DD.")
+
+        if "T" in str(punch_time_str):
+            from django.utils.dateparse import parse_datetime
+            dt = parse_datetime(punch_time_str)
+            if dt and not timezone.is_aware(dt):
+                dt = timezone.make_aware(dt)
+        else:
+            time_part = datetime.strptime(str(punch_time_str)[:5], "%H:%M").time()
+            dt = timezone.make_aware(datetime.combine(work_date, time_part))
+
+        punch_obj, status_data = services.correct_punch(
+            client=request.user.client,
+            employee=employee,
+            work_date=work_date,
+            punch_type=punch_type,
+            punch_time=dt,
+            reason=reason,
+            user=request.user,
+        )
+        return Response(status_data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["get"])
+    def punches(self, request, pk=None):
+        """``GET /hrms/attendance/<id>/punches/`` -- punch timeline for attendance row."""
+        att = self.get_object()
+        punches_qs = att.punches.all().order_by("punch_time")
+        return Response(AttendancePunchSerializer(punches_qs, many=True).data)
+
+    @action(detail=False, methods=["get"], url_path="punch-timeline")
+    def punch_timeline(self, request):
+        """``GET /hrms/attendance/punch-timeline/?employeeId=...&date=...``."""
+        employee_id = request.query_params.get("employeeId")
+        date_str = request.query_params.get("date") or request.query_params.get("work_date")
+        employee = self._resolve_employee(request, employee_id)
+        if not employee:
+            return Response([])
+
+        if date_str:
+            try:
+                work_date = datetime.strptime(str(date_str)[:10], "%Y-%m-%d").date()
+            except ValueError:
+                work_date = timezone.localdate()
+        else:
+            work_date = timezone.localdate()
+
+        punches = AttendancePunch.objects.filter(
+            client_id=request.client_id,
+            employee=employee,
+            work_date=work_date,
+            deleted_at__isnull=True,
+        ).order_by("punch_time")
+        return Response(AttendancePunchSerializer(punches, many=True).data)
 
 
 class RegularizationViewSet(TenantModelViewSet):
