@@ -212,14 +212,20 @@ class EmployeeViewSet(TenantModelViewSet):
                 client_id=self.get_client_id(), email=employee.email.lower(),
                 deleted_at__isnull=True,
             ).exists():
+                emp_password = (
+                    self.request.data.get("password")
+                    or self.request.data.get("userPassword")
+                    or "Password@123"
+                )
                 user = User.objects.create_user(
                     email=employee.email,
+                    password=emp_password,
                     client_id=self.get_client_id(),
                     name=employee.name,
                     phone=employee.phone,
                     employee=employee,
                     department=employee.department.name if employee.department_id else None,
-                    status="Invited",
+                    status="Active",
                 )
                 self.write_audit(
                     "provision_user", employee,

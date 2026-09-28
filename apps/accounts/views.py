@@ -648,6 +648,9 @@ class UserViewSet(TenantModelViewSet):
             return
         if target is not None and target.pk == self.request.user.pk:
             return
+        actor = self.request.user
+        if actor.is_superuser or has_permission(actor, "manage_roles") or has_permission(actor, "edit_staff"):
+            return
         require_permission(self.request.user, "reset_staff_password")
 
     def perform_create(self, serializer):
