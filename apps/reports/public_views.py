@@ -20,7 +20,11 @@ from apps.core.exceptions import Codes, Conflict, NotFound, ValidationFailed
 from apps.core.money import round2
 from apps.core.permissions import AllowPublic
 from apps.core.tenancy import set_current_client_id
-from apps.core.throttling import PublicEndpointThrottle, PublicWriteThrottle
+from apps.core.throttling import (
+    PublicEndpointThrottle,
+    PublicWriteThrottle,
+    SafeAnonRateThrottle,
+)
 
 
 def hash_token(token):
@@ -30,11 +34,11 @@ def hash_token(token):
 class PublicView(APIView):
     authentication_classes = []
     permission_classes = [AllowPublic]
-    throttle_classes = [PublicEndpointThrottle]
+    throttle_classes = [SafeAnonRateThrottle, PublicEndpointThrottle]
 
 
 class PublicWriteView(PublicView):
-    throttle_classes = [PublicWriteThrottle]
+    throttle_classes = [SafeAnonRateThrottle, PublicWriteThrottle]
 
 
 # ---------------------------------------------------------------------------

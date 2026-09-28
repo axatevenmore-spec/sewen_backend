@@ -94,6 +94,9 @@ class TaskSerializer(BaseModelSerializer):
     projectId = serializers.CharField(source="project_id", read_only=True)
     stageId = serializers.CharField(source="stage_id", read_only=True)
     completionPct = serializers.IntegerField(source="completion_pct", required=False)
+    weightPct = serializers.DecimalField(
+        source="weight_pct", max_digits=5, decimal_places=2, required=False, default=0
+    )
     startDate = serializers.DateField(source="start_date", required=False, allow_null=True)
     dueDate = serializers.DateField(source="due_date", required=False, allow_null=True)
 
@@ -102,7 +105,7 @@ class TaskSerializer(BaseModelSerializer):
         fields = [
             "id", "projectId", "stageId", "taskName", "description",
             "assignedUser", "assignedUserId", "department", "departmentId",
-            "startDate", "dueDate", "completionPct", "priority", "status",
+            "startDate", "dueDate", "completionPct", "weightPct", "priority", "status",
             "created_at", "updated_at",
         ]
 

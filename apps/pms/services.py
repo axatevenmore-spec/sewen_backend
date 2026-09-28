@@ -69,12 +69,20 @@ def settings_payload(client_id):
 # ---------------------------------------------------------------------------
 @transaction.atomic
 def recalculate_stage(stage):
-    """A stage's ``completion_pct`` is recomputed from its tasks."""
-    rows = Task.objects.filter(stage=stage, deleted_at__isnull=True).aggregate(
-        count=Count("id"), average=Avg("completion_pct")
-    )
-    if rows["count"]:
-        stage.completion_pct = int(round(rows["average"] or 0))
+    """A stage's ``completion_pct`` is recomputed from its tasks using task weights if configured,
+    falling back to unweighted average."""
+    tasks = list(Task.objects.filter(stage=stage, deleted_at__isnull=True))
+    if tasks:
+        total_weight = sum(float(t.weight_pct or 0) for t in tasks)
+        if total_weight > 0:
+            weighted_sum = sum(
+                float(t.completion_pct or 0) * float(t.weight_pct or 0) for t in tasks
+            )
+            stage.completion_pct = int(round(weighted_sum / total_weight))
+        else:
+            stage.completion_pct = int(
+                round(sum((t.completion_pct or 0) for t in tasks) / len(tasks))
+            )
     # With no tasks the stage keeps whatever progress was set directly, because
     # `POST .../progress/` is a legitimate way to drive a stage that is not
     # task-managed (api.md §10.3).

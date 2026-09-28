@@ -143,6 +143,23 @@ MEDIA_ROOT = BASE_DIR / "media"
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # --------------------------------------------------------------------------
+# Rate Limiting & Proxy Configuration (api.md §1.5)
+# --------------------------------------------------------------------------
+LOGIN_RATE_LIMIT = env("LOGIN_RATE_LIMIT", "5/minute")
+LOGIN_FAILED_RATE_LIMIT = env("LOGIN_FAILED_RATE_LIMIT", "10/10minute")
+AUTHENTICATED_RATE_LIMIT = env("AUTHENTICATED_RATE_LIMIT", "120/minute")
+ANONYMOUS_RATE_LIMIT = env("ANONYMOUS_RATE_LIMIT", "30/minute")
+PASSWORD_RESET_RATE_LIMIT = env("PASSWORD_RESET_RATE_LIMIT", "3/15minute")
+OTP_VERIFY_RATE_LIMIT = env("OTP_VERIFY_RATE_LIMIT", "5/10minute")
+TOKEN_REFRESH_RATE_LIMIT = env("TOKEN_REFRESH_RATE_LIMIT", "10/10minute")
+SENSITIVE_ACTION_RATE_LIMIT = env("SENSITIVE_ACTION_RATE_LIMIT", "10/10minute")
+ACCOUNT_LOCKOUT_ATTEMPTS = int(env("ACCOUNT_LOCKOUT_ATTEMPTS", "5"))
+ACCOUNT_LOCKOUT_MINUTES = int(env("ACCOUNT_LOCKOUT_MINUTES", "15"))
+
+NUM_PROXIES = int(env("NUM_PROXIES", "0")) if env("NUM_PROXIES") else None
+TRUSTED_PROXIES = env_list("TRUSTED_PROXIES", "")
+
+# --------------------------------------------------------------------------
 # DRF (api.md §1.3 - §1.5)
 # --------------------------------------------------------------------------
 REST_FRAMEWORK = {
@@ -162,13 +179,25 @@ REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": ("rest_framework.renderers.JSONRenderer",),
     # api.md §1.6 -- money is a number with 2 decimals, never a formatted string.
     "COERCE_DECIMAL_TO_STRING": False,
+    "DEFAULT_THROTTLE_CLASSES": (
+        "apps.core.throttling.SafeAnonRateThrottle",
+        "apps.core.throttling.SafeUserRateThrottle",
+    ),
     "DEFAULT_THROTTLE_RATES": {
+        "anon": ANONYMOUS_RATE_LIMIT,
+        "user": AUTHENTICATED_RATE_LIMIT,
+        "login": LOGIN_RATE_LIMIT,
+        "login_failed": LOGIN_FAILED_RATE_LIMIT,
+        "password_reset": PASSWORD_RESET_RATE_LIMIT,
+        "otp_verify": OTP_VERIFY_RATE_LIMIT,
+        "token_refresh": TOKEN_REFRESH_RATE_LIMIT,
+        "sensitive_action": SENSITIVE_ACTION_RATE_LIMIT,
         # Public/unauthenticated surfaces: quotation links, proof links, careers,
         # public lead forms (api.md §5.3, §9.7, §10.6, §11.5).
         "public": "60/min",
         "public_write": "10/min",
-        "login": "20/min",
     },
+    "NUM_PROXIES": NUM_PROXIES,
 }
 
 SIMPLE_JWT = {
@@ -247,12 +276,32 @@ EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", "")
 DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", "Evenmore ERP <noreply@evenmore.io>")
 EMAIL_TIMEOUT = int(env("EMAIL_TIMEOUT", "10"))
 
-CACHES = {
-    "default": {
-        "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
-        "LOCATION": "evenmore-erp",
+# --------------------------------------------------------------------------
+# Cache configuration (Redis / Multi-worker support)
+# --------------------------------------------------------------------------
+REDIS_URL = env("REDIS_URL") or env("CACHE_URL")
+CACHE_BACKEND = env("CACHE_BACKEND")
+if CACHE_BACKEND:
+    CACHES = {
+        "default": {
+            "BACKEND": CACHE_BACKEND,
+            "LOCATION": env("CACHE_LOCATION", "evenmore-erp"),
+        }
     }
-}
+elif REDIS_URL:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.redis.RedisCache",
+            "LOCATION": REDIS_URL,
+        }
+    }
+else:
+    CACHES = {
+        "default": {
+            "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            "LOCATION": "evenmore-erp",
+        }
+    }
 
 LOGGING = {
     "version": 1,

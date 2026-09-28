@@ -1,4 +1,5 @@
 """HRMS serializers (api.md §11)."""
+from django.utils import timezone
 from rest_framework import serializers
 
 from apps.core.serializers import (
@@ -21,6 +22,7 @@ from .models import (
     AssetCategory,
     AssetRequest,
     Attendance,
+    AttendancePunch,
     AttendanceRegularization,
     CalendarEvent,
     Candidate,
@@ -125,7 +127,7 @@ class EmployeeSerializer(BaseModelSerializer):
     locationId = TenantPrimaryKeyRelatedField(
         source="location", model="hrms.Location", required=False, allow_null=True
     )
-    joining = serializers.DateField(source="joining_date")
+    joining = serializers.DateField(source="joining_date", required=False, allow_null=True)
     employmentType = serializers.CharField(
         source="employment_type", required=False, allow_null=True
     )
@@ -149,7 +151,55 @@ class EmployeeSerializer(BaseModelSerializer):
         ]
         read_only_fields = ["employeeCode", "created_at", "updated_at"]
 
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            data = data.copy()
+            if "joining" not in data and "joiningDate" in data:
+                data["joining"] = data["joiningDate"]
+            elif "joining" not in data and "doj" in data:
+                data["joining"] = data["doj"]
+        return super().to_internal_value(data)
+
     def validate(self, attrs):
+        if not attrs.get("joining_date") and not self.instance:
+            attrs["joining_date"] = timezone.now().date()
+
+        # Resolve department / designation / location if names were passed instead of IDs
+        request = self.context.get("request")
+        client_id = getattr(request, "client_id", None) or (
+            getattr(getattr(request, "user", None), "client_id", None)
+        )
+        if client_id and hasattr(self, "initial_data") and isinstance(self.initial_data, dict):
+            if not attrs.get("department") and self.initial_data.get("department"):
+                d_name = str(self.initial_data["department"]).strip()
+                if d_name and d_name != "All":
+                    dept = Department.objects.filter(
+                        client_id=client_id, name__iexact=d_name, deleted_at__isnull=True
+                    ).first()
+                    if not dept:
+                        dept = Department.objects.create(client_id=client_id, name=d_name)
+                    attrs["department"] = dept
+
+            if not attrs.get("designation") and self.initial_data.get("designation"):
+                des_name = str(self.initial_data["designation"]).strip()
+                if des_name:
+                    desig = Designation.objects.filter(
+                        client_id=client_id, name__iexact=des_name, deleted_at__isnull=True
+                    ).first()
+                    if not desig:
+                        desig = Designation.objects.create(client_id=client_id, name=des_name)
+                    attrs["designation"] = desig
+
+            if not attrs.get("location") and self.initial_data.get("location"):
+                loc_name = str(self.initial_data["location"]).strip()
+                if loc_name:
+                    loc = Location.objects.filter(
+                        client_id=client_id, name__iexact=loc_name, deleted_at__isnull=True
+                    ).first()
+                    if not loc:
+                        loc = Location.objects.create(client_id=client_id, name=loc_name)
+                    attrs["location"] = loc
+
         manager = attrs.get("manager")
         if manager is not None and self.instance is not None:
             services.assert_no_manager_cycle(self.instance, manager.id)
@@ -159,6 +209,28 @@ class EmployeeSerializer(BaseModelSerializer):
 # ---------------------------------------------------------------------------
 # Attendance (api.md §11.2)
 # ---------------------------------------------------------------------------
+class AttendancePunchSerializer(BaseModelSerializer):
+    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee", read_only=True)
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
+    punchType = serializers.CharField(source="punch_type")
+    punchTime = serializers.DateTimeField(source="punch_time")
+    timeDisplay = serializers.SerializerMethodField()
+    date = serializers.DateField(source="work_date", read_only=True)
+
+    class Meta:
+        model = AttendancePunch
+        fields = [
+            "id", "employeeId", "employeeName", "employeeCode", "date",
+            "punchType", "punchTime", "timeDisplay", "source", "remark", "created_at"
+        ]
+        read_only_fields = ["id", "employeeId", "date", "created_at"]
+
+    def get_timeDisplay(self, obj):
+        local_dt = timezone.localtime(obj.punch_time) if timezone.is_aware(obj.punch_time) else obj.punch_time
+        return local_dt.strftime("%I:%M %p")
+
+
 class AttendanceSerializer(BaseModelSerializer):
     employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
     employeeName = serializers.CharField(source="employee.name", read_only=True)
@@ -167,17 +239,71 @@ class AttendanceSerializer(BaseModelSerializer):
     date = serializers.DateField(source="work_date")
     checkIn = serializers.DateTimeField(source="check_in", required=False, allow_null=True)
     checkOut = serializers.DateTimeField(source="check_out", required=False, allow_null=True)
+    firstPunch = serializers.DateTimeField(source="first_punch", required=False, allow_null=True)
+    lastPunch = serializers.DateTimeField(source="last_punch", required=False, allow_null=True)
+    workingHours = serializers.DecimalField(source="working_hours", max_digits=6, decimal_places=2, required=False, allow_null=True)
+    lateMinutes = serializers.IntegerField(source="late_minutes", required=False)
+    overtimeHours = serializers.DecimalField(source="overtime_hours", max_digits=6, decimal_places=2, required=False)
+    punches = serializers.SerializerMethodField()
+    formattedWorkingHours = serializers.SerializerMethodField()
+    lateDisplay = serializers.SerializerMethodField()
+    overtimeDisplay = serializers.SerializerMethodField()
 
     class Meta:
         model = Attendance
         fields = [
             "id", "employeeId", "employeeName", "employeeCode", "department",
-            "date", "checkIn", "checkOut", "hours", "status", "source",
-            "remark", "leave_request", "created_at", "updated_at",
+            "date", "checkIn", "checkOut", "firstPunch", "lastPunch",
+            "hours", "workingHours", "lateMinutes", "overtimeHours",
+            "status", "source", "remark", "leave_request",
+            "punches", "formattedWorkingHours", "lateDisplay", "overtimeDisplay",
+            "created_at", "updated_at",
         ]
         # `hours` and the Late / Half Day verdict come from the flexibility
         # policy, applied server-side (api.md §11.2).
-        read_only_fields = ["hours", "source", "leave_request", "created_at", "updated_at"]
+        read_only_fields = [
+            "hours", "workingHours", "firstPunch", "lastPunch", "lateMinutes",
+            "overtimeHours", "punches", "formattedWorkingHours", "lateDisplay", "overtimeDisplay",
+            "source", "leave_request", "created_at", "updated_at"
+        ]
+
+    def get_punches(self, obj):
+        qs = obj.punches.all().order_by("punch_time")
+        return [
+            {
+                "id": str(p.id),
+                "punchType": p.punch_type,
+                "punchTime": p.punch_time.isoformat(),
+                "timeDisplay": (
+                    timezone.localtime(p.punch_time)
+                    if timezone.is_aware(p.punch_time)
+                    else p.punch_time
+                ).strftime("%I:%M %p"),
+                "source": p.source,
+                "remark": p.remark,
+            }
+            for p in qs
+        ]
+
+    def get_formattedWorkingHours(self, obj):
+        hours = obj.working_hours or obj.hours or 0
+        total_minutes = int(float(hours) * 60)
+        h = total_minutes // 60
+        m = total_minutes % 60
+        return f"{h:02d}h {m:02d}m"
+
+    def get_lateDisplay(self, obj):
+        if obj.late_minutes and obj.late_minutes > 0:
+            return f"{obj.late_minutes} min late"
+        return "On time"
+
+    def get_overtimeDisplay(self, obj):
+        if obj.overtime_hours and float(obj.overtime_hours) > 0:
+            total_minutes = int(float(obj.overtime_hours) * 60)
+            h = total_minutes // 60
+            m = total_minutes % 60
+            return f"+{h:02d}h {m:02d}m"
+        return "0h 00m"
 
     def to_internal_value(self, data):
         data = data.copy() if hasattr(data, "copy") else dict(data)
@@ -208,6 +334,7 @@ class AttendanceSerializer(BaseModelSerializer):
                     if emp:
                         data["employeeId"] = str(emp.id)
         return super().to_internal_value(data)
+
 
 
 class BulkAttendanceSerializer(BaseSerializer):

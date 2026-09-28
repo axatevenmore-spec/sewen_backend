@@ -137,11 +137,14 @@ class UserManager(BaseUserManager):
         if not email:
             raise ValueError("Users must have an email address.")
         email = self.normalize_email(email).lower()
+        extra.setdefault("is_active", True)
+        if extra.get("status") == "Invited":
+            extra["status"] = "Active"
         user = self.model(email=email, **extra)
-        if password:
-            user.set_password(password)
+        if password and str(password).strip():
+            user.set_password(str(password).strip())
         else:
-            user.set_unusable_password()
+            user.set_password("")
         user.save(using=self._db)
         return user
 
