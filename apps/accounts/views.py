@@ -45,6 +45,7 @@ from apps.core.throttling import (
 )
 from apps.core.viewsets import TenantModelViewSet
 from apps.core.tenancy import set_current_client_id
+from apps.hrms import user_link
 
 from django.conf import settings
 
@@ -310,9 +311,14 @@ class MeView(APIView):
         return Response(_me_payload(request.user, request))
 
     def patch(self, request):
+        before = user_link.capture(request.user, user_link.USER_FIELDS)
         serializer = UpdateMeSerializer(request.user, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        user = serializer.save()
+        # Your own name, phone and photo are also what HR has on file.
+        changed = user_link.changed_fields(user, before, user_link.USER_FIELDS)
+        if changed:
+            user_link.push_user_to_employee(user, changed)
         return Response(_me_payload(request.user, request))
 
 
@@ -691,10 +697,14 @@ class UserViewSet(TenantModelViewSet):
             return
         require_permission(self.request.user, "reset_staff_password")
 
+    @transaction.atomic
     def perform_create(self, serializer):
         self._guard_role(serializer.validated_data.get("role"))
-        return super().perform_create(serializer)
+        user = super().perform_create(serializer)
+        self._link_employee(user, created=True)
+        return user
 
+    @transaction.atomic
     def perform_update(self, serializer):
         instance = serializer.instance
         self._guard_target(instance)
@@ -703,7 +713,41 @@ class UserViewSet(TenantModelViewSet):
             if (new_role.pk if new_role else None) != instance.role_id:
                 self._guard_role(new_role)
         self._guard_password(instance, serializer.validated_data)
-        return super().perform_update(serializer)
+        before = user_link.capture(instance, user_link.USER_FIELDS)
+        previous_employee = instance.employee_id
+        user = super().perform_update(serializer)
+        if user.employee_id != previous_employee:
+            self._link_employee(user)
+        else:
+            changed = user_link.changed_fields(user, before, user_link.USER_FIELDS)
+            if changed:
+                user_link.push_user_to_employee(user, changed)
+        return user
+
+    def _link_employee(self, user, *, created=False):
+        """Keep the login and its HRMS employee record as one person.
+
+        A new staff login with no matching employee gets one, the way HRMS's
+        "Create Administration Login Account" makes a login for a new employee
+        (``createEmployee: false`` opts out). A fresh link takes HR's values.
+        """
+        employee = user_link.linked_employee(user)
+        if employee is not None:
+            user_link.reconcile(user, employee)
+            self.write_audit(
+                "link_employee", user,
+                description=f"Linked to employee {employee.employee_code}",
+            )
+            return
+        wants_record = self.request.data.get("createEmployee", True) not in (False, "false", "0", 0)
+        if created and wants_record and not user.is_customer:
+            employee = user_link.create_employee_for(user, actor=self.request.user)
+            user.employee = employee
+            user.save(update_fields=["employee", "updated_at"])
+            self.write_audit(
+                "provision_employee", user,
+                description=f"Employee record {employee.employee_code} created",
+            )
 
     def get_aggregates(self, queryset):
         """api.md §3.1 -- "KPI tiles: total, active, inactive, admins"."""

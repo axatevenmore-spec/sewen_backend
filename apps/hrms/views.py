@@ -25,7 +25,7 @@ from apps.core.permissions import HasModulePermission, has_permission
 from apps.core.printing import PdfNotAvailable, print_payload
 from apps.core.viewsets import ReadOnlyTenantViewSet, TenantModelViewSet
 
-from . import services
+from . import services, user_link
 from .models import (
     Appraisal,
     AppraisalCycle,
@@ -243,6 +243,24 @@ class EmployeeViewSet(TenantModelViewSet):
             exited=Count("id", filter=Q(status__in=["Resigned", "Terminated"])),
         )
 
+    def get_queryset(self):
+        # The linked Administration login, for the directory's "Login" column
+        # (users.employee_id is the only pointer, so it is read as a join).
+        from django.db.models import OuterRef, Subquery
+
+        from apps.accounts.models import User
+
+        logins = User.objects.filter(
+            employee=OuterRef("pk"), deleted_at__isnull=True
+        ).exclude(status="Deleted").order_by("created_at")
+        return super().get_queryset().annotate(
+            linked_user_id=Subquery(logins.values("id")[:1]),
+            linked_user_email=Subquery(logins.values("email")[:1]),
+            linked_user_status=Subquery(logins.values("status")[:1]),
+            linked_user_role=Subquery(logins.values("role__name")[:1]),
+        )
+
+    @transaction.atomic
     def perform_create(self, serializer):
         serializer.validated_data["employee_code"] = allocate_number(
             self.request.user.client, "EMP"
@@ -261,9 +279,10 @@ class EmployeeViewSet(TenantModelViewSet):
             ).first()
 
             if existing_user:
-                if not existing_user.employee_id:
+                if not user_link.linked_employee(existing_user):
                     existing_user.employee = employee
                     existing_user.save(update_fields=["employee", "updated_at"])
+                    user_link.reconcile(existing_user, employee)
                     self.write_audit(
                         "link_user", employee,
                         description=f"Linked user account {existing_user.email} to employee {employee.employee_code}",
@@ -292,11 +311,27 @@ class EmployeeViewSet(TenantModelViewSet):
                     role=emp_role,
                     status="Active",
                 )
+                # Location, joining date, photo and manager follow the HR record.
+                user_link.reconcile(user, employee)
                 self.write_audit(
                     "provision_user", employee,
                     description=f"User account created for {user.email}",
                 )
         return employee
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        before = user_link.capture(serializer.instance, user_link.EMPLOYEE_FIELDS)
+        employee = super().perform_update(serializer)
+        changed = user_link.changed_fields(employee, before, user_link.EMPLOYEE_FIELDS)
+        if changed:
+            user_link.push_employee_to_user(employee, changed)
+        return employee
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        super().perform_destroy(instance)
+        user_link.unlink_employee(instance)
 
     @action(detail=True, methods=["post"])
     @transaction.atomic
@@ -1343,6 +1378,18 @@ class OnboardingViewSet(TenantModelViewSet):
         candidate.employee = employee
         candidate.stage = "Hired"
         candidate.save(update_fields=["employee", "stage", "updated_at"])
+
+        if employee.email:
+            from apps.accounts.models import User
+
+            login = User.objects.filter(
+                client_id=request.client_id, email=employee.email.strip().lower(),
+                deleted_at__isnull=True,
+            ).first()
+            if login is not None and not user_link.linked_employee(login):
+                login.employee = employee
+                login.save(update_fields=["employee", "updated_at"])
+                user_link.reconcile(login, employee)
 
         record_audit(
             client=request.client_id,

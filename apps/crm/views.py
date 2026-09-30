@@ -10,7 +10,7 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.core.exceptions import Codes, Conflict, NotFound, ValidationFailed
+from apps.core.exceptions import Codes, Conflict, NotFound, PermissionDenied, ValidationFailed
 from apps.core.money import ZERO, round2
 from apps.core.numbering import allocate_number
 from apps.core.pagination import envelope
@@ -71,7 +71,7 @@ from .serializers import (
     SourceSerializer,
     StageSerializer,
     StageTaskSerializer,
-    # TaskAllocationSerializer,  # Hidden: out of scope
+    TaskAllocationSerializer,
     TaskSerializer,
     # UserAllocationSerializer,  # Hidden: out of scope
     # UserLocationSerializer,  # Hidden: out of scope
@@ -707,65 +707,107 @@ class TaskViewSet(TenantModelViewSet):
         )
 
 
-# Hidden: Task Allocation duplicates CRM Tasks -- restore by uncommenting this block.
-# class TaskAllocationViewSet(TenantModelViewSet):
-#     queryset = TaskAllocation.objects.select_related("assignee", "assigned_by").prefetch_related(
-#         "audit_entries"
-#     )
-#     serializer_class = TaskAllocationSerializer
-#     audit_entity_type = "CrmTaskAllocation"
-#     audit_label_field = "title"
-#     status_field = "status"
-#     search_fields = ["title", "description", "department"]
-#     ordering = ["-created_at"]
-#     filter_map = {"assigneeId": "assignee_id", "department": "department", "priority": "priority"}
-#     permission_map = {"read": ["view_task"], "write": ["manage_task_allocation"]}
+class TaskAllocationViewSet(TenantModelViewSet):
+    queryset = TaskAllocation.objects.select_related("assignee", "assigned_by").prefetch_related(
+        "audit_entries"
+    )
+    serializer_class = TaskAllocationSerializer
+    audit_entity_type = "CrmTaskAllocation"
+    audit_label_field = "title"
+    status_field = "status"
+    search_fields = ["title", "description", "department"]
+    ordering = ["-created_at"]
+    filter_map = {"assigneeId": "assignee_id", "department": "department", "priority": "priority"}
+    #: Holders of either see and edit every allocation (a Sales Manager has
+    #: ``assign_task``); everyone else sees the work allocated to them and may
+    #: only change its status.
+    MANAGE_PERMISSIONS = ("manage_task_allocation", "assign_task")
+    ASSIGNEE_WRITABLE = {"status", "note"}
 
-#     def _append_audit(self, allocation, action_name, text):
-#         """Every assignment and status change appends a human-readable line;
-#         the server generates the string from the structured record (api.md §9.3)."""
-#         TaskAllocationAudit.objects.create(
-#             client_id=allocation.client_id,
-#             allocation=allocation,
-#             action=action_name,
-#             text=text,
-#             actor=self.request.user,
-#         )
+    permission_map = {
+        "list": ["view_task"],
+        "retrieve": ["view_task"],
+        "create": [MANAGE_PERMISSIONS],
+        "assign": [MANAGE_PERMISSIONS],
+        "update": [MANAGE_PERMISSIONS],
+        # An assignee may move their own allocation along; see perform_update.
+        "partial_update": ["view_task"],
+        "destroy": [MANAGE_PERMISSIONS],
+    }
 
-#     def perform_create(self, serializer):
-#         serializer.validated_data.setdefault("assigned_by", self.request.user)
-#         allocation = super().perform_create(serializer)
-#         assignee = allocation.assignee.name if allocation.assignee_id else "nobody"
-#         self._append_audit(
-#             allocation, "assigned", f"{self.request.user.name} assigned this to {assignee}"
-#         )
-#         return allocation
+    def _can_manage(self):
+        return any(has_permission(self.request.user, p) for p in self.MANAGE_PERMISSIONS)
 
-#     def perform_update(self, serializer):
-#         previous_status = serializer.instance.status
-#         previous_assignee = serializer.instance.assignee_id
-#         allocation = super().perform_update(serializer)
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if not self._can_manage():
+            queryset = queryset.filter(assignee=self.request.user)
+        return queryset
 
-#         if allocation.status != previous_status:
-#             self._append_audit(
-#                 allocation,
-#                 "status",
-#                 f"{self.request.user.name} moved this to {allocation.status}",
-#             )
-#         if allocation.assignee_id != previous_assignee:
-#             name = allocation.assignee.name if allocation.assignee_id else "nobody"
-#             self._append_audit(
-#                 allocation, "reassigned", f"{self.request.user.name} reassigned this to {name}"
-#             )
-#         return allocation
+    def _append_audit(self, allocation, action_name, text, note=None):
+        """Every assignment and status change appends a human-readable line;
+        the server generates the string from the structured record (api.md §9.3)."""
+        if note:
+            text = f"{text} — {note}"
+        TaskAllocationAudit.objects.create(
+            client_id=allocation.client_id,
+            allocation=allocation,
+            action=action_name,
+            text=text,
+            actor=self.request.user,
+        )
 
-#     @action(detail=False, methods=["post"])
-#     def assign(self, request):
-#         """``POST /crm/task-allocations/assign/`` -- the AssignTaskModal."""
-#         serializer = self.get_serializer(data=request.data)
-#         serializer.is_valid(raise_exception=True)
-#         self.perform_create(serializer)
-#         return Response(serializer.data, status=status.HTTP_201_CREATED)
+    def perform_create(self, serializer):
+        note = (serializer.validated_data.pop("note", None) or "").strip()
+        serializer.validated_data.setdefault("assigned_by", self.request.user)
+        allocation = super().perform_create(serializer)
+        assignee = allocation.assignee.name if allocation.assignee_id else "nobody"
+        self._append_audit(
+            allocation,
+            "assigned",
+            f"{self.request.user.name} assigned this to {assignee}",
+            note,
+        )
+        return allocation
+
+    def perform_update(self, serializer):
+        if not self._can_manage():
+            changed = set(self.request.data.keys()) - self.ASSIGNEE_WRITABLE
+            if changed:
+                raise PermissionDenied(
+                    "Only the status of an allocation assigned to you can be changed.",
+                    code=self.MANAGE_PERMISSIONS[0],
+                )
+        note = (serializer.validated_data.pop("note", None) or "").strip()
+        previous_status = serializer.instance.status
+        previous_assignee = serializer.instance.assignee_id
+        allocation = super().perform_update(serializer)
+
+        if allocation.status != previous_status:
+            self._append_audit(
+                allocation,
+                "status",
+                f"{self.request.user.name} moved this to {allocation.status}",
+                note,
+            )
+            note = None
+        if allocation.assignee_id != previous_assignee:
+            name = allocation.assignee.name if allocation.assignee_id else "nobody"
+            self._append_audit(
+                allocation,
+                "reassigned",
+                f"{self.request.user.name} reassigned this to {name}",
+                note,
+            )
+        return allocation
+
+    @action(detail=False, methods=["post"])
+    def assign(self, request):
+        """``POST /crm/task-allocations/assign/`` -- the AssignTaskModal."""
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
 class TeamRosterView(APIView):

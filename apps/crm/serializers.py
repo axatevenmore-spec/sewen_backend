@@ -440,39 +440,41 @@ class CompleteTaskSerializer(BaseSerializer):
     completedBy = serializers.CharField(required=False, allow_null=True)
 
 
-# Hidden: Task Allocation duplicates CRM Tasks -- restore by uncommenting this block.
-# class TaskAllocationAuditSerializer(BaseModelSerializer):
-#     at = serializers.DateTimeField(source="created_at", read_only=True)
+class TaskAllocationAuditSerializer(BaseModelSerializer):
+    at = serializers.DateTimeField(source="created_at", read_only=True)
 
-#     class Meta:
-#         model = TaskAllocationAudit
-#         fields = ["id", "action", "text", "at"]
+    class Meta:
+        model = TaskAllocationAudit
+        fields = ["id", "action", "text", "at"]
 
 
-# Hidden: Task Allocation duplicates CRM Tasks -- restore by uncommenting this block.
-# class TaskAllocationSerializer(BaseModelSerializer):
-#     """A separate entity from lead tasks -- internal work assignment (api.md §9.3)."""
+class TaskAllocationSerializer(BaseModelSerializer):
+    """A separate entity from lead tasks -- internal work assignment (api.md §9.3)."""
 
-#     assignee = serializers.CharField(source="assignee.name", read_only=True)
-#     assigneeId = TenantPrimaryKeyRelatedField(
-#         source="assignee", model="accounts.User", required=False, allow_null=True
-#     )
-#     assignedBy = serializers.CharField(source="assigned_by.name", read_only=True)
-#     fileName = serializers.CharField(
-#         source="file_name", required=False, allow_null=True, allow_blank=True
-#     )
-#     audit = TaskAllocationAuditSerializer(
-#         source="audit_entries", many=True, read_only=True
-#     )
+    assignee = serializers.CharField(source="assignee.name", read_only=True)
+    assigneeId = TenantPrimaryKeyRelatedField(
+        source="assignee", model="accounts.User", required=False, allow_null=True
+    )
+    assignedBy = serializers.CharField(source="assigned_by.name", read_only=True)
+    fileName = serializers.CharField(
+        source="file_name", required=False, allow_null=True, allow_blank=True
+    )
+    audit = TaskAllocationAuditSerializer(
+        source="audit_entries", many=True, read_only=True
+    )
+    #: Why the status changed or the work moved; appended to the audit line.
+    note = serializers.CharField(
+        write_only=True, required=False, allow_blank=True, allow_null=True
+    )
 
-#     class Meta:
-#         model = TaskAllocation
-#         fields = [
-#             "id", "title", "description", "department", "assignee", "assigneeId",
-#             "assignedBy", "priority", "deadline", "status", "fileName", "audit",
-#             "created_at", "updated_at",
-#         ]
-#         read_only_fields = ["created_at", "updated_at"]
+    class Meta:
+        model = TaskAllocation
+        fields = [
+            "id", "title", "description", "department", "assignee", "assigneeId",
+            "assignedBy", "priority", "deadline", "status", "fileName", "audit",
+            "note", "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
 
 
 # ---------------------------------------------------------------------------

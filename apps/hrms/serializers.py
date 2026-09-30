@@ -136,11 +136,14 @@ class EmployeeSerializer(BaseModelSerializer):
         required=False, allow_null=True,
     )
     avatar = serializers.CharField(source="avatar_url", required=False, allow_null=True)
+    #: The Administration login backed by this record (read-only; the link is
+    #: made from either side's create, or from the user's "Linked employee").
+    login = serializers.SerializerMethodField()
 
     class Meta:
         model = Employee
         fields = [
-            "id", "employeeCode", "name", "email", "phone", "avatar",
+            "id", "employeeCode", "name", "email", "phone", "avatar", "login",
             "designation", "designationId", "department", "departmentId",
             "manager", "managerId", "location", "locationId", "joining",
             "employmentType", "shift", "salaryStructureId", "standard_salary",
@@ -150,6 +153,29 @@ class EmployeeSerializer(BaseModelSerializer):
             "termination_reason", "created_at", "updated_at",
         ]
         read_only_fields = ["employeeCode", "created_at", "updated_at"]
+
+    def get_login(self, employee):
+        if hasattr(employee, "linked_user_id"):
+            if not employee.linked_user_id:
+                return None
+            return {
+                "id": str(employee.linked_user_id),
+                "email": employee.linked_user_email,
+                "status": employee.linked_user_status,
+                "role": employee.linked_user_role,
+            }
+        # Rows not read through the viewset's annotated queryset (a create).
+        from .user_link import linked_user
+
+        user = linked_user(employee)
+        if user is None:
+            return None
+        return {
+            "id": str(user.id),
+            "email": user.email,
+            "status": user.status,
+            "role": user.role.name if user.role_id else None,
+        }
 
     def to_internal_value(self, data):
         if isinstance(data, dict):
