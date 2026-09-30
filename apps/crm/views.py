@@ -436,9 +436,10 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
 
     @action(detail=True, methods=["get", "post"], url_path="calls")
     def calls(self, request, pk=None):
-        return self._sub_resource(
-            request, "calls", LeadCallSerializer, called_by=request.user
-        )
+        defaults = {"called_by": request.user}
+        if not request.data.get("calledAt") and not request.data.get("called_at"):
+            defaults["called_at"] = timezone.now()
+        return self._sub_resource(request, "calls", LeadCallSerializer, **defaults)
 
     @action(detail=True, methods=["get", "post"], url_path="emails")
     def emails(self, request, pk=None):
@@ -447,6 +448,38 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
     @action(detail=True, methods=["get", "post"], url_path="files")
     def files(self, request, pk=None):
         return self._sub_resource(request, "files", LeadFileSerializer)
+
+    #: ``section`` in the URL -> (related manager on Lead, serializer).
+    SUB_ROWS = {
+        "users": ("lead_users", LeadUserSerializer),
+        "products": ("products", LeadProductSerializer),
+        "sources": ("source_entries", LeadSourceSerializer),
+        "notes": ("notes", LeadNoteSerializer),
+        "calls": ("calls", LeadCallSerializer),
+        "emails": ("emails", LeadEmailSerializer),
+    }
+
+    @action(
+        detail=True,
+        methods=["patch", "delete"],
+        url_path=r"(?P<section>users|products|sources|notes|calls|emails)/(?P<row_id>[^/.]+)",
+    )
+    def sub_row(self, request, pk=None, section=None, row_id=None):
+        """Edit or remove one row of a lead's sub-collection (api.md §9.2)."""
+        related_name, serializer_class = self.SUB_ROWS[section]
+        lead = self.get_object()
+        row = getattr(lead, related_name).filter(pk=row_id, deleted_at__isnull=True).first()
+        if row is None:
+            raise NotFound("That entry no longer exists.")
+        if request.method == "DELETE":
+            row.soft_delete(request.user)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = serializer_class(
+            row, data=request.data, partial=True, context=self.get_serializer_context()
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
 
     @action(detail=True, methods=["delete"], url_path=r"files/(?P<file_id>[^/.]+)")
     def file_detail(self, request, pk=None, file_id=None):
@@ -520,7 +553,7 @@ class StageViewSet(TenantModelViewSet):
     @transaction.atomic
     def reorder(self, request):
         """``{ order: [id] }`` -- drag-reorder (api.md §9.3)."""
-        order = request.data.get("order") or []
+        order = request.data.get("order") or request.data.get("ids") or []
         if not isinstance(order, list) or not order:
             raise ValidationFailed(
                 "Provide the new stage order.",
@@ -551,7 +584,7 @@ class DealStageViewSet(TenantModelViewSet):
 
 
 class MasterTaskViewSet(TenantModelViewSet):
-    queryset = MasterTask.objects.prefetch_related("stages")
+    queryset = MasterTask.objects.prefetch_related("stages").select_related("form")
     serializer_class = MasterTaskSerializer
     audit_entity_type = "CrmMasterTask"
     audit_label_field = "title"
@@ -559,9 +592,20 @@ class MasterTaskViewSet(TenantModelViewSet):
     ordering = ["sort_order", "title"]
     permission_map = {"read": ["view_task"], "write": ["manage_pipeline"]}
 
+    # "Used in stages" becomes the stage tasks the automation runs.
+    def after_create(self, instance):
+        services.sync_master_task_stages(instance, user=self.request.user)
+
+    def after_update(self, instance, before):
+        services.sync_master_task_stages(instance, user=self.request.user)
+
+    def perform_destroy(self, instance):
+        super().perform_destroy(instance)
+        services.sync_master_task_stages(instance, user=self.request.user)
+
 
 class StageTaskViewSet(TenantModelViewSet):
-    queryset = StageTask.objects.select_related("stage")
+    queryset = StageTask.objects.select_related("stage", "form")
     serializer_class = StageTaskSerializer
     audit_entity_type = "CrmStageTask"
     audit_label_field = "title"
@@ -851,24 +895,43 @@ class DealViewSet(TenantModelViewSet):
     @action(detail=True, methods=["post"], url_path="create-project")
     @transaction.atomic
     def create_project(self, request, pk=None):
+        """``{ name, startDate, endDate, team, projectType, description, managerName }``."""
         deal = self.get_object()
         if deal.crm_project_id:
             raise Conflict("This deal already has a project.", code=Codes.ALREADY_DONE)
+        if deal.stage != "Won":
+            raise ValidationFailed(
+                "Only a Won deal can create a project.",
+                field_errors={"stage": ["Move the deal to Won first."]},
+            )
 
-        project = CrmProject.objects.create(
+        serializer = CrmProjectSerializer(
+            data={"name": deal.title, "status": "Active", **request.data},
+            context=self.get_serializer_context(),
+        )
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        project = serializer.save(
             client_id=request.client_id,
-            name=request.data.get("name") or deal.title,
-            party=deal.party,
+            code=allocate_number(request.user.client, "CPRJ"),
+            party=data.get("party") or deal.party,
+            customer_name=data.get("customer_name") or deal.client_name,
             deal=deal,
-            owner=deal.owner or request.user,
-            status="Active",
-            value=deal.value,
+            owner=data.get("owner") or deal.owner or request.user,
+            value=data.get("value") if data.get("value") is not None else deal.value,
             created_by=request.user,
         )
         deal.crm_project = project
         deal.save(update_fields=["crm_project", "updated_at"])
+        DealActivity.objects.create(
+            deal=deal,
+            type="project-created",
+            description=f"Project {project.code} created from this deal",
+            actor=request.user,
+        )
         return Response(
-            CrmProjectSerializer(project).data, status=status.HTTP_201_CREATED
+            CrmProjectSerializer(project, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
         )
 
     @action(detail=False, methods=["get"])
@@ -915,10 +978,31 @@ class ContractViewSet(TenantModelViewSet):
     permission_map = {"read": ["view_lead"], "write": ["manage_deals"]}
 
     def perform_create(self, serializer):
-        serializer.validated_data["contract_number"] = allocate_number(
-            self.request.user.client, "CON", serializer.validated_data.get("start_date")
+        data = serializer.validated_data
+        deal = data.get("deal")
+        party = data.get("party") or (deal.party if deal else None)
+        if party is None:
+            raise ValidationFailed(
+                "Link this deal to a customer before creating a contract.",
+                field_errors={"customerId": ["The deal has no customer record."]},
+            )
+        data["party"] = party
+        data.setdefault("customer_name", party.name)
+        if not data.get("title"):
+            kind = data.get("contract_type") or "Contract"
+            data["title"] = f"{kind} - {data.get('customer_name') or party.name}"
+        data["contract_number"] = allocate_number(
+            self.request.user.client, "CON", data.get("start_date")
         )
-        return super().perform_create(serializer)
+        contract = super().perform_create(serializer)
+        if deal is not None:
+            DealActivity.objects.create(
+                deal=deal,
+                type="contract",
+                description=f"Contract {contract.contract_number} created for {contract.customer_name}.",
+                actor=self.request.user,
+            )
+        return contract
 
     @action(detail=False, methods=["get"])
     def templates(self, request):
@@ -978,9 +1062,31 @@ class CrmProjectViewSet(TenantModelViewSet):
     audit_entity_type = "CrmProject"
     audit_label_field = "name"
     status_field = "status"
-    search_fields = ["name", "code", "party__name"]
+    search_fields = ["name", "code", "party__name", "customer_name"]
     ordering = ["-created_at"]
     permission_map = {"read": ["view_projects"], "write": ["create_project"]}
+
+    def perform_create(self, serializer):
+        serializer.validated_data["code"] = allocate_number(self.request.user.client, "CPRJ")
+        deal = serializer.validated_data.get("deal")
+        if deal is not None and deal.crm_project_id:
+            raise Conflict("This deal already has a project.", code=Codes.ALREADY_DONE)
+        project = super().perform_create(serializer)
+        if deal is not None:
+            deal.crm_project = project
+            deal.save(update_fields=["crm_project", "updated_at"])
+            DealActivity.objects.create(
+                deal=deal,
+                type="project-created",
+                description=f"Project {project.code} created from this deal",
+                actor=self.request.user,
+            )
+        return project
+
+    def perform_destroy(self, instance):
+        # A soft-deleted project must not stay linked -- the deal can then start a new one.
+        Deal.objects.filter(crm_project=instance).update(crm_project=None)
+        return super().perform_destroy(instance)
 
 
 # ---------------------------------------------------------------------------

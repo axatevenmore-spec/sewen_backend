@@ -108,7 +108,12 @@ DATABASES = {
         "PASSWORD": env("DB_PASSWORD", "postgres"),
         "HOST": env("DB_HOST", "localhost"),
         "PORT": env("DB_PORT", "5432"),
-        "CONN_MAX_AGE": 60,
+        # 0 = close at the end of each request. Under ASGI (daphne, which also
+        # serves `runserver`), Django runs each request's sync code on its own
+        # thread, so a persistent connection per thread piles up until Postgres
+        # refuses new clients ("too many clients already"). Raise this only for
+        # a WSGI deployment; under ASGI put a pooler (pgbouncer) in front instead.
+        "CONN_MAX_AGE": int(env("DB_CONN_MAX_AGE", "0")),
     }
 }
 

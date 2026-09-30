@@ -231,6 +231,9 @@ class LeadProduct(LeadSubResource):
         "masters.Item", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     product_name = models.TextField(null=True, blank=True)
+    sku = models.TextField(null=True, blank=True)
+    price = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    status = models.TextField(null=True, blank=True)
     qty = models.DecimalField(max_digits=18, decimal_places=4, default=1)
     notes = models.TextField(null=True, blank=True)
 
@@ -243,6 +246,9 @@ class LeadSource(LeadSubResource):
     source = models.ForeignKey(
         Source, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
+    #: The channel as the user picked it ("Website", "Referral") when it is not a configured Source.
+    label = models.TextField(null=True, blank=True)
+    details = models.TextField(null=True, blank=True)
     campaign = models.TextField(null=True, blank=True)
     medium = models.TextField(null=True, blank=True)
     attributed_at = models.DateTimeField(auto_now_add=True)
@@ -287,6 +293,8 @@ class LeadThreadMessage(TenantModel):
 
 class LeadCall(LeadSubResource):
     lead = models.ForeignKey(Lead, on_delete=models.CASCADE, related_name="calls")
+    subject = models.TextField(null=True, blank=True)
+    phone = models.TextField(null=True, blank=True)
     direction = models.TextField(default="outbound")
     outcome = models.TextField(null=True, blank=True)
     duration_seconds = models.IntegerField(default=0)
@@ -338,7 +346,13 @@ class MasterTask(TenantModel):
     priority = models.TextField(choices=PRIORITIES, default="Medium")
     sort_order = models.IntegerField(default=0)
     #: A master task may apply to several stages (the frontend's `stages[]`).
+    #: Saving the master keeps one linked ``StageTask`` per stage in step
+    #: (``services.sync_master_task_stages``), which is what the automation runs.
     stages = models.ManyToManyField(Stage, blank=True, related_name="master_tasks")
+    #: The task form (``Form`` of kind ``task``) a task of this type is worked in.
+    form = models.ForeignKey(
+        "Form", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
     is_active = models.BooleanField(default=True)
 
     class Meta:
@@ -351,7 +365,12 @@ class StageTask(TenantModel):
 
     stage = models.ForeignKey(Stage, on_delete=models.CASCADE, related_name="stage_tasks")
     master_task = models.ForeignKey(
-        MasterTask, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+        MasterTask, null=True, blank=True, on_delete=models.SET_NULL, related_name="stage_tasks"
+    )
+    #: Overrides the master task's form for this stage; either one is copied
+    #: onto generated tasks as ``extra.taskFormId``.
+    form = models.ForeignKey(
+        "Form", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     title = models.TextField()
     description = models.TextField(null=True, blank=True)
@@ -363,6 +382,10 @@ class StageTask(TenantModel):
     required = models.BooleanField(default=False)
     auto_create = models.BooleanField(default=True)
     repeats = models.BooleanField(default=False)
+    #: Lead Stage Tasks' "Max repeats": at most this many tasks per lead from
+    #: this template (re-entering the stage makes another, up to the cap).
+    #: Null keeps the older yes/no ``repeats`` behaviour.
+    max_repeats = models.PositiveIntegerField(null=True, blank=True)
 
     class Meta:
         db_table = "crm_stage_tasks"
@@ -393,6 +416,9 @@ class Task(TenantModel, LegacyIdMixin):
     source = models.TextField(default=MANUAL_SOURCE)
     outcome = models.TextField(choices=TASK_OUTCOMES, null=True, blank=True)
     next_action = models.TextField(choices=NEXT_ACTIONS, null=True, blank=True)
+    #: Screen-level extras with no column of their own: due time, linked task form
+    #: and its answers, linked proposal / delivery challan.
+    extra = models.JSONField(default=dict, blank=True)
     completion_note = models.TextField(null=True, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
     completed_by = models.ForeignKey(
@@ -514,6 +540,20 @@ class Deal(TenantModel, LegacyIdMixin):
     crm_project = models.ForeignKey(
         "CrmProject", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
+    #: What the deal card captures as text; ``party``/``owner`` stay the links.
+    client_name = models.TextField(null=True, blank=True)
+    contact_phone = models.TextField(null=True, blank=True)
+    product = models.TextField(null=True, blank=True)
+    source_label = models.TextField(null=True, blank=True)
+    tag = models.TextField(null=True, blank=True)
+    notes = models.TextField(null=True, blank=True)
+    #: The deal page's pricing: ``[{id, name, description, qty, rate, unit}]`` plus discount / tax.
+    line_items = models.JSONField(default=list, blank=True)
+    discount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    tax_rate = models.DecimalField(max_digits=7, decimal_places=4, default=0)
+    description = models.TextField(null=True, blank=True)
+    #: ``[{fileId, name, size, mimeType, uploadedBy, createdAt}]`` -- uploaded ``core.File`` refs.
+    documents = models.JSONField(default=list, blank=True)
 
     class Meta:
         db_table = "crm_deals"
@@ -580,6 +620,13 @@ class Contract(TenantModel, LegacyIdMixin):
     )
     signed_at = models.DateTimeField(null=True, blank=True)
     expiring_soon_days = models.IntegerField(default=30)
+    #: The customer as the contract names it (defaults to the party's name).
+    customer_name = models.TextField(null=True, blank=True)
+    description = models.TextField(null=True, blank=True)
+    terms = models.TextField(null=True, blank=True)
+    #: ``[{fileId, name, size, mimeType, uploadedBy, createdAt}]`` -- uploaded ``core.File`` refs.
+    attachments = models.JSONField(default=list, blank=True)
+    notify_customer = models.BooleanField(default=False)
 
     class Meta:
         db_table = "crm_contracts"
@@ -625,6 +672,11 @@ class CrmProject(TenantModel, LegacyIdMixin):
     value = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
     progress = models.SmallIntegerField(default=0)
     description = models.TextField(null=True, blank=True)
+    #: Free-text fallbacks for when the customer / manager is not a linked record.
+    customer_name = models.TextField(null=True, blank=True)
+    manager_name = models.TextField(null=True, blank=True)
+    team = models.TextField(null=True, blank=True)
+    project_type = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "crm_projects"

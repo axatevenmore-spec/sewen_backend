@@ -147,6 +147,71 @@ def compute_due_date(offset_days, priority="Medium", from_date=None):
 # ---------------------------------------------------------------------------
 # Stage automation (api.md §9.3)
 # ---------------------------------------------------------------------------
+#: Fields a linked stage task takes from its master task. Order, Required,
+#: Auto-create and Repeats stay per stage (Lead Stage Tasks owns those).
+MASTER_TO_STAGE_TASK = {
+    "title": "title",
+    "description": "description",
+    "role": "assignee_role",
+    "department": "department",
+    "duration_days": "offset_days",
+    "priority": "priority",
+    "form_id": "form_id",
+}
+
+
+@transaction.atomic
+def sync_master_task_stages(master, *, user=None):
+    """Keep one linked ``StageTask`` per stage the master task is used in.
+
+    The Tasks Master's "Used in stages" is what decides where a task type is
+    generated; the automation only reads stage tasks, so this is the bridge.
+    Linked rows follow the master's name, role, due days, priority and form;
+    unticking a stage retires its linked row. A deleted or inactive master
+    retires all of them.
+    """
+    stage_ids = set() if (master.deleted_at or not master.is_active) else {
+        stage.id for stage in master.stages.filter(deleted_at__isnull=True)
+    }
+    linked = {
+        row.stage_id: row
+        for row in StageTask.objects.filter(master_task=master, deleted_at__isnull=True)
+    }
+    values = {target: getattr(master, source) for source, target in MASTER_TO_STAGE_TASK.items()}
+    actor = user if getattr(user, "is_authenticated", False) else None
+
+    for stage_id in stage_ids - set(linked):
+        last = (
+            StageTask.objects.filter(stage_id=stage_id, deleted_at__isnull=True)
+            .order_by("-sort_order")
+            .values_list("sort_order", flat=True)
+            .first()
+        )
+        StageTask.objects.create(
+            client_id=master.client_id,
+            stage_id=stage_id,
+            master_task=master,
+            sort_order=(last or 0) + 1,
+            created_by=actor,
+            **values,
+        )
+    for stage_id, row in linked.items():
+        if stage_id not in stage_ids:
+            row.soft_delete(actor)
+            continue
+        changed = [field for field, value in values.items() if getattr(row, field) != value]
+        if changed:
+            for field in changed:
+                setattr(row, field, values[field])
+            row.save(update_fields=changed + ["updated_at"])
+
+
+def task_form_for(template):
+    """The task form a generated task opens in: the stage task's own, else its master's."""
+    form = template.form or (template.master_task.form if template.master_task_id else None)
+    return form if form is not None and form.deleted_at is None else None
+
+
 @transaction.atomic
 def run_stage_automation(lead, stage, *, user=None):
     """Create the target stage's auto-create tasks and notify the assignees.
@@ -156,30 +221,41 @@ def run_stage_automation(lead, stage, *, user=None):
     """
     templates = StageTask.objects.filter(
         client_id=lead.client_id, stage=stage, auto_create=True, deleted_at__isnull=True
-    ).order_by("sort_order")
+    ).select_related("form", "master_task__form").order_by("sort_order")
 
     created = []
     for template in templates:
-        # A non-repeating template creates its task once per lead, so moving
-        # back and forth between stages does not pile up duplicates.
-        if not template.repeats and Task.objects.filter(
+        # A template creates its task once per lead by default, so moving back
+        # and forth between stages does not pile up duplicates. "Max repeats"
+        # raises that cap; the older yes/no ``repeats`` means no cap.
+        already = Task.objects.filter(
             client_id=lead.client_id, lead=lead, stage_task=template, deleted_at__isnull=True
-        ).exists():
+        ).count()
+        if template.max_repeats is not None:
+            if already >= max(template.max_repeats, 1):
+                continue
+        elif already and not template.repeats:
             continue
 
-        assignee = resolve_assignee(
-            lead.client_id, template.assignee_role, template.department
-        )
+        # A blank role or department on the stage row falls back to the master.
+        master = template.master_task if template.master_task_id else None
+        role = template.assignee_role or (master.role if master else None)
+        department = template.department or (master.department if master else None)
+        form = task_form_for(template)
+        assignee = resolve_assignee(lead.client_id, role, department)
         task = Task.objects.create(
             client_id=lead.client_id,
             task_number=allocate_number(lead.client, "TSK"),
             lead=lead,
             stage_task=template,
             title=template.title,
-            description=template.description,
+            description=template.description or (master.description if master else None),
             assignee=assignee,
-            assignee_role=template.assignee_role,
-            department=template.department,
+            assignee_role=role,
+            department=department,
+            # The lead task editor opens this form (the frontend reads extra).
+            extra={"taskFormId": str(form.id), "taskFormName": form.name, "stage": stage.name}
+            if form else {"stage": stage.name},
             due_date=compute_due_date(template.offset_days, template.priority),
             priority=template.priority,
             status="Open",

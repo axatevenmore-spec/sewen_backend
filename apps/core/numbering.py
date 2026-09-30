@@ -50,6 +50,8 @@ SERIES_DEFAULTS = {
     "LEAD": ("L", "never", 8, ""),
     "DEAL": ("DEAL", "fy", 4, "-"),
     "CON": ("CON", "fy", 4, "-"),
+    # CRM project cards -- P-000001, never resets
+    "CPRJ": ("P", "never", 6, "-"),
     # Masters / HRMS
     "CUST": ("CUST", "never", 4, "-"),
     "VEND": ("VEND", "never", 4, "-"),
