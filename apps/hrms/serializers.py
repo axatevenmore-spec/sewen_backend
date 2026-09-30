@@ -2,6 +2,7 @@
 from django.utils import timezone
 from rest_framework import serializers
 
+from apps.core.exceptions import ValidationFailed
 from apps.core.serializers import (
     BaseModelSerializer,
     BaseSerializer,
@@ -70,43 +71,129 @@ from .models import (
 # ---------------------------------------------------------------------------
 # Organisation (api.md §11.1)
 # ---------------------------------------------------------------------------
-class DepartmentSerializer(BaseModelSerializer):
+class UniqueNameMixin:
+    """Names are unique per tenant (a DB constraint); say so as a field error
+    rather than letting the insert fail."""
+
+    def validate_name(self, value):
+        value = (value or "").strip()
+        if not value:
+            raise serializers.ValidationError("A name is required.")
+        request = self.context.get("request")
+        client_id = getattr(request, "client_id", None)
+        taken = self.Meta.model.objects.filter(
+            client_id=client_id, name__iexact=value, deleted_at__isnull=True
+        )
+        if self.instance is not None:
+            taken = taken.exclude(pk=self.instance.pk)
+        if client_id and taken.exists():
+            raise serializers.ValidationError(f"'{value}' already exists.")
+        return value
+
+
+class DepartmentSerializer(UniqueNameMixin, BaseModelSerializer):
     head = serializers.CharField(source="head_employee.name", read_only=True)
+    headAvatar = serializers.CharField(source="head_employee.avatar_url", read_only=True)
     headEmployeeId = TenantPrimaryKeyRelatedField(
         source="head_employee", model="hrms.Employee", required=False, allow_null=True
     )
+    parentId = TenantPrimaryKeyRelatedField(
+        source="parent", model="hrms.Department", required=False, allow_null=True
+    )
+    budget = serializers.DecimalField(
+        max_digits=18, decimal_places=2, required=False, allow_null=True
+    )
+    #: Headcount, teams and open positions, annotated by the viewset.
     employees = serializers.SerializerMethodField()
     teams = serializers.SerializerMethodField()
+    openRoles = serializers.SerializerMethodField()
 
     class Meta:
         model = Department
         fields = [
-            "id", "name", "code", "head", "headEmployeeId", "parent", "status",
-            "description", "employees", "teams", "created_at", "updated_at",
+            "id", "name", "code", "head", "headAvatar", "headEmployeeId", "parent",
+            "parentId", "status", "description", "budget", "employees", "teams",
+            "openRoles", "created_at", "updated_at",
         ]
+        read_only_fields = ["parent", "created_at", "updated_at"]
 
     def get_employees(self, department):
-        return getattr(department, "employee_count", None)
+        return getattr(department, "employee_count", 0) or 0
 
     def get_teams(self, department):
-        return getattr(department, "team_count", None)
+        return getattr(department, "team_count", 0) or 0
+
+    def get_openRoles(self, department):
+        return getattr(department, "open_roles", 0) or 0
+
+    def validate_headEmployeeId(self, head):
+        # The Org Chart hangs the department's people under this person.
+        if head is not None and head.status in ("Resigned", "Terminated"):
+            raise serializers.ValidationError(f"{head.name} has left and cannot head a department.")
+        return head
+
+    def validate_parentId(self, parent):
+        if parent is not None and self.instance is not None and parent.pk == self.instance.pk:
+            raise serializers.ValidationError("A department cannot sit under itself.")
+        return parent
 
 
-class DesignationSerializer(BaseModelSerializer):
+class DesignationSerializer(UniqueNameMixin, BaseModelSerializer):
     department = serializers.CharField(source="department.name", read_only=True)
     departmentId = TenantPrimaryKeyRelatedField(
         source="department", model="hrms.Department", required=False, allow_null=True
     )
+    level = serializers.IntegerField(required=False, allow_null=True, min_value=1, max_value=7)
+    employees = serializers.SerializerMethodField()
 
     class Meta:
         model = Designation
-        fields = ["id", "name", "level", "department", "departmentId", "created_at"]
+        fields = [
+            "id", "name", "level", "department", "departmentId", "employees",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+    def get_employees(self, designation):
+        return getattr(designation, "employee_count", 0) or 0
 
 
-class LocationSerializer(BaseModelSerializer):
+class LocationAddressField(serializers.Field):
+    """The screens edit an address as one line; older rows hold a dict of
+    parts. Read as text either way, stored as ``{"line": ...}``."""
+
+    def to_representation(self, value):
+        if isinstance(value, dict):
+            if value.get("line"):
+                return value["line"]
+            parts = [value.get(k) for k in ("line1", "line2", "city", "state", "pincode", "country")]
+            return ", ".join(str(p) for p in parts if p)
+        return value or ""
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            return data
+        text = str(data or "").strip()
+        return {"line": text} if text else {}
+
+
+class LocationSerializer(UniqueNameMixin, BaseModelSerializer):
+    type = serializers.ChoiceField(
+        source="location_type", choices=Location.TYPES, required=False
+    )
+    address = LocationAddressField(required=False)
+    employees = serializers.SerializerMethodField()
+
     class Meta:
         model = Location
-        fields = ["id", "name", "address", "timezone", "created_at"]
+        fields = [
+            "id", "name", "type", "address", "timezone", "employees",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+    def get_employees(self, location):
+        return getattr(location, "employee_count", 0) or 0
 
 
 class EmployeeSerializer(BaseModelSerializer):
@@ -227,6 +314,11 @@ class EmployeeSerializer(BaseModelSerializer):
                     attrs["location"] = loc
 
         manager = attrs.get("manager")
+        if manager is not None and manager.status in ("Resigned", "Terminated"):
+            raise ValidationFailed(
+                f"{manager.name} has left and cannot be a reporting manager.",
+                field_errors={"managerId": ["Not an active employee."]},
+            )
         if manager is not None and self.instance is not None:
             services.assert_no_manager_cycle(self.instance, manager.id)
         return attrs

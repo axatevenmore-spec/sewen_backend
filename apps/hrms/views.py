@@ -387,6 +387,20 @@ class EmployeeViewSet(TenantModelViewSet):
         return Response(envelope(AssetSerializer(rows, many=True).data))
 
 
+def _live_employees(prefix="employees"):
+    return Q(**{f"{prefix}__deleted_at__isnull": True})
+
+
+def _refuse_if_staffed(label, count, what="employee"):
+    """An org unit still in use is not deleted out from under its people."""
+    if count:
+        raise Conflict(
+            f"{count} {what}{'s' if count != 1 else ''} still use{'s' if count == 1 else ''} this {label}.",
+            code=Codes.IN_USE,
+            detail=f"Move them to another {label} first.",
+        )
+
+
 class HrmsDepartmentViewSet(TenantModelViewSet):
     queryset = Department.objects.select_related("head_employee", "parent")
     serializer_class = DepartmentSerializer
@@ -398,11 +412,29 @@ class HrmsDepartmentViewSet(TenantModelViewSet):
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
 
     def get_queryset(self):
+        from django.db.models import IntegerField, OuterRef, Subquery, Sum
+        from django.db.models.functions import Coalesce
+
+        open_jobs = (
+            Job.objects.filter(department=OuterRef("pk"), status="Open", deleted_at__isnull=True)
+            .values("department")
+            .annotate(total=Sum("openings"))
+            .values("total")
+        )
         return super().get_queryset().annotate(
-            employee_count=Count(
-                "employees", filter=Q(employees__deleted_at__isnull=True), distinct=True
-            ),
+            employee_count=Count("employees", filter=_live_employees(), distinct=True),
             team_count=Count("teams", filter=Q(teams__deleted_at__isnull=True), distinct=True),
+            open_roles=Coalesce(Subquery(open_jobs, output_field=IntegerField()), 0),
+        )
+
+    def check_delete_allowed(self, department):
+        _refuse_if_staffed(
+            "department", department.employees.filter(deleted_at__isnull=True).count()
+        )
+        _refuse_if_staffed(
+            "department",
+            department.designations.filter(deleted_at__isnull=True).count(),
+            what="designation",
         )
 
 
@@ -414,7 +446,18 @@ class DesignationViewSet(TenantModelViewSet):
     status_field = None
     search_fields = ["name"]
     ordering = ["name"]
+    filter_map = {"departmentId": "department_id"}
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def get_queryset(self):
+        return super().get_queryset().annotate(
+            employee_count=Count("employees", filter=_live_employees(), distinct=True),
+        )
+
+    def check_delete_allowed(self, designation):
+        _refuse_if_staffed(
+            "designation", designation.employees.filter(deleted_at__isnull=True).count()
+        )
 
 
 class HrmsLocationViewSet(TenantModelViewSet):
@@ -423,8 +466,20 @@ class HrmsLocationViewSet(TenantModelViewSet):
     audit_entity_type = "HrmsLocation"
     audit_label_field = "name"
     status_field = None
+    search_fields = ["name", "timezone"]
     ordering = ["name"]
+    filter_map = {"type": "location_type"}
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def get_queryset(self):
+        return super().get_queryset().annotate(
+            employee_count=Count("employees", filter=_live_employees(), distinct=True),
+        )
+
+    def check_delete_allowed(self, location):
+        _refuse_if_staffed(
+            "location", location.employees.filter(deleted_at__isnull=True).count()
+        )
 
 
 class OrgChartView(APIView):
@@ -432,7 +487,14 @@ class OrgChartView(APIView):
     required_permissions = ["view_staff"]
 
     def get(self, request):
-        return Response({"tree": services.org_chart(request.client_id)})
+        from . import org_structure
+
+        # ``tree`` is the plain reporting-line walk; the rest is the
+        # Department -> Head -> reporting hierarchy the Org Chart draws.
+        return Response({
+            "tree": services.org_chart(request.client_id),
+            **org_structure.build(request.client_id),
+        })
 
 
 class HrmsDashboardView(APIView):

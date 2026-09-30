@@ -178,9 +178,15 @@ def push_user_to_employee(user, fields=USER_FIELDS):
     if "location" in fields and (user.location or "").strip():
         updates["location"] = _named(Location, employee.client_id, user.location)
     if "reporting_manager_id" in fields:
+        from apps.hrms.services import assert_no_manager_cycle
+
         manager = linked_employee(user.reporting_manager) if user.reporting_manager_id else None
-        if manager is None or manager.pk != employee.pk:
+        try:
+            # A login's manager that would loop HR's reporting lines is not copied.
+            assert_no_manager_cycle(employee, manager.pk if manager else None)
             updates["manager"] = manager
+        except ValidationFailed:
+            pass
 
     updates = {k: v for k, v in updates.items() if getattr(employee, k, None) != v}
     if updates:

@@ -1266,12 +1266,14 @@ def calendar_time_label(event):
 
 def org_chart(client_id):
     """``GET /hrms/org-chart/`` -- a recursive walk over ``manager_id``."""
+    # People who have left are not on the chart.
     employees = list(
         Employee.objects.filter(client_id=client_id, deleted_at__isnull=True)
-        .select_related("designation", "department")
+        .exclude(status__in=["Resigned", "Terminated"])
+        .select_related("designation", "department", "location")
         .only(
-            "id", "name", "employee_code", "manager_id", "avatar_url",
-            "designation__name", "department__name",
+            "id", "name", "employee_code", "manager_id", "avatar_url", "email",
+            "phone", "status", "designation__name", "department__name", "location__name",
         )
     )
     nodes = {
@@ -1281,7 +1283,13 @@ def org_chart(client_id):
             "employeeCode": employee.employee_code,
             "designation": employee.designation.name if employee.designation_id else None,
             "department": employee.department.name if employee.department_id else None,
+            "location": employee.location.name if employee.location_id else None,
+            "email": employee.email,
+            "phone": employee.phone,
+            "status": employee.status,
             "avatar": employee.avatar_url,
+            "managerId": str(employee.manager_id) if employee.manager_id else None,
+            "manager": None,
             "reports": [],
         }
         for employee in employees
@@ -1292,6 +1300,7 @@ def org_chart(client_id):
         node = nodes[employee.id]
         parent = nodes.get(employee.manager_id) if employee.manager_id else None
         if parent is not None and parent is not node:
+            node["manager"] = parent["name"]
             parent["reports"].append(node)
         else:
             roots.append(node)

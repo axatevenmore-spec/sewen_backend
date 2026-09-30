@@ -145,6 +145,8 @@ class Department(TenantModel, LegacyIdMixin):
     )
     status = models.TextField(default="Active")
     description = models.TextField(null=True, blank=True)
+    #: Annual budget, shown on the Organization > Departments screen.
+    budget = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
 
     class Meta:
         db_table = "hrms_departments"
@@ -184,9 +186,18 @@ class Designation(TenantModel, LegacyIdMixin):
 
 
 class Location(TenantModel, LegacyIdMixin):
+    TYPES = [
+        ("Headquarters", "Headquarters"),
+        ("Branch", "Branch"),
+        ("Factory", "Factory"),
+        ("Warehouse", "Warehouse"),
+        ("Remote", "Remote"),
+    ]
+
     name = models.TextField()
     address = models.JSONField(default=dict, blank=True)
     timezone = models.TextField(null=True, blank=True)
+    location_type = models.TextField(choices=TYPES, default="Branch")
 
     class Meta:
         db_table = "hrms_locations"
