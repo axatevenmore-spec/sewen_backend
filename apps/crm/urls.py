@@ -11,10 +11,9 @@ router.register("deal-stages", views.DealStageViewSet, basename="crm-deal-stages
 router.register("stage-tasks", views.StageTaskViewSet, basename="crm-stage-tasks")
 router.register("master-tasks", views.MasterTaskViewSet, basename="crm-master-tasks")
 router.register("tasks", views.TaskViewSet, basename="crm-tasks")
-# Hidden: Task Allocation duplicates CRM Tasks
-# router.register(
-#     "task-allocations", views.TaskAllocationViewSet, basename="crm-task-allocations"
-# )
+router.register(
+    "task-allocations", views.TaskAllocationViewSet, basename="crm-task-allocations"
+)
 router.register("deals", views.DealViewSet, basename="crm-deals")
 router.register("contracts", views.ContractViewSet, basename="crm-contracts")
 router.register("projects", views.CrmProjectViewSet, basename="crm-projects")

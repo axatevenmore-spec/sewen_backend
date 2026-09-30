@@ -135,6 +135,7 @@ CATALOGUE = [
             ("menu_hrms", "HRMS menu"),
             ("menu_admin", "Administration menu"),
             ("menu_pms", "PMS menu"),
+            ("menu_organization", "Organization menu"),
         ],
     ),
     (
@@ -352,7 +353,7 @@ DEFAULT_ROLES = [
         "HR Manager",
         "Employees, attendance, leave and payroll.",
         [
-            "menu_hrms",
+            "menu_hrms", "menu_organization",
             "mark_attendance", "view_team_attendance", "approve_leave",
             "regularize_attendance", "generate_payroll", "approve_payroll",
             "edit_salary_structure", "view_staff", "create_staff", "edit_staff",

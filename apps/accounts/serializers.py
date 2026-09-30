@@ -163,7 +163,11 @@ class UserSerializer(BaseModelSerializer):
     roleId = TenantPrimaryKeyRelatedField(
         source="role", queryset=Role.objects.all(), allow_null=True, required=False
     )
+    #: The linked HRMS employee's code (read) -- or, written, the employee to
+    #: link by id or code; ``""`` / ``null`` unlinks.
     employeeId = serializers.SerializerMethodField()
+    employeeRecordId = serializers.SerializerMethodField()
+    employeeName = serializers.SerializerMethodField()
     reportingManager = serializers.SerializerMethodField()
     reportingManagerId = TenantPrimaryKeyRelatedField(
         source="reporting_manager",
@@ -186,7 +190,8 @@ class UserSerializer(BaseModelSerializer):
         model = User
         fields = [
             "id", "name", "email", "phone", "role", "roleId", "department", "status",
-            "joinedDate", "lastLogin", "employeeId", "location", "reportingManager",
+            "joinedDate", "lastLogin", "employeeId", "employeeRecordId", "employeeName",
+            "location", "reportingManager",
             "reportingManagerId", "avatar", "permissions", "crm_roles", "password",
             "partyId", "partyName", "isCustomer",
             "created_at", "updated_at",
@@ -196,8 +201,22 @@ class UserSerializer(BaseModelSerializer):
     def get_role(self, user):
         return user.role.name if user.role_id else None
 
+    def _employee(self, user):
+        from apps.hrms.user_link import linked_employee
+
+        return linked_employee(user)
+
     def get_employeeId(self, user):
-        return user.employee.employee_code if user.employee_id else None
+        employee = self._employee(user)
+        return employee.employee_code if employee else None
+
+    def get_employeeRecordId(self, user):
+        employee = self._employee(user)
+        return str(employee.id) if employee else None
+
+    def get_employeeName(self, user):
+        employee = self._employee(user)
+        return employee.name if employee else None
 
     def get_reportingManager(self, user):
         return user.reporting_manager.name if user.reporting_manager_id else None
@@ -209,41 +228,70 @@ class UserSerializer(BaseModelSerializer):
         """Role-derived plus overrides (api.md §3.1: "permissions[]" on detail)."""
         return sorted(user.effective_permissions())
 
+    _NO_LINK_INPUT = object()
+
     def to_internal_value(self, data):
         ret = super().to_internal_value(data)
-        if isinstance(data, dict):
-            if "employeeId" in data and data["employeeId"]:
-                ret["_employee_id_input"] = str(data["employeeId"]).strip()
+        if isinstance(data, dict) and "employeeId" in data:
+            value = data["employeeId"]
+            ret["_employee_link"] = str(value).strip() if value not in (None, "") else ""
         return ret
 
+    def _find_employee(self, client_id, value):
+        from uuid import UUID
+
+        from apps.hrms.models import Employee
+
+        live = Employee.objects.filter(client_id=client_id, deleted_at__isnull=True)
+        try:
+            found = live.filter(id=UUID(value)).first()
+        except (ValueError, TypeError):
+            found = None
+        return found or live.filter(employee_code__iexact=value).first()
+
     def validate(self, attrs):
+        """Resolve ``employeeId`` to the HRMS record the login belongs to.
+
+        Given: link that employee (by id or code), or unlink when blank.
+        Not given: a login without an employee is matched to the employee with
+        the same email, if nobody else holds that record. Customer logins
+        never link -- they are not staff.
+        """
+        from apps.hrms.user_link import assert_linkable, linked_employee, linked_user
+
         attrs = super().validate(attrs)
-        emp_input = attrs.pop("_employee_id_input", None)
+        link = attrs.pop("_employee_link", self._NO_LINK_INPUT)
         client_id = self.context.get("client_id")
-        if client_id:
+        if not client_id:
+            return attrs
+
+        is_customer = bool(
+            attrs.get("party") or (self.instance is not None and self.instance.party_id)
+        )
+        if link is not self._NO_LINK_INPUT:
+            if not link:
+                attrs["employee"] = None
+                return attrs
+            employee = self._find_employee(client_id, link)
+            if employee is None:
+                raise ValidationFailed(
+                    "No employee with that ID.",
+                    field_errors={"employeeId": [f"'{link}' is not an HRMS employee."]},
+                )
+            assert_linkable(employee, self.instance)
+            attrs["employee"] = employee
+            return attrs
+
+        already = linked_employee(self.instance) if self.instance is not None else None
+        email = (attrs.get("email") or "").strip()
+        if already is None and email and not is_customer:
             from apps.hrms.models import Employee
-            target_employee = None
-            if emp_input:
-                from uuid import UUID
-                try:
-                    target_uuid = UUID(str(emp_input))
-                    target_employee = Employee.objects.filter(
-                        client_id=client_id, id=target_uuid, deleted_at__isnull=True
-                    ).first()
-                except (ValueError, TypeError):
-                    target_employee = None
-                if not target_employee:
-                    target_employee = Employee.objects.filter(
-                        client_id=client_id, employee_code__iexact=emp_input, deleted_at__isnull=True
-                    ).first()
 
-            if not target_employee and attrs.get("email"):
-                target_employee = Employee.objects.filter(
-                    client_id=client_id, email__iexact=attrs["email"].strip(), deleted_at__isnull=True
-                ).first()
-
-            if target_employee:
-                attrs["employee"] = target_employee
+            match = Employee.objects.filter(
+                client_id=client_id, email__iexact=email, deleted_at__isnull=True
+            ).first()
+            if match is not None and linked_user(match) is None:
+                attrs["employee"] = match
         return attrs
 
     def validate_email(self, value):

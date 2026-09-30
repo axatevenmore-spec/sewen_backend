@@ -40,6 +40,26 @@ from .models import (
 )
 
 
+def signed_file_refs(refs, client_id, request=None):
+    """``[{fileId, ...}]`` stored on a record -> the same rows, each with a signed ``url``.
+
+    Download links expire, so they are minted per read rather than stored.
+    """
+    refs = refs if isinstance(refs, list) else []
+    ids = [row.get("fileId") for row in refs if isinstance(row, dict) and row.get("fileId")]
+    if not ids:
+        return refs
+    from apps.core.files import public_url
+    from apps.core.models import File
+
+    files = {str(row.id): row for row in File.objects.filter(pk__in=ids, client_id=client_id)}
+    return [
+        {**row, "url": public_url(files.get(str(row.get("fileId"))), request)}
+        if isinstance(row, dict) and row.get("fileId") else row
+        for row in refs
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -184,22 +204,39 @@ class LeadProductSerializer(BaseModelSerializer):
     itemId = TenantPrimaryKeyRelatedField(
         source="item", model="masters.Item", required=False, allow_null=True
     )
-    sku = serializers.CharField(source="item.sku", read_only=True)
+    #: The item's SKU when linked to one, else the SKU typed on the lead.
+    sku = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    name = serializers.CharField(source="product_name", required=False, allow_null=True, allow_blank=True)
 
     class Meta:
         model = LeadProduct
-        fields = ["id", "itemId", "sku", "product_name", "qty", "notes", "created_at"]
+        fields = [
+            "id", "itemId", "sku", "name", "product_name", "price", "qty", "status",
+            "notes", "created_at",
+        ]
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if not data.get("sku") and instance.item_id:
+            data["sku"] = instance.item.sku
+        return data
 
 
 class LeadSourceSerializer(BaseModelSerializer):
     sourceId = TenantPrimaryKeyRelatedField(
         source="source", model="crm.Source", required=False, allow_null=True
     )
-    name = serializers.CharField(source="source.name", read_only=True)
+    name = serializers.SerializerMethodField()
 
     class Meta:
         model = LeadSource
-        fields = ["id", "sourceId", "name", "campaign", "medium", "attributed_at"]
+        fields = [
+            "id", "sourceId", "name", "label", "details", "campaign", "medium",
+            "attributed_at", "created_at",
+        ]
+
+    def get_name(self, row):
+        return row.source.name if row.source_id else (row.label or "")
 
 
 class LeadNoteSerializer(BaseModelSerializer):
@@ -234,10 +271,12 @@ class LeadCallSerializer(BaseModelSerializer):
     class Meta:
         model = LeadCall
         fields = [
-            "id", "direction", "outcome", "duration_seconds", "notes",
-            "called_at", "called_by", "calledByName",
+            "id", "subject", "phone", "direction", "outcome", "duration_seconds",
+            "notes", "called_at", "called_by", "calledByName",
         ]
         read_only_fields = ["called_by"]
+        #: Defaults to now in ``LeadViewSet.calls`` -- the screen logs a call as it happens.
+        extra_kwargs = {"called_at": {"required": False}}
 
 
 class LeadEmailSerializer(BaseModelSerializer):
@@ -268,11 +307,21 @@ class LeadFileSerializer(BaseModelSerializer):
 # ---------------------------------------------------------------------------
 # Tasks (api.md §9.3)
 # ---------------------------------------------------------------------------
+def _validate_task_form(form):
+    """A task template can only point at a task form (``kind='task'``)."""
+    if form is not None and form.kind != "task":
+        raise serializers.ValidationError("Pick a task form, not a lead form.")
+    return form
+
+
 class MasterTaskSerializer(BaseModelSerializer):
-    stages = serializers.PrimaryKeyRelatedField(
-        many=True, queryset=Stage.objects.all(), required=False
-    )
+    # Tenant-scoped: a stage id from another workspace is "does not exist".
+    stages = TenantPrimaryKeyRelatedField(many=True, model="crm.Stage", required=False)
     stageNames = serializers.SerializerMethodField()
+    formId = TenantPrimaryKeyRelatedField(
+        source="form", model="crm.Form", required=False, allow_null=True
+    )
+    formName = serializers.CharField(source="form.name", read_only=True, default=None)
     order = serializers.IntegerField(source="sort_order", required=False)
     dueIn = serializers.IntegerField(source="duration_days", required=False)
     status = serializers.SerializerMethodField()
@@ -282,8 +331,11 @@ class MasterTaskSerializer(BaseModelSerializer):
         fields = [
             "id", "order", "sort_order", "title", "description", "role",
             "department", "dueIn", "duration_days", "priority", "stages",
-            "stageNames", "is_active", "status", "created_at",
+            "stageNames", "formId", "formName", "is_active", "status", "created_at",
         ]
+
+    def validate_formId(self, form):
+        return _validate_task_form(form)
 
     def get_stageNames(self, task):
         return [stage.name for stage in task.stages.all()]
@@ -301,6 +353,16 @@ class StageTaskSerializer(BaseModelSerializer):
     order = serializers.IntegerField(source="sort_order", required=False)
     dueIn = serializers.IntegerField(source="offset_days", required=False)
     autoCreate = serializers.BooleanField(source="auto_create", required=False)
+    masterTaskId = TenantPrimaryKeyRelatedField(
+        source="master_task", model="crm.MasterTask", required=False, allow_null=True
+    )
+    formId = TenantPrimaryKeyRelatedField(
+        source="form", model="crm.Form", required=False, allow_null=True
+    )
+    formName = serializers.CharField(source="form.name", read_only=True, default=None)
+    maxRepeats = serializers.IntegerField(
+        source="max_repeats", required=False, allow_null=True, min_value=0
+    )
 
     class Meta:
         model = StageTask
@@ -308,13 +370,26 @@ class StageTaskSerializer(BaseModelSerializer):
             "id", "stageId", "stageName", "name", "title", "description", "role",
             "assignee_role", "department", "order", "sort_order", "dueIn",
             "offset_days", "priority", "required", "autoCreate", "repeats",
-            "master_task", "created_at",
+            "maxRepeats", "master_task", "masterTaskId", "formId", "formName", "created_at",
         ]
-        extra_kwargs = {"title": {"required": False}}
+        extra_kwargs = {"title": {"required": False}, "master_task": {"read_only": True}}
 
     name = serializers.CharField(source="title", required=False)
 
+    def validate_formId(self, form):
+        return _validate_task_form(form)
+
     def validate(self, attrs):
+        master = attrs.get("master_task")
+        if self.instance is None and master is not None:
+            # Picked from the Tasks Master: whatever the row did not set comes
+            # from the master, so the stage task starts as a copy of it.
+            attrs.setdefault("title", master.title)
+            attrs.setdefault("description", master.description)
+            attrs.setdefault("assignee_role", master.role)
+            attrs.setdefault("department", master.department)
+            attrs.setdefault("offset_days", master.duration_days)
+            attrs.setdefault("priority", master.priority)
         if not attrs.get("title") and self.instance is None:
             raise serializers.ValidationError({"name": ["Required."]})
         return attrs
@@ -328,6 +403,8 @@ class TaskSerializer(BaseModelSerializer):
         source="deal", model="crm.Deal", required=False, allow_null=True
     )
     leadName = serializers.CharField(source="lead.name", read_only=True)
+    #: The stage-task template that generated this task (null for manual ones).
+    stageTaskId = serializers.CharField(source="stage_task_id", read_only=True, default=None)
     assigneeId = TenantPrimaryKeyRelatedField(
         source="assignee", model="accounts.User", required=False, allow_null=True
     )
@@ -337,10 +414,10 @@ class TaskSerializer(BaseModelSerializer):
     class Meta:
         model = Task
         fields = [
-            "id", "task_number", "leadId", "leadName", "dealId", "title",
+            "id", "task_number", "leadId", "leadName", "stageTaskId", "dealId", "title",
             "description", "assigneeId", "assigneeName", "assignee_role",
             "department", "dueDate", "priority", "status", "source", "outcome",
-            "next_action", "completion_note", "completed_at", "follow_up_task",
+            "next_action", "extra", "completion_note", "completed_at", "follow_up_task",
             "created_at", "updated_at",
         ]
         read_only_fields = [
@@ -363,39 +440,41 @@ class CompleteTaskSerializer(BaseSerializer):
     completedBy = serializers.CharField(required=False, allow_null=True)
 
 
-# Hidden: Task Allocation duplicates CRM Tasks -- restore by uncommenting this block.
-# class TaskAllocationAuditSerializer(BaseModelSerializer):
-#     at = serializers.DateTimeField(source="created_at", read_only=True)
+class TaskAllocationAuditSerializer(BaseModelSerializer):
+    at = serializers.DateTimeField(source="created_at", read_only=True)
 
-#     class Meta:
-#         model = TaskAllocationAudit
-#         fields = ["id", "action", "text", "at"]
+    class Meta:
+        model = TaskAllocationAudit
+        fields = ["id", "action", "text", "at"]
 
 
-# Hidden: Task Allocation duplicates CRM Tasks -- restore by uncommenting this block.
-# class TaskAllocationSerializer(BaseModelSerializer):
-#     """A separate entity from lead tasks -- internal work assignment (api.md §9.3)."""
+class TaskAllocationSerializer(BaseModelSerializer):
+    """A separate entity from lead tasks -- internal work assignment (api.md §9.3)."""
 
-#     assignee = serializers.CharField(source="assignee.name", read_only=True)
-#     assigneeId = TenantPrimaryKeyRelatedField(
-#         source="assignee", model="accounts.User", required=False, allow_null=True
-#     )
-#     assignedBy = serializers.CharField(source="assigned_by.name", read_only=True)
-#     fileName = serializers.CharField(
-#         source="file_name", required=False, allow_null=True, allow_blank=True
-#     )
-#     audit = TaskAllocationAuditSerializer(
-#         source="audit_entries", many=True, read_only=True
-#     )
+    assignee = serializers.CharField(source="assignee.name", read_only=True)
+    assigneeId = TenantPrimaryKeyRelatedField(
+        source="assignee", model="accounts.User", required=False, allow_null=True
+    )
+    assignedBy = serializers.CharField(source="assigned_by.name", read_only=True)
+    fileName = serializers.CharField(
+        source="file_name", required=False, allow_null=True, allow_blank=True
+    )
+    audit = TaskAllocationAuditSerializer(
+        source="audit_entries", many=True, read_only=True
+    )
+    #: Why the status changed or the work moved; appended to the audit line.
+    note = serializers.CharField(
+        write_only=True, required=False, allow_blank=True, allow_null=True
+    )
 
-#     class Meta:
-#         model = TaskAllocation
-#         fields = [
-#             "id", "title", "description", "department", "assignee", "assigneeId",
-#             "assignedBy", "priority", "deadline", "status", "fileName", "audit",
-#             "created_at", "updated_at",
-#         ]
-#         read_only_fields = ["created_at", "updated_at"]
+    class Meta:
+        model = TaskAllocation
+        fields = [
+            "id", "title", "description", "department", "assignee", "assigneeId",
+            "assignedBy", "priority", "deadline", "status", "fileName", "audit",
+            "note", "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
 
 
 # ---------------------------------------------------------------------------
@@ -417,16 +496,29 @@ class DealSerializer(BaseModelSerializer):
     expectedCloseDate = serializers.DateField(
         source="expected_close_date", required=False, allow_null=True
     )
+    lostReasonId = TenantPrimaryKeyRelatedField(
+        source="lost_reason", model="crm.LostReason", required=False, allow_null=True
+    )
+    projectId = serializers.CharField(source="crm_project_id", read_only=True)
 
     class Meta:
         model = Deal
         fields = [
             "id", "deal_number", "title", "leadId", "customerId", "customerName",
             "ownerId", "ownerName", "stage", "value", "probability",
-            "expected_close_date", "expectedCloseDate", "closed_at", "lost_reason", "quotation",
-            "crm_project", "created_at", "updated_at",
+            "expected_close_date", "expectedCloseDate", "closed_at", "lost_reason",
+            "lostReasonId", "quotation", "crm_project", "projectId",
+            "client_name", "contact_phone", "product", "source_label", "tag", "notes",
+            "line_items", "discount", "tax_rate", "description", "documents",
+            "created_at", "updated_at",
         ]
         read_only_fields = ["deal_number", "closed_at", "created_at", "updated_at"]
+
+    def to_representation(self, instance):
+        """Each document gets a fresh signed ``url`` -- the stored ref is only the file id."""
+        data = super().to_representation(instance)
+        data["documents"] = signed_file_refs(data.get("documents"), instance.client_id, self.context.get("request"))
+        return data
 
 
 class DealActivitySerializer(BaseModelSerializer):
@@ -439,20 +531,32 @@ class DealActivitySerializer(BaseModelSerializer):
 
 
 class ContractSerializer(BaseModelSerializer):
-    customerId = TenantPrimaryKeyRelatedField(source="party", model="masters.Party")
-    customerName = serializers.CharField(source="party.name", read_only=True)
+    #: Optional on write -- the view falls back to the deal's party (see ``ContractViewSet``).
+    customerId = TenantPrimaryKeyRelatedField(
+        source="party", model="masters.Party", required=False
+    )
+    dealId = TenantPrimaryKeyRelatedField(
+        source="deal", model="crm.Deal", required=False, allow_null=True
+    )
+    dealTitle = serializers.CharField(source="deal.title", read_only=True)
+    dealNumber = serializers.CharField(source="deal.deal_number", read_only=True)
+    leadId = serializers.CharField(source="deal.lead_id", read_only=True)
+    projectId = serializers.CharField(source="deal.crm_project_id", read_only=True)
+    createdByName = serializers.CharField(source="created_by.name", read_only=True)
+    title = serializers.CharField(required=False)
     #: ``Expiring Soon`` / ``Expired`` derived from ``end_date`` (api.md §9.5).
     displayStatus = serializers.SerializerMethodField()
 
     class Meta:
         model = Contract
         fields = [
-            "id", "contract_number", "title", "customerId", "customerName",
-            "deal", "template_key", "contract_type", "value", "start_date",
-            "end_date", "status", "displayStatus", "body", "signed_file",
-            "signed_at", "expiring_soon_days", "created_at", "updated_at",
+            "id", "contract_number", "title", "customerId", "customer_name", "deal", "dealId", "dealTitle", "dealNumber", "leadId",
+            "projectId", "template_key", "contract_type", "value", "start_date",
+            "end_date", "status", "displayStatus", "body", "description", "terms",
+            "attachments", "notify_customer", "signed_file", "signed_at",
+            "expiring_soon_days", "createdByName", "created_at", "updated_at",
         ]
-        read_only_fields = ["contract_number", "created_at", "updated_at"]
+        read_only_fields = ["contract_number", "deal", "created_at", "updated_at"]
 
     def get_displayStatus(self, contract):
         from django.utils import timezone
@@ -476,20 +580,55 @@ class ContractSerializer(BaseModelSerializer):
             )
         return attrs
 
+    def to_representation(self, instance):
+        """``customerName`` is the name as entered, else the linked party's.
+        Each attachment gets a fresh signed ``url`` -- the stored ref is only the file id."""
+        data = super().to_representation(instance)
+        if not data.get("customerName") and instance.party_id:
+            data["customerName"] = instance.party.name
+        data["attachments"] = signed_file_refs(
+            data.get("attachments"), instance.client_id, self.context.get("request")
+        )
+        return data
+
 
 class CrmProjectSerializer(BaseModelSerializer):
     customerId = TenantPrimaryKeyRelatedField(
         source="party", model="masters.Party", required=False, allow_null=True
     )
-    customerName = serializers.CharField(source="party.name", read_only=True)
+    dealId = TenantPrimaryKeyRelatedField(
+        source="deal", model="crm.Deal", required=False, allow_null=True
+    )
+    ownerId = TenantPrimaryKeyRelatedField(
+        source="owner", model="accounts.User", required=False, allow_null=True
+    )
+    ownerName = serializers.CharField(source="owner.name", read_only=True)
 
     class Meta:
         model = CrmProject
         fields = [
-            "id", "name", "code", "customerId", "customerName", "deal", "owner",
-            "start_date", "end_date", "status", "value", "progress",
-            "description", "created_at", "updated_at",
+            "id", "name", "code", "customerId", "customer_name",
+            "deal", "dealId", "owner", "ownerId", "ownerName", "manager_name",
+            "team", "project_type", "start_date", "end_date", "status", "value",
+            "progress", "description", "created_at", "updated_at",
         ]
+        read_only_fields = ["code", "deal", "owner", "created_at", "updated_at"]
+
+    def validate(self, attrs):
+        start = attrs.get("start_date") or getattr(self.instance, "start_date", None)
+        end = attrs.get("end_date") or getattr(self.instance, "end_date", None)
+        if start and end and end < start:
+            raise serializers.ValidationError(
+                {"endDate": ["Expected end date must be on or after the start date."]}
+            )
+        return attrs
+
+    def to_representation(self, instance):
+        """``customerName`` is the name as entered, else the linked party's."""
+        data = super().to_representation(instance)
+        if not data.get("customerName") and instance.party_id:
+            data["customerName"] = instance.party.name
+        return data
 
 
 # Hidden: User Tracking out of scope (Sweven spec) -- restore by uncommenting this block.

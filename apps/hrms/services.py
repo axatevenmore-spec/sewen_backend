@@ -129,12 +129,19 @@ def mark_attendance(
     remark=None, source="manual", user=None, leave_request=None,
 ):
     """Upsert against the one-row-per-employee-per-day constraint (db.md §11.2)."""
-    derived_status, hours = derive_attendance(
-        client.id if hasattr(client, "id") else client,
-        check_in=check_in,
-        check_out=check_out,
-        submitted_status=status,
-    )
+    if source == "regularization" and status:
+        derived_status = status
+        hours = None
+        if check_in and check_out:
+            delta = check_out - check_in
+            hours = round(Decimal(delta.total_seconds()) / Decimal(3600), 2)
+    else:
+        derived_status, hours = derive_attendance(
+            client.id if hasattr(client, "id") else client,
+            check_in=check_in,
+            check_out=check_out,
+            submitted_status=status,
+        )
 
     client_id = getattr(client, "id", client)
     existing = Attendance.objects.select_for_update().filter(
@@ -152,6 +159,8 @@ def mark_attendance(
         existing.check_out = check_out
         existing.hours = hours
         existing.status = derived_status
+        if source == "regularization" and derived_status == "Present":
+            existing.early_leaving_minutes = 0
         existing.remark = remark
         existing.source = source
         if leave_request is not None:
@@ -168,6 +177,7 @@ def mark_attendance(
             check_out=check_out,
             hours=hours,
             status=derived_status,
+            early_leaving_minutes=0 if (source == "regularization" and derived_status == "Present") else 0,
             remark=remark,
             source=source,
             leave_request=leave_request,
@@ -258,6 +268,7 @@ def calculate_punch_metrics(client_id, employee, work_date, punches=None, now=No
 
     policy = flexibility_policy(client_id)
     shift_start = _parse_time(policy.get("shiftStart"), time(9, 30))
+    shift_end = _parse_time(policy.get("shiftEnd"), time(18, 30))
     grace = int(policy.get("graceMinutes") or 0)
     half_day_threshold = Decimal(str(policy.get("halfDayThresholdHours") or 4))
     full_day_hours = Decimal(str(policy.get("fullDayHours") or 8))
@@ -276,12 +287,30 @@ def calculate_punch_metrics(client_id, employee, work_date, punches=None, now=No
             diff = (local_first_in.replace(tzinfo=None) - shift_start_dt).total_seconds()
             late_minutes = max(0, int(diff // 60))
 
+    early_leaving_minutes = 0
+    if last_out:
+        local_last_out = (
+            timezone.localtime(last_out.punch_time)
+            if timezone.is_aware(last_out.punch_time)
+            else last_out.punch_time
+        )
+        shift_end_dt = datetime.combine(local_last_out.date(), shift_end)
+        if local_last_out.replace(tzinfo=None) < shift_end_dt:
+            diff = (shift_end_dt - local_last_out.replace(tzinfo=None)).total_seconds()
+            early_leaving_minutes = max(0, int(diff // 60))
+
+    is_early_out = bool(last_out and (early_leaving_minutes > 0 or working_hours < full_day_hours))
+
     overtime_seconds = max(0, int(total_working_seconds - full_day_seconds))
     overtime_hours = round(Decimal(overtime_seconds) / Decimal(3600), 2)
 
     if not punches:
         status = "Absent"
-    elif working_hours < half_day_threshold and not is_punched_in:
+    elif is_punched_in:
+        status = "Late" if late_minutes > 0 else "Present"
+    elif working_hours == 0:
+        status = "Absent"
+    elif working_hours < half_day_threshold:
         status = "Half Day"
     elif late_minutes > 0:
         status = "Late"
@@ -301,6 +330,12 @@ def calculate_punch_metrics(client_id, employee, work_date, punches=None, now=No
         "first_in": first_in,
         "last_out": last_out,
         "late_minutes": late_minutes,
+        "early_leaving_minutes": early_leaving_minutes,
+        "is_early_out": is_early_out,
+        "shift_start": policy.get("shiftStart", "09:30"),
+        "shift_end": policy.get("shiftEnd", "18:30"),
+        "full_day_hours": float(full_day_hours),
+        "half_day_threshold_hours": float(half_day_threshold),
         "overtime_seconds": overtime_seconds,
         "overtime_hours": overtime_hours,
         "status": status,
@@ -338,6 +373,18 @@ def get_today_punch_status(client, employee, work_date=None):
         client_id=client_id, employee=employee, work_date=work_date
     ).first()
 
+    has_out_punch = any(p.punch_type == "OUT" for p in punches)
+    day_completed = bool(has_out_punch and not metrics["is_punched_in"])
+    can_punch_in = bool(not metrics["is_punched_in"] and not day_completed)
+    can_punch_out = bool(metrics["is_punched_in"])
+
+    from apps.hrms.models import AttendanceRegularization
+    has_pending_regularization = AttendanceRegularization.objects.filter(
+        client_id=client_id, employee=employee, work_date=work_date, status="Pending"
+    ).exists()
+
+    early_mins = att_row.early_leaving_minutes if att_row else metrics["early_leaving_minutes"]
+
     return {
         "has_employee": True,
         "employee": {
@@ -350,6 +397,17 @@ def get_today_punch_status(client, employee, work_date=None):
         "date": work_date.isoformat(),
         "status": status_label,
         "is_punched_in": metrics["is_punched_in"],
+        "day_completed": day_completed,
+        "can_punch_in": can_punch_in,
+        "can_punch_out": can_punch_out,
+        "is_early_out": metrics["is_early_out"],
+        "early_leaving_minutes": early_mins,
+        "early_minutes": early_mins,
+        "shift_start": metrics["shift_start"],
+        "shift_end": metrics["shift_end"],
+        "full_day_hours": metrics["full_day_hours"],
+        "half_day_threshold_hours": metrics["half_day_threshold_hours"],
+        "has_pending_regularization": has_pending_regularization,
         "attendance_status": att_row.status if att_row else metrics["status"],
         "first_punch": first_punch_time,
         "last_punch": last_punch_time,
@@ -378,7 +436,8 @@ def get_today_punch_status(client, employee, work_date=None):
 
 @transaction.atomic
 def record_punch(
-    *, client, employee, punch_type, punch_time=None, source="web", remark=None, user=None
+    *, client, employee, punch_type, punch_time=None, source="web", remark=None, user=None,
+    early_reason=None, request_regularization=False
 ):
     """Record a Punch In or Punch Out event with validation, and update Attendance."""
     client_id = getattr(client, "id", client)
@@ -404,6 +463,14 @@ def record_punch(
     )
     last_punch = existing_punches[-1] if existing_punches else None
 
+    # Single punch per day rule: If already punched out today, employee cannot punch in again
+    has_out_punch = any(p.punch_type == "OUT" for p in existing_punches)
+    if punch_type == "IN" and has_out_punch:
+        raise ValidationFailed(
+            "You have already completed your punch in and punch out for today.",
+            code="DAY_PUNCH_LIMIT_REACHED",
+        )
+
     # Duplicate / validation checks
     if last_punch:
         time_diff = abs((punch_time - last_punch.punch_time).total_seconds())
@@ -427,6 +494,10 @@ def record_punch(
             code="CANNOT_PUNCH_OUT",
         )
 
+    punch_remark = remark
+    if early_reason:
+        punch_remark = f"{remark} | Early: {early_reason}" if remark else f"Early Punch Out: {early_reason}"
+
     punch = AttendancePunch.objects.create(
         client_id=client_id,
         employee=employee,
@@ -434,7 +505,7 @@ def record_punch(
         punch_type=punch_type,
         punch_time=punch_time,
         source=source,
-        remark=remark,
+        remark=punch_remark,
         created_by=user if getattr(user, "is_authenticated", False) else None,
     )
 
@@ -448,6 +519,9 @@ def record_punch(
     first_punch_time = metrics["first_punch"].punch_time if metrics["first_punch"] else None
     last_punch_time = metrics["last_punch"].punch_time if metrics["last_punch"] else None
 
+    check_in_time = first_in or first_punch_time
+    check_out_time = None if metrics["is_punched_in"] else last_out
+
     # Upsert Attendance row
     att_row = Attendance.objects.select_for_update().filter(
         client_id=client_id, employee=employee, work_date=work_date
@@ -457,17 +531,26 @@ def record_punch(
     if att_row and att_row.status in ("On Leave", "Holiday", "Week Off"):
         status_to_use = att_row.status
 
+    early_leaving_mins = metrics["early_leaving_minutes"] if punch_type == "OUT" else (att_row.early_leaving_minutes if att_row else 0)
+
     if att_row is not None:
         att_row.first_punch = first_punch_time
         att_row.last_punch = last_punch_time
-        att_row.check_in = first_in or first_punch_time
-        att_row.check_out = last_out or last_punch_time
+        att_row.check_in = check_in_time
+        att_row.check_out = check_out_time
         att_row.hours = metrics["working_hours"]
         att_row.working_hours = metrics["working_hours"]
         att_row.late_minutes = metrics["late_minutes"]
+        att_row.early_leaving_minutes = early_leaving_mins
         att_row.overtime_hours = metrics["overtime_hours"]
         att_row.status = status_to_use
         att_row.source = "punch"
+        if early_reason:
+            att_row.remark = (
+                f"{att_row.remark} | Early: {early_reason}"
+                if att_row.remark and "Early:" not in att_row.remark
+                else (att_row.remark or f"Early Punch Out: {early_reason}")
+            )
         att_row.updated_by = user if getattr(user, "is_authenticated", False) else None
         att_row.save()
     else:
@@ -477,19 +560,38 @@ def record_punch(
             work_date=work_date,
             first_punch=first_punch_time,
             last_punch=last_punch_time,
-            check_in=first_in or first_punch_time,
-            check_out=last_out or last_punch_time,
+            check_in=check_in_time,
+            check_out=check_out_time,
             hours=metrics["working_hours"],
             working_hours=metrics["working_hours"],
             late_minutes=metrics["late_minutes"],
+            early_leaving_minutes=early_leaving_mins,
             overtime_hours=metrics["overtime_hours"],
             status=status_to_use,
             source="punch",
+            remark=f"Early Punch Out: {early_reason}" if early_reason else None,
             created_by=user if getattr(user, "is_authenticated", False) else None,
         )
 
     punch.attendance = att_row
     punch.save(update_fields=["attendance"])
+
+    # Connect with Regularization if requested or early punch out with reason
+    if punch_type == "OUT" and (request_regularization or (early_reason and metrics["is_early_out"])):
+        from apps.hrms.models import AttendanceRegularization
+        AttendanceRegularization.objects.update_or_create(
+            client_id=client_id,
+            employee=employee,
+            work_date=work_date,
+            status="Pending",
+            defaults={
+                "requested_check_in": check_in_time,
+                "requested_check_out": punch_time,
+                "requested_status": "Present",
+                "reason": early_reason or remark or f"Early punch out ({early_leaving_mins} min early)",
+                "created_by": user if getattr(user, "is_authenticated", False) else None,
+            },
+        )
 
     return punch, get_today_punch_status(client_id, employee, work_date=work_date)
 
@@ -518,25 +620,49 @@ def correct_punch(*, client, employee, work_date, punch_type, punch_time, reason
 
     first_in = metrics["first_in"].punch_time if metrics["first_in"] else None
     last_out = metrics["last_out"].punch_time if metrics["last_out"] else None
+    first_punch_time = metrics["first_punch"].punch_time if metrics["first_punch"] else None
+    last_punch_time = metrics["last_punch"].punch_time if metrics["last_punch"] else None
+
+    check_in_time = first_in or first_punch_time
+    check_out_time = None if metrics["is_punched_in"] else last_out
 
     att_row = Attendance.objects.select_for_update().filter(
         client_id=client_id, employee=employee, work_date=work_date
     ).first()
 
     if att_row is not None:
-        att_row.first_punch = metrics["first_punch"].punch_time if metrics["first_punch"] else None
-        att_row.last_punch = metrics["last_punch"].punch_time if metrics["last_punch"] else None
-        att_row.check_in = first_in
-        att_row.check_out = last_out
+        att_row.first_punch = first_punch_time
+        att_row.last_punch = last_punch_time
+        att_row.check_in = check_in_time
+        att_row.check_out = check_out_time
         att_row.hours = metrics["working_hours"]
         att_row.working_hours = metrics["working_hours"]
         att_row.late_minutes = metrics["late_minutes"]
         att_row.overtime_hours = metrics["overtime_hours"]
         att_row.status = metrics["status"]
         att_row.source = "regularization"
+        att_row.updated_by = user if getattr(user, "is_authenticated", False) else None
         att_row.save()
-        punch.attendance = att_row
-        punch.save(update_fields=["attendance"])
+    else:
+        att_row = Attendance.objects.create(
+            client_id=client_id,
+            employee=employee,
+            work_date=work_date,
+            first_punch=first_punch_time,
+            last_punch=last_punch_time,
+            check_in=check_in_time,
+            check_out=check_out_time,
+            hours=metrics["working_hours"],
+            working_hours=metrics["working_hours"],
+            late_minutes=metrics["late_minutes"],
+            overtime_hours=metrics["overtime_hours"],
+            status=metrics["status"],
+            source="regularization",
+            created_by=user if getattr(user, "is_authenticated", False) else None,
+        )
+
+    punch.attendance = att_row
+    punch.save(update_fields=["attendance"])
 
     if getattr(user, "is_authenticated", False):
         record_audit(
@@ -1140,12 +1266,14 @@ def calendar_time_label(event):
 
 def org_chart(client_id):
     """``GET /hrms/org-chart/`` -- a recursive walk over ``manager_id``."""
+    # People who have left are not on the chart.
     employees = list(
         Employee.objects.filter(client_id=client_id, deleted_at__isnull=True)
-        .select_related("designation", "department")
+        .exclude(status__in=["Resigned", "Terminated"])
+        .select_related("designation", "department", "location")
         .only(
-            "id", "name", "employee_code", "manager_id", "avatar_url",
-            "designation__name", "department__name",
+            "id", "name", "employee_code", "manager_id", "avatar_url", "email",
+            "phone", "status", "designation__name", "department__name", "location__name",
         )
     )
     nodes = {
@@ -1155,7 +1283,13 @@ def org_chart(client_id):
             "employeeCode": employee.employee_code,
             "designation": employee.designation.name if employee.designation_id else None,
             "department": employee.department.name if employee.department_id else None,
+            "location": employee.location.name if employee.location_id else None,
+            "email": employee.email,
+            "phone": employee.phone,
+            "status": employee.status,
             "avatar": employee.avatar_url,
+            "managerId": str(employee.manager_id) if employee.manager_id else None,
+            "manager": None,
             "reports": [],
         }
         for employee in employees
@@ -1166,6 +1300,7 @@ def org_chart(client_id):
         node = nodes[employee.id]
         parent = nodes.get(employee.manager_id) if employee.manager_id else None
         if parent is not None and parent is not node:
+            node["manager"] = parent["name"]
             parent["reports"].append(node)
         else:
             roots.append(node)
