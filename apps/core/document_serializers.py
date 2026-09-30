@@ -108,6 +108,11 @@ class DocumentSerializer(BaseModelSerializer):
     line_serializer = None
     line_fk_name = None
     line_table_name = None
+    #: Quotation-first sales: a line may be an inventory item, or a service /
+    #: fabrication / custom / free-text line with no item at all. Such a line
+    #: is identified only by its text, so documents that opt in require it.
+    #: Never satisfied by inventing an item -- ``itemId`` stays optional.
+    require_line_description = False
 
     def get_balance_due(self, document):
         return document.balance_due
@@ -190,6 +195,8 @@ class DocumentSerializer(BaseModelSerializer):
             data = dict(line_serializer.validated_data)
             serial_numbers = data.pop("serials", [])
             data.setdefault("line_no", index)
+            if self.require_line_description:
+                self._check_line_text(data, index)
 
             line = self.line_model(
                 client_id=document.client_id,
@@ -206,6 +213,27 @@ class DocumentSerializer(BaseModelSerializer):
                 link_line_serials(
                     document.client_id, self.line_table_name, line.id, resolved
                 )
+
+    @staticmethod
+    def _check_line_text(data, index):
+        """A line without an item is named by its description (or item name).
+
+        The two are mirrored so every screen and print view, which read one or
+        the other, shows the same text for a custom line.
+        """
+        if data.get("item") is not None:
+            return
+        description = (data.get("description") or "").strip()
+        item_name = (data.get("item_name") or "").strip()
+        if not description and not item_name:
+            from .exceptions import ValidationFailed
+
+            raise ValidationFailed(
+                f"Line {index} needs a description or an inventory item.",
+                field_errors={f"lineItems[{index - 1}].description": ["Required."]},
+            )
+        data["description"] = description or item_name
+        data["item_name"] = item_name or description
 
     def _recalculate(self, document):
         from apps.sales.services import assert_client_totals_match, recalculate_document

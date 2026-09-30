@@ -637,7 +637,11 @@ def _post_invoice_stock(invoice, lines, *, user=None):
     A line already dispatched on a challan has moved its stock; matching on the
     source order line is what makes that check reliable.
     """
-    location_id = invoice.location_id or _default_location_id(invoice.client_id)
+    # Replaced (quotation-first sales): resolving the warehouse up front made a
+    # service / custom-only invoice fail with NO_LOCATION on a workspace that
+    # has no Inventory set up. It is now resolved on the first stock line.
+    # location_id = invoice.location_id or _default_location_id(invoice.client_id)
+    location_id = invoice.location_id
 
     for line in lines:
         if line.item_id is None or not line.item.holds_stock:
@@ -646,6 +650,8 @@ def _post_invoice_stock(invoice, lines, *, user=None):
             continue  # dispatched already
         if line.sales_order_line_id and _already_dispatched(line.sales_order_line_id):
             continue
+        if location_id is None:
+            location_id = _default_location_id(invoice.client_id)
 
         stock.assert_not_qc_blocked(invoice.client_id, line.item_id, line.item_name)
         stock.assert_sufficient_stock(
@@ -768,7 +774,10 @@ def dispatch_challan(challan, *, user=None):
     if not challan.challan_number:
         challan.challan_number = allocate_number(challan.client, "DC", challan.doc_date)
 
-    location_id = challan.location_id or _default_location_id(challan.client_id)
+    # Replaced (quotation-first sales): see _post_invoice_stock -- a challan of
+    # service / custom lines needs no warehouse, so it is resolved lazily below.
+    # location_id = challan.location_id or _default_location_id(challan.client_id)
+    location_id = challan.location_id
     serial_map = stock.serials_for_lines(
         challan.client_id, "delivery_challan_lines", [line.id for line in lines]
     )
@@ -783,6 +792,8 @@ def dispatch_challan(challan, *, user=None):
 
         if line.item_id is None or not line.item.holds_stock:
             continue
+        if location_id is None:
+            location_id = _default_location_id(challan.client_id)
 
         stock.assert_not_qc_blocked(challan.client_id, line.item_id, line.item_name)
         stock.assert_sufficient_stock(

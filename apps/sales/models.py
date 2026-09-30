@@ -54,6 +54,51 @@ def choices(values):
     return [(value, value) for value in values]
 
 
+#: What a sales line is, for a metal / fabrication business (Sweven spec §2.1:
+#: "professional quotes for machines and spare parts", plus MS table
+#: fabrication). Free of any inventory item: a Fabrication or Service line has
+#: no item at all.
+# Replaced (sheet-metal sales): Sweven's work is steel / iron sheet, plate and
+# section, so those lead; the earlier kinds stay valid for existing rows.
+# LINE_KINDS = ["Machine", "Spare Part", "Fabrication", "Service", "Custom"]
+LINE_KINDS = [
+    "Sheet Metal", "Section / Pipe", "Fabrication",
+    "Machine", "Spare Part", "Service", "Custom",
+]
+
+
+class MetalLineFields(models.Model):
+    """Optional metal-industry detail on a sales document line.
+
+    Carried through every conversion (estimate -> quotation -> order ->
+    challan / invoice) so what was quoted is what is billed. All optional:
+    an inventory line without them behaves exactly as before.
+    """
+
+    line_kind = models.TextField(choices=choices(LINE_KINDS), null=True, blank=True)
+    #: e.g. "MS IS 2062", "SS 304".
+    material_grade = models.TextField(null=True, blank=True)
+    #: Size / section / thickness / finish, e.g. "1800x900x750 mm, 40x40 pipe, powder coated".
+    specification = models.TextField(null=True, blank=True)
+    #: Weight of one unit in kg -- total weight is qty x unit_weight.
+    unit_weight = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    #: The sheet-metal calculator behind the line, as the form captured it:
+    #: material, grade, form, finish, thickness / width / length (mm), kg per
+    #: metre, pieces, weight per piece and billing basis ("kg" or "pcs").
+    #: A record of how qty was worked out -- qty, rate and the totals stay the
+    #: columns the server computes from.
+    sheet_spec = models.JSONField(null=True, blank=True)
+
+    class Meta:
+        abstract = True
+
+
+#: The columns above, for the conversions that copy a line field by field.
+# Replaced: + sheet_spec.
+# METAL_LINE_FIELDS = ["line_kind", "material_grade", "specification", "unit_weight"]
+METAL_LINE_FIELDS = ["line_kind", "material_grade", "specification", "unit_weight", "sheet_spec"]
+
+
 # ---------------------------------------------------------------------------
 # Estimates (api.md §5.2)
 # ---------------------------------------------------------------------------
@@ -80,7 +125,9 @@ class Estimate(DocumentHeader):
         return self.estimate_number or f"Estimate {self.id}"
 
 
-class EstimateLine(DocumentLine):
+# Replaced (metal-industry sales): + MetalLineFields.
+# class EstimateLine(DocumentLine):
+class EstimateLine(DocumentLine, MetalLineFields):
     estimate = models.ForeignKey(Estimate, on_delete=models.CASCADE, related_name="line_items")
 
     class Meta(DocumentLine.Meta):
@@ -107,6 +154,14 @@ class Quotation(DocumentHeader):
         "crm.Lead", null=True, blank=True, on_delete=models.SET_NULL, related_name="quotations"
     )
     subject = models.TextField(null=True, blank=True)
+    # Quotation-first sales: the commercial header the printed quotation
+    # carries. Free text, because a quotation is often raised before the
+    # salesperson or signatory exists as a user in this workspace.
+    reference_number = models.TextField(null=True, blank=True)
+    salesperson = models.TextField(null=True, blank=True)
+    payment_terms = models.TextField(null=True, blank=True)
+    delivery_terms = models.TextField(null=True, blank=True)
+    authorized_person = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "quotations"
@@ -120,7 +175,9 @@ class Quotation(DocumentHeader):
         return self.quotation_number or f"Quotation {self.id}"
 
 
-class QuotationLine(DocumentLine):
+# Replaced (metal-industry sales): + MetalLineFields.
+# class QuotationLine(DocumentLine):
+class QuotationLine(DocumentLine, MetalLineFields):
     quotation = models.ForeignKey(Quotation, on_delete=models.CASCADE, related_name="line_items")
 
     class Meta(DocumentLine.Meta):
@@ -221,7 +278,9 @@ class SalesOrder(DocumentHeader):
         return self.stage not in NON_RESERVING_STAGES and self.deleted_at is None
 
 
-class SalesOrderLine(DocumentLine):
+# Replaced (metal-industry sales): + MetalLineFields.
+# class SalesOrderLine(DocumentLine):
+class SalesOrderLine(DocumentLine, MetalLineFields):
     sales_order = models.ForeignKey(
         SalesOrder, on_delete=models.CASCADE, related_name="line_items"
     )
@@ -280,7 +339,9 @@ class ProformaInvoice(DocumentHeader):
         ]
 
 
-class ProformaInvoiceLine(DocumentLine):
+# Replaced (metal-industry sales): + MetalLineFields.
+# class ProformaInvoiceLine(DocumentLine):
+class ProformaInvoiceLine(DocumentLine, MetalLineFields):
     proforma_invoice = models.ForeignKey(
         ProformaInvoice, on_delete=models.CASCADE, related_name="line_items"
     )
@@ -320,6 +381,12 @@ class DeliveryChallan(DocumentHeader):
         "masters.Location", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     delivered_at = models.DateTimeField(null=True, blank=True)
+    # -- weighbridge (steel is dispatched and billed by weight) ---------------
+    weighbridge_slip = models.TextField(null=True, blank=True)
+    #: kg. Net is DERIVED as gross - tare when both are given.
+    gross_weight = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+    tare_weight = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
+    net_weight = models.DecimalField(max_digits=18, decimal_places=3, null=True, blank=True)
 
     class Meta:
         db_table = "delivery_challans"
@@ -333,7 +400,9 @@ class DeliveryChallan(DocumentHeader):
         return self.challan_number or f"Challan {self.id}"
 
 
-class DeliveryChallanLine(DocumentLine):
+# Replaced (metal-industry sales): + MetalLineFields.
+# class DeliveryChallanLine(DocumentLine):
+class DeliveryChallanLine(DocumentLine, MetalLineFields):
     delivery_challan = models.ForeignKey(
         DeliveryChallan, on_delete=models.CASCADE, related_name="line_items"
     )
@@ -397,7 +466,9 @@ class SalesInvoice(DocumentHeader):
         return self.invoice_number or f"Invoice {self.id}"
 
 
-class SalesInvoiceLine(DocumentLine):
+# Replaced (metal-industry sales): + MetalLineFields.
+# class SalesInvoiceLine(DocumentLine):
+class SalesInvoiceLine(DocumentLine, MetalLineFields):
     sales_invoice = models.ForeignKey(
         SalesInvoice, on_delete=models.CASCADE, related_name="line_items"
     )

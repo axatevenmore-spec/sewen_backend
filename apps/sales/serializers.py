@@ -21,6 +21,7 @@ from apps.core.serializers import (
 
 from . import services
 from .models import (
+    METAL_LINE_FIELDS,
     DeliveryChallan,
     DeliveryChallanLine,
     Estimate,
@@ -56,9 +57,32 @@ def line_serializer_for(line_model, table_name, extra_fields=(), extra_read_only
     class _LineSerializer(DocumentLineSerializer):
         line_table_name = table_name
 
+        def validate_sheet_spec(self, value):
+            """The sheet-metal calculator's inputs: an object, basis kg / pcs."""
+            if value in (None, ""):
+                return None
+            if not isinstance(value, dict):
+                raise serializers.ValidationError("Must be an object.")
+            if value.get("basis") not in (None, "", "kg", "pcs"):
+                raise serializers.ValidationError("basis must be 'kg' or 'pcs'.")
+            for key in ("thicknessMm", "widthMm", "lengthMm", "kgPerMeter", "pieces", "weightPerPiece"):
+                raw = value.get(key)
+                if raw in (None, ""):
+                    continue
+                try:
+                    number = Decimal(str(raw))
+                except Exception:
+                    raise serializers.ValidationError(f"{key} must be a number.")
+                if number < 0:
+                    raise serializers.ValidationError(f"{key} cannot be negative.")
+            return value
+
         class Meta(DocumentLineSerializer.Meta):
             model = line_model
-            fields = DocumentLineSerializer.Meta.fields + list(extra_fields)
+            # Replaced (metal-industry sales): every sales line also carries
+            # the optional kind / material / specification / unit weight.
+            # fields = DocumentLineSerializer.Meta.fields + list(extra_fields)
+            fields = DocumentLineSerializer.Meta.fields + METAL_LINE_FIELDS + list(extra_fields)
             read_only_fields = DocumentLineSerializer.Meta.read_only_fields + list(
                 extra_read_only
             )
@@ -110,14 +134,28 @@ class QuotationSerializer(DocumentSerializer):
     line_serializer = QuotationLineSerializer
     line_fk_name = "quotation"
     line_table_name = "quotation_lines"
+    require_line_description = True
+
+    #: The documents this quotation became -- the customer-history chain
+    #: Quotation -> Sales Order -> Invoice -> Payment, read from the links.
+    salesOrders = serializers.SerializerMethodField()
 
     class Meta:
         model = Quotation
         fields = HEADER_FIELDS + [
             "quotation_number", "status", "valid_until", "subject",
             "estimate", "crm_deal", "crm_lead",
+            "reference_number", "salesperson", "payment_terms",
+            "delivery_terms", "authorized_person", "salesOrders",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["quotation_number"]
+
+    def get_salesOrders(self, quotation):
+        orders = quotation.orders.filter(deleted_at__isnull=True).order_by("created_at")
+        return [
+            {"id": order.id, "orderNumber": order.order_number, "stage": order.stage}
+            for order in orders
+        ]
 
 
 class QuotationActivitySerializer(BaseModelSerializer):
@@ -142,7 +180,11 @@ class SalesOrderSerializer(DocumentSerializer):
     line_serializer = SalesOrderLineSerializer
     line_fk_name = "sales_order"
     line_table_name = "sales_order_lines"
+    require_line_description = True
 
+    quotationNumber = serializers.CharField(
+        source="quotation.quotation_number", read_only=True, default=None
+    )
     totalSalesValue = MoneyField(source="total_sales_value", required=False, allow_null=True)
     formalInvoiceAmount = MoneyField(source="formal_invoice_amount", required=False, allow_null=True)
     cashAmount = MoneyField(source="cash_amount", required=False, allow_null=True)
@@ -153,7 +195,7 @@ class SalesOrderSerializer(DocumentSerializer):
         model = SalesOrder
         fields = HEADER_FIELDS + [
             "order_number", "stage", "payment_status", "delivery_date",
-            "quotation", "pms_project", "reference_number",
+            "quotation", "quotationNumber", "pms_project", "reference_number",
             "total_sales_value", "formal_invoice_amount", "cash_amount",
             "totalSalesValue", "formalInvoiceAmount", "cashAmount",
             "invoice", "cashReceipt",
@@ -263,8 +305,25 @@ class DeliveryChallanSerializer(DocumentSerializer):
             "challan_number", "status", "sales_order", "quotation",
             "dispatch_date", "vehicle_number", "transporter", "lr_number",
             "delivery_location", "location", "delivered_at",
+            # Weighbridge (sheet-metal dispatch is by weight).
+            "weighbridge_slip", "gross_weight", "tare_weight", "net_weight",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + ["challan_number", "delivered_at"]
+
+    def validate(self, attrs):
+        """Net weight is gross - tare whenever both are known."""
+        attrs = super().validate(attrs)
+        instance = getattr(self, "instance", None)
+        gross = attrs.get("gross_weight", getattr(instance, "gross_weight", None))
+        tare = attrs.get("tare_weight", getattr(instance, "tare_weight", None))
+        for field, value in (("gross_weight", gross), ("tare_weight", tare), ("net_weight", attrs.get("net_weight"))):
+            if value is not None and value < 0:
+                raise serializers.ValidationError({field: ["Cannot be negative."]})
+        if gross is not None and tare is not None:
+            if tare > gross:
+                raise serializers.ValidationError({"tare_weight": ["Tare cannot exceed gross weight."]})
+            attrs["net_weight"] = gross - tare
+        return attrs
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +355,7 @@ class SalesInvoiceSerializer(DocumentSerializer):
     line_serializer = SalesInvoiceLineSerializer
     line_fk_name = "sales_invoice"
     line_table_name = "sales_invoice_lines"
+    require_line_description = True
 
     #: ``Overdue`` is layered on at read time, never stored (db.md §12).
     displayStatus = serializers.SerializerMethodField()
@@ -308,6 +368,16 @@ class SalesInvoiceSerializer(DocumentSerializer):
     )
     proformaInvoiceId = TenantPrimaryKeyRelatedField(
         source="proforma_invoice", model="sales.ProformaInvoice", required=False, allow_null=True
+    )
+    # Upstream numbers for the customer-history chain (read-only).
+    salesOrderNumber = serializers.CharField(
+        source="sales_order.order_number", read_only=True, default=None
+    )
+    quotationId = serializers.UUIDField(
+        source="sales_order.quotation_id", read_only=True, default=None
+    )
+    quotationNumber = serializers.CharField(
+        source="sales_order.quotation.quotation_number", read_only=True, default=None
     )
 
     totalSalesValue = MoneyField(source="total_sales_value", required=False, allow_null=True)
@@ -324,6 +394,7 @@ class SalesInvoiceSerializer(DocumentSerializer):
             "invoice_number", "status", "displayStatus", "due_date",
             "sales_order", "delivery_challan", "proforma_invoice", "location",
             "salesOrderId", "deliveryChallanId", "proformaInvoiceId",
+            "salesOrderNumber", "quotationId", "quotationNumber",
             "totalSalesValue", "formalInvoiceAmount", "cashAmount",
             "totalAllocated", "remainingAmount", "revisions", "cashReceipt",
             "irn", "eway_bill_number",
