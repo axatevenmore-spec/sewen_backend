@@ -657,7 +657,8 @@ class UserViewSet(TenantModelViewSet):
     # these checks it could hand out the Administrator role or overwrite an
     # administrator's password and sign in as them.
     def _guard_target(self, target):
-        """Only an administrator may change an administrator's account."""
+        """Only an administrator may change an administrator's account, and
+        nobody may change an account that holds more than they do."""
         actor = self.request.user
         if actor.is_superuser:
             return
@@ -665,18 +666,28 @@ class UserViewSet(TenantModelViewSet):
             raise PermissionDenied(
                 "Only a superuser can change a superuser account.", code="SUPERUSER_ONLY"
             )
+        target_permissions = target.effective_permissions()
         if has_permission(actor, "manage_roles"):
+            beyond = sorted(target_permissions - granted_permissions(actor))
+            if beyond:
+                raise PermissionDenied(
+                    "You cannot change an account with permissions you don't hold.",
+                    code="manage_roles",
+                    detail=f"'{target.name}' also holds: {', '.join(beyond)}.",
+                )
             return
-        if "manage_roles" in target.effective_permissions():
+        if "manage_roles" in target_permissions:
             raise PermissionDenied(
                 "Only an administrator can change an administrator's account.",
                 code="manage_roles",
             )
 
     def _guard_role(self, role):
-        """A role may only be handed out by someone who holds all of it."""
+        """A role may only be handed out by someone who holds all of it --
+        ``manage_roles`` included, or a partial administrator could assign
+        the Administrator role to themselves."""
         actor = self.request.user
-        if role is None or actor.is_superuser or has_permission(actor, "manage_roles"):
+        if role is None or actor.is_superuser:
             return
         beyond = sorted(role.permission_ids() - granted_permissions(actor))
         if beyond:
@@ -861,8 +872,18 @@ class UserViewSet(TenantModelViewSet):
                 }
             )
 
+        self._guard_target(user)
         serializer = UserPermissionOverrideSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        actor = request.user
+        if not actor.is_superuser:
+            beyond = sorted(set(serializer.validated_data.get("grant", [])) - granted_permissions(actor))
+            if beyond:
+                raise PermissionDenied(
+                    "You cannot grant permissions you don't hold.",
+                    code="manage_roles",
+                    detail=f"Not yours to grant: {', '.join(beyond)}.",
+                )
         with transaction.atomic():
             UserPermission.objects.filter(user=user).delete()
             UserPermission.objects.bulk_create(
@@ -894,12 +915,69 @@ class RoleViewSet(TenantModelViewSet):
     ordering_fields = ["name", "code", "created_at"]
     ordering = ["name"]
     status_field = None
-    permission_map = {"read": ["manage_roles"], "write": ["manage_roles"]}
+    permission_map = {
+        # Whoever may create or edit staff picks a role on the user form, so
+        # they may list the roles; only ``manage_roles`` may change one.
+        "list": [("manage_roles", "create_staff", "edit_staff")],
+        "read": ["manage_roles"],
+        "write": ["manage_roles"],
+    }
 
     def get_queryset(self):
         return super().get_queryset().annotate(
             user_count=Count("users", filter=Q(users__deleted_at__isnull=True))
         )
+
+    # -- no-escalation rules -------------------------------------------------
+    # ``manage_roles`` alone must not be a way to every permission: a role
+    # can only be given what its editor holds, and a role that grants more
+    # than its editor holds is out of their reach.
+    def _guard_role_change(self, role, requested):
+        actor = self.request.user
+        if actor.is_superuser:
+            return
+        held = granted_permissions(actor)
+        if role is not None:
+            beyond = sorted(role.permission_ids() - held)
+            if beyond:
+                raise PermissionDenied(
+                    "You cannot change a role with permissions you don't hold.",
+                    code="manage_roles",
+                    detail=f"Role '{role.name}' also grants: {', '.join(beyond)}.",
+                )
+        if requested is None:
+            return
+        beyond = sorted(set(requested) - held)
+        if beyond:
+            raise PermissionDenied(
+                "You cannot grant permissions you don't hold.",
+                code="manage_roles",
+                detail=f"Not yours to grant: {', '.join(beyond)}.",
+            )
+        if (
+            role is not None
+            and role.pk == actor.role_id
+            and "manage_roles" in role.permission_ids()
+            and "manage_roles" not in requested
+            and not UserPermission.objects.filter(
+                user=actor, permission_id="manage_roles", effect="grant"
+            ).exists()
+        ):
+            raise Conflict(
+                "You cannot remove 'Manage roles' from your own role.",
+                code="SELF_LOCKOUT",
+                detail="You would lose access to this screen. Ask another administrator.",
+            )
+
+    def perform_create(self, serializer):
+        self._guard_role_change(None, serializer.validated_data.get("selectedPermissions", []))
+        return super().perform_create(serializer)
+
+    def perform_update(self, serializer):
+        self._guard_role_change(
+            serializer.instance, serializer.validated_data.get("selectedPermissions")
+        )
+        return super().perform_update(serializer)
 
     def check_delete_allowed(self, role):
         """api.md §3.2 -- 409 if users are attached unless ``?reassignTo=``."""
@@ -937,12 +1015,14 @@ class RoleViewSet(TenantModelViewSet):
             raise Conflict(
                 "System roles cannot be deleted.", code="SYSTEM_ROLE"
             )
+        self._guard_role_change(instance, None)
         super().perform_destroy(instance)
 
     @action(detail=True, methods=["post"])
     def duplicate(self, request, pk=None):
         """The UI's "Copy" action (api.md §3.2)."""
         source = self.get_object()
+        self._guard_role_change(None, source.permission_ids())
         base_code = f"{source.code}-COPY"
         code, suffix = base_code, 1
         while Role.objects.filter(

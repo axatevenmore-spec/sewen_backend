@@ -211,6 +211,90 @@ class RoleAdministrationTests(RbacTestCase):
             200,
         )
 
+    # -- role editor (Administration -> Roles) ----------------------------------
+    def test_create_role_with_name_only_derives_a_unique_code(self):
+        client = self.api(self.admin)
+        first = client.post(
+            f"{API}/admin/roles/",
+            {"name": "Regional Sales Lead", "selectedPermissions": ["view_lead", "view_lead"]},
+            format="json",
+        )
+        self.assertEqual(first.status_code, 201, first.content)
+        self.assertEqual(first.json()["code"], "RSL")
+        self.assertEqual(first.json()["permissions"], ["view_lead"])
+        second = client.post(f"{API}/admin/roles/", {"name": "Regional Sales Lead"}, format="json")
+        self.assertEqual(second.status_code, 201, second.content)
+        self.assertEqual(second.json()["code"], "RSL2")
+
+    def test_role_permissions_persist_and_reload(self):
+        client = self.api(self.admin)
+        role_id = client.post(f"{API}/admin/roles/", {"name": "Auditor"}, format="json").json()["id"]
+        url = f"{API}/admin/roles/{role_id}/"
+        client.patch(url, {"selectedPermissions": ["view_ledger", "view_audit_logs"]}, format="json")
+        self.assertEqual(client.get(url).json()["permissions"], ["view_audit_logs", "view_ledger"])
+        client.patch(url, {"selectedPermissions": ["view_ledger"]}, format="json")
+        self.assertEqual(client.get(url).json()["permissions"], ["view_ledger"])
+        # A rename alone leaves the permission set alone.
+        client.patch(url, {"name": "Auditor (read-only)"}, format="json")
+        self.assertEqual(client.get(url).json()["permissions"], ["view_ledger"])
+
+    def test_staff_editors_can_list_roles_for_the_user_form_but_not_change_them(self):
+        self.assertEqual(self.api(self.hr).get(f"{API}/admin/roles/").status_code, 200)
+        self.assertEqual(self.api(self.employee).get(f"{API}/admin/roles/").status_code, 403)
+        resp = self.api(self.hr).post(f"{API}/admin/roles/", {"name": "Mine"}, format="json")
+        self.assertEqual(resp.status_code, 403)
+
+    def test_partial_role_manager_cannot_grant_beyond_their_own_permissions(self):
+        self.roles["MGR"] = self.role("MGR", "manage_roles", "view_staff", "edit_staff", "view_lead")
+        manager = self.user("mgr@rbac.test", "MGR")
+        client = self.api(manager)
+        # Within their own permissions: allowed.
+        ok = client.post(
+            f"{API}/admin/roles/", {"name": "Lead viewer", "selectedPermissions": ["view_lead"]},
+            format="json",
+        )
+        self.assertEqual(ok.status_code, 201, ok.content)
+        # Beyond them: refused on create, edit, duplicate and delete.
+        resp = client.post(
+            f"{API}/admin/roles/", {"name": "Backdoor", "selectedPermissions": ["system_backup"]},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 403)
+        resp = client.patch(
+            f"{API}/admin/roles/{ok.json()['id']}/",
+            {"selectedPermissions": ["view_lead", "view_sales"]}, format="json",
+        )
+        self.assertEqual(resp.status_code, 403)
+        admin_url = f"{API}/admin/roles/{self.roles['AD'].id}/"
+        self.assertEqual(client.patch(admin_url, {"selectedPermissions": []}, format="json").status_code, 403)
+        self.assertEqual(client.post(f"{admin_url}duplicate/").status_code, 403)
+        # Nor hand out the Administrator role, nor change an administrator.
+        resp = client.patch(
+            f"{API}/admin/users/{manager.id}/", {"roleId": str(self.roles["AD"].id)}, format="json"
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(
+            client.patch(f"{API}/admin/users/{self.admin.id}/", {"name": "X"}, format="json").status_code,
+            403,
+        )
+        # Nor grant a permission they lack through a per-user override.
+        resp = client.post(
+            f"{API}/admin/users/{self.employee.id}/permissions/", {"grant": ["view_sales"]},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(self.roles["AD"].permission_ids(), set(all_permission_ids()))
+
+    def test_role_manager_cannot_remove_manage_roles_from_their_own_role(self):
+        everything = [p for p in all_permission_ids() if p != "manage_roles"]
+        resp = self.api(self.admin).patch(
+            f"{API}/admin/roles/{self.roles['AD'].id}/", {"selectedPermissions": everything},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(resp.json()["code"], "SELF_LOCKOUT")
+        self.assertIn("manage_roles", self.roles["AD"].permission_ids())
+
     def test_role_from_another_tenant_is_rejected(self):
         other = Client.objects.create(slug="other", name="Other")
         foreign = Role.objects.create(client=other, code="AD", name="Their admin")
