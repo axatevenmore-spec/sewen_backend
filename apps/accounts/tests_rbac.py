@@ -311,6 +311,20 @@ class RoleAdministrationTests(RbacTestCase):
 
 
 class EndpointMappingTests(RbacTestCase):
+    def test_main_dashboard_shows_each_role_only_its_own_modules(self):
+        stage = Stage.objects.create(client=self.tenant, name="New", sequence=1)
+        Lead.objects.create(client=self.tenant, lead_number="L-1", name="Lead", stage=stage)
+        sales = self.api(self.user("sm@rbac.test", "SM")).get(f"{API}/dashboard/").json()
+        hr = self.api(self.user("hr@rbac.test", "HR")).get(f"{API}/dashboard/").json()
+        self.assertEqual(sales["crm"]["openLeads"], 1)
+        self.assertEqual(hr["crm"]["openLeads"], 0)
+        # Same keys for everyone, blank where the role has no business.
+        self.assertEqual(set(hr), set(sales))
+        self.assertEqual(hr["sales"]["monthly"], [])
+        self.assertEqual(hr["recentDocuments"], [])
+        self.assertEqual(hr["cash"]["bankAccounts"], [])
+        self.assertEqual(hr["inventoryAlerts"], [])
+
     def test_reports_follow_their_module_permission(self):
         employee = self.user("em@rbac.test", "EM")
         accountant = self.user("ac@rbac.test", "AC")
