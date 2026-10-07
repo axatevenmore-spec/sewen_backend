@@ -269,6 +269,7 @@ class EmployeeViewSet(TenantModelViewSet):
 
         # api.md §11.1 -- Connect employee with Administration user account
         if employee.email:
+            from apps.accounts.invites import send_invite_on_commit
             from apps.accounts.models import User, Role
             client_id = self.get_client_id()
             normalized_email = employee.email.strip().lower()
@@ -288,10 +289,12 @@ class EmployeeViewSet(TenantModelViewSet):
                         description=f"Linked user account {existing_user.email} to employee {employee.employee_code}",
                     )
             elif self.request.data.get("createUserAccount", True):
+                # No default password -- without one the login is unusable
+                # until the employee activates it from the invite email.
                 emp_password = (
                     self.request.data.get("password")
                     or self.request.data.get("userPassword")
-                    or "Password@123"
+                    or None
                 )
                 role_id = self.request.data.get("roleId")
                 emp_role = None
@@ -313,6 +316,7 @@ class EmployeeViewSet(TenantModelViewSet):
                 )
                 # Location, joining date, photo and manager follow the HR record.
                 user_link.reconcile(user, employee)
+                send_invite_on_commit(user)
                 self.write_audit(
                     "provision_user", employee,
                     description=f"User account created for {user.email}",

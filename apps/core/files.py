@@ -49,6 +49,17 @@ ALLOWED_CONTENT_TYPES = {
     "application/octet-stream",
 }
 
+#: Types a browser renders without running script. Everything else -- SVG,
+#: HTML, XML, office files, unknown -- is served as an attachment
+#: (apps/core/views.py FileDownloadView).
+INLINE_SAFE_CONTENT_TYPES = {
+    "application/pdf",
+    "image/png",
+    "image/jpeg",
+    "image/webp",
+    "image/gif",
+}
+
 
 def max_bytes_for(scope):
     if scope in PMS_SCOPES:

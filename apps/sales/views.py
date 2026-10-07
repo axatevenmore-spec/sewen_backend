@@ -28,6 +28,7 @@ from apps.inventory import services as stock
 from . import services
 from .models import (
     CHALLAN_SHIPPED_STATUSES,
+    METAL_LINE_FIELDS,
     CashPaymentReceipt,
     DeliveryChallan,
     DeliveryChallanLine,
@@ -227,6 +228,12 @@ def _clone_document(source, target_model, overrides, *, number_field, series,
         "hsn_code", "uom", "qty", "rate", "discount_pct", "tax_pct",
         "is_bom_generated", "bom_source_item_id", "is_user_modified", "parent_sku",
     ]
+    # Metal-industry detail travels with the line when both ends carry it.
+    source_line_model = source.line_items.model
+    line_fields += [
+        field for field in METAL_LINE_FIELDS
+        if hasattr(line_model, field) and hasattr(source_line_model, field)
+    ]
     for line in source_lines:
         data = {field: getattr(line, field) for field in line_fields}
         data[line_fk] = target
@@ -262,7 +269,10 @@ class QuotationViewSet(SalesDocumentViewSet):
     @transaction.atomic
     def convert_to_order(self, request, pk=None):
         quotation = self.get_object()
-        if quotation.status in ("Converted", "Cancelled"):
+        # Replaced (quotation-first sales): a quotation the customer rejected,
+        # or one that lapsed, is no longer an offer and cannot become an order.
+        # if quotation.status in ("Converted", "Cancelled"):
+        if quotation.status in ("Converted", "Cancelled", "Rejected", "Expired"):
             raise Conflict(
                 f"This quotation is {quotation.status}.", code=Codes.ALREADY_DONE
             )
@@ -270,7 +280,13 @@ class QuotationViewSet(SalesDocumentViewSet):
         order = _clone_document(
             quotation,
             SalesOrder,
-            {"quotation": quotation, "stage": "Draft"},
+            # Replaced: the customer's reference travels with the order too.
+            # {"quotation": quotation, "stage": "Draft"},
+            {
+                "quotation": quotation,
+                "stage": "Draft",
+                "reference_number": quotation.reference_number,
+            },
             number_field="order_number",
             series="SO",
             line_model_name="SalesOrderLine",
@@ -307,6 +323,60 @@ class QuotationViewSet(SalesDocumentViewSet):
             DeliveryChallanSerializer(challan, context=self.get_serializer_context()).data,
             status=status.HTTP_201_CREATED,
         )
+
+    # -- customer approval (quotation-first sales) ---------------------------
+    #: Where each staff-side decision may be taken from. The public share link
+    #: records the customer's own decision (reports.public_views); these record
+    #: an approval given by phone, email or in person.
+    DECISIONS = {
+        "accept": ("Accepted", ("Draft", "Sent", "Viewed")),
+        "reject": ("Rejected", ("Draft", "Sent", "Viewed", "Accepted")),
+        "cancel": ("Cancelled", ("Draft", "Sent", "Viewed", "Accepted", "Rejected", "Expired")),
+    }
+
+    def _decide(self, request, verb):
+        target, allowed_from = self.DECISIONS[verb]
+        quotation = self.get_object()
+        if quotation.status not in allowed_from:
+            raise Conflict(
+                f"A {quotation.status} quotation cannot be marked {target}.",
+                code=Codes.ALREADY_DONE,
+            )
+        reason = request.data.get("reason")
+        quotation.status = target
+        update_fields = ["status", "updated_at"]
+        if verb == "cancel":
+            quotation.cancelled_at = timezone.now()
+            quotation.cancelled_by = request.user
+            quotation.cancellation_reason = reason
+            update_fields += ["cancelled_at", "cancelled_by", "cancellation_reason"]
+        quotation.save(update_fields=update_fields)
+        if verb in ("accept", "reject"):
+            QuotationActivity.objects.create(
+                quotation=quotation,
+                event="accepted" if verb == "accept" else "rejected",
+                actor_label=getattr(request.user, "email", None) or "staff",
+                comment=reason,
+            )
+        self.write_audit(verb, quotation, description=reason or f"Marked {target}")
+        return Response(self.get_serializer(quotation).data)
+
+    @action(detail=True, methods=["post"])
+    @transaction.atomic
+    def accept(self, request, pk=None):
+        """Customer approval recorded by staff -- the step before a Sales Order."""
+        return self._decide(request, "accept")
+
+    @action(detail=True, methods=["post"])
+    @transaction.atomic
+    def reject(self, request, pk=None):
+        return self._decide(request, "reject")
+
+    @action(detail=True, methods=["post"])
+    @transaction.atomic
+    def cancel(self, request, pk=None):
+        """``{ reason }`` -- a quotation is cancelled, never deleted once sent."""
+        return self._decide(request, "cancel")
 
     @action(detail=True, methods=["post", "delete"], url_path="share")
     def share(self, request, pk=None):
@@ -586,6 +656,8 @@ class SalesOrderViewSet(SalesDocumentViewSet):
                 is_bom_generated=source.is_bom_generated,
                 bom_source_item_id=source.bom_source_item_id,
                 parent_sku=source.parent_sku,
+                # Metal-industry detail (kind, material, specification, weight).
+                **{field: getattr(source, field) for field in METAL_LINE_FIELDS},
             )
             if serials:
                 resolved = stock.resolve_serials(order.client_id, source.item_id, serials)
@@ -846,6 +918,8 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
                 is_bom_generated=line.is_bom_generated,
                 bom_source_item_id=line.bom_source_item_id,
                 parent_sku=line.parent_sku,
+                # Metal-industry detail (kind, material, specification, weight).
+                **{field: getattr(line, field) for field in METAL_LINE_FIELDS},
             )
         services.recalculate_document(invoice)
         return Response(

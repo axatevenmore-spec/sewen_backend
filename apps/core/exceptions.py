@@ -9,6 +9,7 @@ can branch without string-matching a message.
 """
 import logging
 
+from django.conf import settings
 from django.core.exceptions import PermissionDenied as DjangoPermissionDenied
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError
@@ -247,7 +248,8 @@ def api_exception_handler(exc, context):
             Conflict(
                 message="That change conflicts with an existing record.",
                 code=Codes.VERSION_CONFLICT,
-                detail=str(exc).split("\n")[0],
+                # Constraint and table names stay server-side outside development.
+                detail=str(exc).split("\n")[0] if settings.DEBUG else None,
             ).body(),
             status=http_status.HTTP_409_CONFLICT,
         )

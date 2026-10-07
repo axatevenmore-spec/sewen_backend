@@ -10,6 +10,7 @@ from apps.core.serializers import (
     TenantPrimaryKeyRelatedField,
 )
 
+from .invites import send_invite_on_commit
 from .models import Client, Permission, Role, RolePermission, User, UserPermission, UserSession
 
 
@@ -310,12 +311,14 @@ class UserSerializer(BaseModelSerializer):
         if password and str(password).strip():
             user.set_password(str(password).strip())
         else:
-            user.set_password("Password@123")
+            # Never a shared default: the user sets their own via the invite.
+            user.set_unusable_password()
 
         if not user.status or user.status == "Invited":
             user.status = "Active"
         user.is_active = True
         user.save()
+        send_invite_on_commit(user)
         return user
 
     def update(self, instance, validated_data):
@@ -367,6 +370,8 @@ class RoleSerializer(BaseModelSerializer):
             "permissions", "selectedPermissions", "created_at", "updated_at",
         ]
         read_only_fields = ["is_system", "created_at", "updated_at"]
+        # The Roles screen asks for a name only; the code is derived from it.
+        extra_kwargs = {"code": {"required": False}}
 
     def get_userCount(self, role):
         cached = getattr(role, "user_count", None)
@@ -388,7 +393,32 @@ class RoleSerializer(BaseModelSerializer):
             raise serializers.ValidationError("A role with this code already exists.")
         return value
 
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        if self.instance is None and not (attrs.get("code") or "").strip():
+            attrs["code"] = self._derive_code(attrs.get("name") or "")
+        return attrs
+
+    def _derive_code(self, name):
+        """Initials of the name ("Regional Sales Lead" -> "RSL"), made unique."""
+        words = [w for w in "".join(c if c.isalnum() else " " for c in name).split() if w]
+        if len(words) > 1:
+            base = "".join(w[0] for w in words[:4]).upper()
+        else:
+            base = (words[0][:3] if words else "ROLE").upper()
+        taken = set(
+            Role.objects.filter(
+                client_id=self.context.get("client_id"), deleted_at__isnull=True
+            ).values_list("code", flat=True)
+        )
+        code, suffix = base, 1
+        while code in taken:
+            suffix += 1
+            code = f"{base}{suffix}"
+        return code
+
     def _apply_permissions(self, role, permission_ids):
+        permission_ids = list(dict.fromkeys(permission_ids))
         known = set(Permission.objects.values_list("id", flat=True))
         unknown = [p for p in permission_ids if p not in known]
         if unknown:

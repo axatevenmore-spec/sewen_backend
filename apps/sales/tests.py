@@ -540,3 +540,460 @@ class SalesPipelineLinkTests(TestCase):
         })
         self.assertEqual(challan["salesOrder"], order["id"])
         self.assertEqual(challan["vehicleNumber"], "GJ05AB1234")
+
+
+class QuotationFirstSalesTests(TestCase):
+    """Quotation-first sales: Inventory is optional.
+
+    Customer -> Quotation -> Customer Approval -> Sales Order -> Delivery ->
+    Invoice -> Payment-In, with inventory, service, fabrication, custom and
+    free-text lines -- and never a fake inventory item for a custom line.
+    """
+
+    API = "/api/v1/sales"
+
+    def setUp(self):
+        from apps.masters.models import Item
+
+        self.client_obj, _ = Client.objects.get_or_create(
+            slug="quote-first-tenant", defaults={"name": "Quote First Tenant"}
+        )
+        seed_chart_of_accounts(self.client_obj)
+        self.user = User.objects.create_superuser(
+            email="quote_first@example.com", password="password123", client=self.client_obj,
+        )
+        self.party = Party.objects.create(
+            client=self.client_obj, code="CUST-QF", type="Customer", name="Fab Buyer Ltd",
+            billing_address={"line1": "Plot 7", "city": "Surat", "state": "Gujarat"},
+            shipping_address={"line1": "Site B", "city": "Vapi", "state": "Gujarat"},
+        )
+        self.panel = Item.objects.create(
+            client=self.client_obj, sku="SS-PANEL", name="SS Panel", uom="Nos",
+            hsn_code="7326", selling_price=Decimal("5000"), cost_price=Decimal("3000"),
+        )
+        self.api = APIClient()
+        self.api.credentials(HTTP_AUTHORIZATION=f"Bearer {build_tokens(self.user)['access']}")
+
+    # -- helpers --------------------------------------------------------------
+    def _post(self, url, data=None, expected=201):
+        resp = self.api.post(url, data or {}, format="json")
+        self.assertEqual(resp.status_code, expected, resp.content)
+        return resp.json()
+
+    def _warehouse_with_stock(self, qty=100):
+        from apps.inventory import services as stock
+        from apps.masters.models import Location
+
+        location = Location.objects.create(
+            client=self.client_obj, code="WH-QF", name="Main Warehouse",
+            type="Warehouse", is_active=True,
+        )
+        stock.post_movement(
+            client_id=self.client_obj.id, item=self.panel.id, location=location.id,
+            type="ADJUSTMENT", quantity=Decimal(qty), unit_cost=Decimal("3000"),
+            notes="Opening stock", user=self.user,
+        )
+        return location
+
+    def _on_hand(self):
+        from apps.inventory.models import StockBalance
+
+        return sum(
+            (b.on_hand for b in StockBalance.objects.filter(item=self.panel)), Decimal("0")
+        )
+
+    def _inventory_line(self, qty=10):
+        return {"itemId": str(self.panel.id), "qty": qty, "rate": 5000, "tax": 18}
+
+    def _custom_line(self):
+        return {
+            "description": "Custom MS Fabrication Work", "qty": 1, "uom": "Job",
+            "hsnCode": "998873", "rate": 85000, "tax": 18,
+        }
+
+    def _quotation(self, lines, **extra):
+        return self._post(f"{self.API}/quotations/", {
+            "partyId": str(self.party.id), "date": str(date.today()),
+            "validUntil": str(date.today()), "lineItems": lines, **extra,
+        })
+
+    # -- 1-5: quotation lines -------------------------------------------------
+    def test_inventory_quotation(self):
+        quote = self._quotation([self._inventory_line()])
+        line = quote["lineItems"][0]
+        self.assertEqual(line["itemId"], str(self.panel.id))
+        self.assertEqual(line["itemName"], "SS Panel")
+        self.assertEqual(line["uom"], "Nos")
+        self.assertEqual(Decimal(str(quote["subtotal"])), Decimal("50000.00"))
+
+    def test_non_inventory_custom_quotation_creates_no_item(self):
+        from apps.masters.models import Item
+
+        before = Item.objects.filter(client=self.client_obj).count()
+        quote = self._quotation([self._custom_line()])
+        line = quote["lineItems"][0]
+        self.assertIsNone(line["itemId"])
+        self.assertEqual(line["description"], "Custom MS Fabrication Work")
+        self.assertEqual(line["itemName"], "Custom MS Fabrication Work")
+        self.assertEqual(line["uom"], "Job")
+        self.assertEqual(line["hsnCode"], "998873")
+        self.assertEqual(Decimal(str(quote["total"])), Decimal("100300.00"))
+        # Never a fake inventory product for a custom line.
+        self.assertEqual(Item.objects.filter(client=self.client_obj).count(), before)
+
+    def test_service_and_free_text_lines(self):
+        quote = self._quotation([
+            {"description": "Installation & commissioning (service)", "qty": 2, "uom": "Day",
+             "rate": 7500, "tax": 18},
+            {"itemName": "Transport charges", "qty": 1, "rate": 2000, "tax": 0},
+        ])
+        first, second = quote["lineItems"]
+        self.assertIsNone(first["itemId"])
+        self.assertEqual(second["description"], "Transport charges")
+        self.assertEqual(Decimal(str(quote["total"])), Decimal("19700.00"))
+
+    def test_line_without_item_or_description_is_refused(self):
+        resp = self.api.post(f"{self.API}/quotations/", {
+            "partyId": str(self.party.id), "date": str(date.today()),
+            "lineItems": [{"qty": 1, "rate": 100}],
+        }, format="json")
+        self.assertEqual(resp.status_code, 400, resp.content)
+
+    def test_mixed_quotation_with_discount_and_tax(self):
+        quote = self._quotation(
+            [
+                {**self._inventory_line(), "discount": 10},
+                {**self._custom_line(), "tax": 12},
+            ],
+            referenceNumber="ENQ-42", salesperson="R. Shah",
+            paymentTerms="50% advance", deliveryTerms="Ex-works, 3 weeks",
+            notes="Prices valid for this order only", terms="Subject to Surat jurisdiction",
+            authorizedPerson="A. Patel",
+        )
+        # 10 x 5000 = 50000, -10% = 45000, +18% = 8100 -> 53100
+        # 1 x 85000, +12% = 10200 -> 95200
+        self.assertEqual(Decimal(str(quote["subtotal"])), Decimal("135000.00"))
+        self.assertEqual(Decimal(str(quote["totalDiscount"])), Decimal("5000.00"))
+        self.assertEqual(Decimal(str(quote["taxableValue"])), Decimal("130000.00"))
+        self.assertEqual(Decimal(str(quote["totalTax"])), Decimal("18300.00"))
+        self.assertEqual(Decimal(str(quote["total"])), Decimal("148300.00"))
+        # No company state configured -> intra-state default: CGST + SGST.
+        self.assertEqual(
+            Decimal(str(quote["cgst"])) + Decimal(str(quote["sgst"])), Decimal("18300.00")
+        )
+        for key, value in {
+            "referenceNumber": "ENQ-42", "salesperson": "R. Shah",
+            "paymentTerms": "50% advance", "deliveryTerms": "Ex-works, 3 weeks",
+            "notes": "Prices valid for this order only",
+            "terms": "Subject to Surat jurisdiction", "authorizedPerson": "A. Patel",
+        }.items():
+            self.assertEqual(quote[key], value, key)
+        self.assertEqual(quote["shippingAddress"]["city"], "Vapi")
+
+    # -- 6: PDF payload ---------------------------------------------------------
+    def test_print_payload_carries_letterhead_lines_and_terms(self):
+        from apps.core.models import CompanyProfile
+
+        CompanyProfile.objects.update_or_create(
+            client=self.client_obj,
+            defaults={"legal_name": "SEWEN Engineering", "trade_name": "SEWEN", "gstin": "24ABCDE1234F1Z5"},
+        )
+        quote = self._quotation(
+            [self._inventory_line(), self._custom_line()],
+            paymentTerms="50% advance", authorizedPerson="A. Patel",
+        )
+        resp = self.api.get(f"{self.API}/quotations/{quote['id']}/print/")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        body = resp.json()
+        self.assertEqual(body["company"]["tradeName"], "SEWEN")
+        self.assertEqual(body["title"], "Quotation")
+        self.assertEqual(len(body["document"]["lineItems"]), 2)
+        self.assertEqual(body["document"]["paymentTerms"], "50% advance")
+        self.assertEqual(body["document"]["authorizedPerson"], "A. Patel")
+        self.assertEqual(Decimal(str(body["totals"]["grandTotal"])), Decimal(str(quote["total"])))
+
+    # -- approval + 7: quotation -> sales order ---------------------------------
+    def test_approval_then_conversion_preserves_lines_and_links(self):
+        quote = self._quotation(
+            [self._inventory_line(), self._custom_line()], referenceNumber="PO-778",
+        )
+        accepted = self._post(f"{self.API}/quotations/{quote['id']}/accept/", expected=200)
+        self.assertEqual(accepted["status"], "Accepted")
+        # Approval is recorded once; a second accept is refused.
+        self._post(f"{self.API}/quotations/{quote['id']}/accept/", expected=409)
+
+        order = self._post(f"{self.API}/quotations/{quote['id']}/convert-to-order/")
+        self.assertEqual(order["quotation"], quote["id"])
+        self.assertEqual(order["quotationNumber"], quote["quotationNumber"])
+        self.assertEqual(order["referenceNumber"], "PO-778")
+        self.assertEqual(Decimal(str(order["total"])), Decimal(str(quote["total"])))
+        inv_line, custom_line = order["lineItems"]
+        self.assertEqual(inv_line["itemId"], str(self.panel.id))
+        self.assertIsNone(custom_line["itemId"])
+        self.assertEqual(custom_line["description"], "Custom MS Fabrication Work")
+        self.assertEqual(custom_line["uom"], "Job")
+
+        quote_after = self.api.get(f"{self.API}/quotations/{quote['id']}/").json()
+        self.assertEqual(quote_after["status"], "Converted")
+        self.assertEqual(quote_after["salesOrders"][0]["id"], order["id"])
+        # Converting twice is refused -- no second order from one quotation.
+        self._post(f"{self.API}/quotations/{quote['id']}/convert-to-order/", expected=409)
+
+    def test_rejected_or_cancelled_quotation_cannot_convert(self):
+        rejected = self._quotation([self._custom_line()])
+        self._post(f"{self.API}/quotations/{rejected['id']}/reject/", {"reason": "Too costly"}, expected=200)
+        self._post(f"{self.API}/quotations/{rejected['id']}/convert-to-order/", expected=409)
+
+        cancelled = self._quotation([self._custom_line()])
+        body = self._post(
+            f"{self.API}/quotations/{cancelled['id']}/cancel/", {"reason": "Duplicate"}, expected=200
+        )
+        self.assertEqual(body["status"], "Cancelled")
+        self.assertEqual(body["cancellationReason"], "Duplicate")
+        self._post(f"{self.API}/quotations/{cancelled['id']}/convert-to-order/", expected=409)
+
+    # -- 8, 9: sales order -> invoice without inventory -------------------------
+    def test_custom_only_flow_needs_no_warehouse(self):
+        from apps.inventory.models import StockMovement
+        from apps.masters.models import Location
+
+        self.assertFalse(Location.objects.filter(client=self.client_obj).exists())
+        quote = self._quotation([self._custom_line()])
+        order = self._post(f"{self.API}/quotations/{quote['id']}/convert-to-order/")
+
+        # Completion / delivery is optional, and a challan of custom lines needs no warehouse.
+        challan = self._post(f"{self.API}/orders/{order['id']}/convert-to-challan/", {})
+        self._post(f"{self.API}/challans/{challan['id']}/dispatch/", expected=200)
+
+        invoice = self._post(f"{self.API}/orders/{order['id']}/convert-to-invoice/", {})
+        self.assertEqual(invoice["salesOrderId"], order["id"])
+        self.assertEqual(invoice["quotationId"], quote["id"])
+        self.assertIsNone(invoice["lineItems"][0]["itemId"])
+        final = self._post(f"{self.API}/invoices/{invoice['id']}/finalize/", expected=200)
+        self.assertEqual(final["status"], "Unpaid")
+        self.assertEqual(Decimal(str(final["total"])), Decimal("100300.00"))
+        self.assertFalse(StockMovement.objects.filter(client=self.client_obj).exists())
+
+        order_after = self.api.get(f"{self.API}/orders/{order['id']}/").json()
+        self.assertEqual(order_after["stage"], "Invoiced")
+
+    def test_direct_custom_invoice(self):
+        invoice = self._post(f"{self.API}/invoices/", {
+            "partyId": str(self.party.id), "date": str(date.today()),
+            "lineItems": [self._custom_line()],
+        })
+        final = self._post(f"{self.API}/invoices/{invoice['id']}/finalize/", expected=200)
+        self.assertTrue(final["invoiceNumber"])
+        self.assertEqual(Decimal(str(final["totalTax"])), Decimal("15300.00"))
+
+    # -- 15: existing inventory sales ------------------------------------------
+    def test_mixed_invoice_moves_stock_for_inventory_lines_only(self):
+        self._warehouse_with_stock(100)
+        quote = self._quotation([self._inventory_line(10), self._custom_line()])
+        order = self._post(f"{self.API}/quotations/{quote['id']}/convert-to-order/")
+        invoice = self._post(f"{self.API}/orders/{order['id']}/convert-to-invoice/", {})
+        self._post(f"{self.API}/invoices/{invoice['id']}/finalize/", expected=200)
+        self.assertEqual(self._on_hand(), Decimal("90"))
+
+    def test_inventory_sale_via_challan_is_not_double_depleted(self):
+        self._warehouse_with_stock(100)
+        quote = self._quotation([self._inventory_line(4)])
+        order = self._post(f"{self.API}/quotations/{quote['id']}/convert-to-order/")
+        challan = self._post(f"{self.API}/orders/{order['id']}/convert-to-challan/", {})
+        self._post(f"{self.API}/challans/{challan['id']}/dispatch/", expected=200)
+        self.assertEqual(self._on_hand(), Decimal("96"))
+        invoice = self._post(f"{self.API}/orders/{order['id']}/convert-to-invoice/", {})
+        self._post(f"{self.API}/invoices/{invoice['id']}/finalize/", expected=200)
+        self.assertEqual(self._on_hand(), Decimal("96"))
+
+    def test_inventory_line_still_needs_a_warehouse(self):
+        quote = self._quotation([self._inventory_line(1)])
+        order = self._post(f"{self.API}/quotations/{quote['id']}/convert-to-order/")
+        invoice = self._post(f"{self.API}/orders/{order['id']}/convert-to-invoice/", {})
+        resp = self.api.post(f"{self.API}/invoices/{invoice['id']}/finalize/", {}, format="json")
+        self.assertEqual(resp.status_code, 422, resp.content)
+        self.assertEqual(resp.json()["code"], "NO_LOCATION")
+
+    # -- 10-13: payments and history -------------------------------------------
+    def _finalized_custom_invoice(self):
+        quote = self._quotation([self._custom_line()])
+        order = self._post(f"{self.API}/quotations/{quote['id']}/convert-to-order/")
+        invoice = self._post(f"{self.API}/orders/{order['id']}/convert-to-invoice/", {})
+        self._post(f"{self.API}/invoices/{invoice['id']}/finalize/", expected=200)
+        return quote, order, invoice
+
+    def test_with_bill_and_cash_payments_keep_gst_invoice_value(self):
+        from apps.accounting.models import Account, BankAccount
+
+        bank = BankAccount.objects.create(
+            client=self.client_obj, name="HDFC Current", type="Bank",
+            account=Account.objects.get(client=self.client_obj, code="1300"),
+        )
+        quote, order, invoice = self._finalized_custom_invoice()
+        before = self.api.get(f"{self.API}/invoices/{invoice['id']}/").json()
+
+        with_bill = self._post(f"{self.API}/payments/", {
+            "customerId": str(self.party.id), "date": str(date.today()),
+            "amount": 50000, "mode": "Bank", "paymentType": "WITH_BILL",
+            "bankAccountId": str(bank.id), "invoiceId": invoice["id"],
+        })
+        self.assertEqual(with_bill["paymentType"], "WITH_BILL")
+
+        cash = self._post(f"{self.API}/payments/", {
+            "customerId": str(self.party.id), "date": str(date.today()),
+            "amount": 10000, "mode": "Cash", "paymentType": "WITHOUT_BILL",
+            "invoiceId": invoice["id"],
+        })
+        self.assertEqual(cash["paymentType"], "WITHOUT_BILL")
+        self.assertIsNotNone(cash["cashReceipt"])
+
+        after = self.api.get(f"{self.API}/invoices/{invoice['id']}/").json()
+        # The GST invoice's value and tax never move with a payment.
+        for key in ("subtotal", "taxableValue", "totalTax", "cgst", "sgst", "igst", "total"):
+            self.assertEqual(after[key], before[key], key)
+        # Only the with-bill payment settles the invoice; cash stays separate.
+        self.assertEqual(Decimal(str(after["amountPaid"])), Decimal("50000.00"))
+        self.assertEqual(after["status"], "Partially Paid")
+        outstanding = self.api.get(f"{self.API}/invoices/{invoice['id']}/outstanding/").json()
+        self.assertEqual(Decimal(str(outstanding["withoutBillCash"])), Decimal("10000.00"))
+        self.assertEqual(Decimal(str(outstanding["outstanding"])), Decimal("50300.00"))
+
+        # Customer history: Quotation -> Sales Order -> Invoice -> Payment.
+        self.assertEqual(after["salesOrderNumber"], order["orderNumber"])
+        self.assertEqual(after["quotationNumber"], quote["quotationNumber"])
+        payments = self.api.get(f"{self.API}/payments/?customerId={self.party.id}").json()
+        numbers = {row["invoiceNumber"] for row in payments["results"]}
+        self.assertEqual(numbers, {after["invoiceNumber"]})
+        for doc in ("quotations", "orders", "invoices"):
+            rows = self.api.get(f"{self.API}/{doc}/?customerId={self.party.id}").json()["results"]
+            self.assertTrue(rows, doc)
+            self.assertTrue(all(row["partyId"] == str(self.party.id) for row in rows), doc)
+
+    # -- 14: permissions -------------------------------------------------------
+    def test_quotation_writes_need_create_quotation(self):
+        from apps.accounts.models import Role, RolePermission
+        from apps.accounts.permission_catalogue import sync_permissions
+
+        sync_permissions()
+        role = Role.objects.create(client=self.client_obj, code="VIEWER", name="Viewer")
+        RolePermission.objects.create(role=role, permission_id="view_sales")
+        viewer = User.objects.create_user(
+            email="viewer_qf@example.com", password="pass-12345",
+            client=self.client_obj, name="viewer", role=role,
+        )
+        quote = self._quotation([self._custom_line()])
+        api = APIClient()
+        api.credentials(HTTP_AUTHORIZATION=f"Bearer {build_tokens(viewer)['access']}")
+        self.assertEqual(api.get(f"{self.API}/quotations/{quote['id']}/").status_code, 200)
+        for verb in ("accept", "reject", "cancel", "convert-to-order"):
+            resp = api.post(f"{self.API}/quotations/{quote['id']}/{verb}/", {}, format="json")
+            self.assertEqual(resp.status_code, 403, verb)
+        resp = api.post(f"{self.API}/quotations/", {
+            "partyId": str(self.party.id), "date": str(date.today()),
+            "lineItems": [self._custom_line()],
+        }, format="json")
+        self.assertEqual(resp.status_code, 403)
+
+    # -- 16: edit / cancel ------------------------------------------------------
+    def test_edit_draft_then_cancel_downstream(self):
+        quote = self._quotation([self._custom_line()])
+        resp = self.api.patch(f"{self.API}/quotations/{quote['id']}/", {
+            "paymentTerms": "100% advance",
+            "lineItems": [self._custom_line(), {"description": "Painting", "qty": 1, "rate": 5000, "tax": 18}],
+        }, format="json")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        edited = resp.json()
+        self.assertEqual(edited["paymentTerms"], "100% advance")
+        self.assertEqual(len(edited["lineItems"]), 2)
+        self.assertEqual(Decimal(str(edited["total"])), Decimal("106200.00"))
+
+        order = self._post(f"{self.API}/quotations/{quote['id']}/convert-to-order/")
+        invoice = self._post(f"{self.API}/orders/{order['id']}/convert-to-invoice/", {})
+        self._post(f"{self.API}/invoices/{invoice['id']}/finalize/", expected=200)
+        # An order with a live invoice cannot be cancelled...
+        self._post(f"{self.API}/orders/{order['id']}/cancel/", {"reason": "x"}, expected=409)
+        # ...until the invoice is cancelled first.
+        cancelled = self._post(f"{self.API}/invoices/{invoice['id']}/cancel/", {"reason": "Wrong rate"}, expected=200)
+        self.assertEqual(cancelled["status"], "Cancelled")
+        order_cancel = self._post(f"{self.API}/orders/{order['id']}/cancel/", {"reason": "Customer withdrew"}, expected=200)
+        self.assertEqual(order_cancel["stage"], "Cancelled")
+
+    # -- metal-industry line detail ----------------------------------------------
+    def test_metal_line_detail_travels_quotation_to_invoice(self):
+        fabrication = {
+            **self._custom_line(), "lineKind": "Fabrication", "materialGrade": "MS IS 2062",
+            "specification": "1800x900x750 mm, 40x40 pipe, powder coated", "unitWeight": 45.5,
+        }
+        spare = {**self._inventory_line(2), "lineKind": "Spare Part"}
+        quote = self._quotation([fabrication, spare])
+        self.assertEqual(quote["lineItems"][0]["materialGrade"], "MS IS 2062")
+        self.assertEqual(Decimal(str(quote["lineItems"][0]["unitWeight"])), Decimal("45.5"))
+
+        order = self._post(f"{self.API}/quotations/{quote['id']}/convert-to-order/")
+        challan = self._post(f"{self.API}/orders/{order['id']}/convert-to-challan/", {
+            "lines": [{"lineId": order["lineItems"][0]["id"], "qty": 1}],
+        })
+        invoice = self._post(f"{self.API}/orders/{order['id']}/convert-to-invoice/", {})
+        from_challan = self._post(f"{self.API}/challans/{challan['id']}/convert-to-invoice/")
+        for doc in (order, challan, invoice, from_challan):
+            line = doc["lineItems"][0]
+            self.assertEqual(line["lineKind"], "Fabrication")
+            self.assertEqual(line["materialGrade"], "MS IS 2062")
+            self.assertEqual(line["specification"], "1800x900x750 mm, 40x40 pipe, powder coated")
+            self.assertEqual(Decimal(str(line["unitWeight"])), Decimal("45.5"))
+        self.assertEqual(order["lineItems"][1]["lineKind"], "Spare Part")
+
+    def test_unknown_line_kind_is_refused(self):
+        resp = self.api.post(f"{self.API}/quotations/", {
+            "partyId": str(self.party.id), "date": str(date.today()),
+            "lineItems": [{**self._custom_line(), "lineKind": "Banana"}],
+        }, format="json")
+        self.assertEqual(resp.status_code, 400, resp.content)
+
+    # -- sheet-metal calculator + weighbridge -----------------------------------
+    def _sheet_line(self):
+        # SS 304 sheet 1.5 x 1250 x 2500 mm: 1.5*1250*2500*7.93/1e6 = 37.172 kg/pc, 10 pcs, billed by kg.
+        return {
+            "description": "SS 304 Sheet 2B", "lineKind": "Sheet Metal",
+            "materialGrade": "SS 304", "specification": "Sheet · 2B · 1.5 x 1250 x 2500 mm · 10 pcs",
+            "qty": 371.72, "uom": "Kg", "rate": 245, "tax": 18, "hsnCode": "7219",
+            "sheetSpec": {
+                "material": "SS 304", "form": "Sheet", "finish": "2B", "thicknessMm": 1.5,
+                "widthMm": 1250, "lengthMm": 2500, "pieces": 10, "weightPerPiece": 37.172, "basis": "kg",
+            },
+        }
+
+    def test_sheet_spec_travels_and_bills_by_weight(self):
+        quote = self._quotation([self._sheet_line()])
+        line = quote["lineItems"][0]
+        self.assertEqual(line["sheetSpec"]["pieces"], 10)
+        self.assertEqual(line["sheetSpec"]["basis"], "kg")
+        self.assertEqual(line["lineKind"], "Sheet Metal")
+        # Billed per kg: 371.72 kg x 245 = 91071.40, +18% GST.
+        self.assertEqual(Decimal(str(quote["subtotal"])), Decimal("91071.40"))
+        order = self._post(f"{self.API}/quotations/{quote['id']}/convert-to-order/")
+        invoice = self._post(f"{self.API}/orders/{order['id']}/convert-to-invoice/", {})
+        self.assertEqual(invoice["lineItems"][0]["sheetSpec"]["thicknessMm"], 1.5)
+        self.assertEqual(invoice["lineItems"][0]["uom"], "Kg")
+
+    def test_bad_sheet_spec_is_refused(self):
+        for spec in ({"basis": "tonne"}, {"thicknessMm": -1}, "sheet"):
+            resp = self.api.post(f"{self.API}/quotations/", {
+                "partyId": str(self.party.id), "date": str(date.today()),
+                "lineItems": [{**self._sheet_line(), "sheetSpec": spec}],
+            }, format="json")
+            self.assertEqual(resp.status_code, 400, (spec, resp.content))
+
+    def test_challan_weighbridge_net_weight(self):
+        quote = self._quotation([self._sheet_line()])
+        order = self._post(f"{self.API}/quotations/{quote['id']}/convert-to-order/")
+        challan = self._post(f"{self.API}/orders/{order['id']}/convert-to-challan/", {})
+        resp = self.api.patch(f"{self.API}/challans/{challan['id']}/", {
+            "weighbridgeSlip": "WB-5521", "grossWeight": 8420.5, "tareWeight": 8045,
+        }, format="json")
+        self.assertEqual(resp.status_code, 200, resp.content)
+        body = resp.json()
+        self.assertEqual(body["weighbridgeSlip"], "WB-5521")
+        self.assertEqual(Decimal(str(body["netWeight"])), Decimal("375.500"))
+        resp = self.api.patch(f"{self.API}/challans/{challan['id']}/", {"tareWeight": 9000}, format="json")
+        self.assertEqual(resp.status_code, 400, resp.content)

@@ -592,7 +592,7 @@ class MainDashboardView(APIView):
         )
 
         return Response(
-            {
+            self._for_caller(request.user, {
                 "sales": {
                     "monthToDate": round2(sales_month["value"]),
                     "invoiceCount": sales_month["count"],
@@ -647,5 +647,33 @@ class MainDashboardView(APIView):
                     }
                     for row in recent_orders
                 ],
-            }
+            })
         )
+
+    @staticmethod
+    def _for_caller(user, body):
+        """Blank every block the caller's role does not cover.
+
+        The keys stay (the page contract is fixed), but an HR or store login
+        must not read sales totals, bank balances or customers' invoices off
+        the dashboard when the module endpoints themselves would refuse them.
+        """
+        def can(*ids):
+            return any(has_permission(user, permission_id) for permission_id in ids)
+
+        if not can("view_sales"):
+            body["sales"] = {"monthToDate": 0, "invoiceCount": 0, "openOrders": 0, "monthly": []}
+            body["recentDocuments"] = []
+        if not can("view_purchase"):
+            body["purchase"] = {"monthToDate": 0, "billCount": 0, "openOrders": 0, "awaitingReceipt": 0}
+        if not can("view_sales", "view_ledger"):
+            body["cash"]["receivable"] = 0
+        if not can("view_purchase", "view_ledger"):
+            body["cash"]["payable"] = 0
+        if not can("view_bank_accounts"):
+            body["cash"]["bankAccounts"] = []
+        if not can("view_inventory"):
+            body["inventoryAlerts"] = []
+        if not can("view_lead"):
+            body["crm"] = {"openLeads": 0}
+        return body
