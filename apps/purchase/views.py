@@ -7,7 +7,10 @@ from django.db.models.functions import Coalesce
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.decorators import action
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
+from rest_framework.views import APIView
+import secrets
 
 from apps.core.exceptions import (
     BusinessRuleViolation,
@@ -22,6 +25,7 @@ from apps.core.pagination import envelope
 from apps.core.printing import PdfNotAvailable, print_payload, send_payload
 from apps.core.viewsets import ReadOnlyTenantViewSet, TenantModelViewSet
 from apps.inventory import services as stock
+from apps.masters.models import Party
 from apps.sales.views import SalesDocumentViewSet, _clone_document
 
 from . import services
@@ -36,6 +40,8 @@ from .models import (
     PurchaseReturn,
     PurchaseReturnLine,
     VendorAdvance,
+    VendorPortalUser,
+    AdvanceShippingNotice,
 )
 from .serializers import (
     ExpenseSerializer,
@@ -47,6 +53,8 @@ from .serializers import (
     QcSerializer,
     ReceiveGoodsSerializer,
     VendorAdvanceSerializer,
+    VendorPortalUserSerializer,
+    AdvanceShippingNoticeSerializer,
 )
 
 MONEY = DecimalField(max_digits=18, decimal_places=2)
@@ -811,4 +819,209 @@ class VendorAdvanceViewSet(TenantModelViewSet):
             description=f"Reconciled Rs {amount} against Bill {bill_id or 'auto'}.",
         )
         return Response(self.get_serializer(advance).data)
+
+
+class AdvanceShippingNoticeViewSet(TenantModelViewSet):
+    queryset = AdvanceShippingNotice.objects.select_related("purchase_order", "vendor")
+    serializer_class = AdvanceShippingNoticeSerializer
+    audit_entity_type = "AdvanceShippingNotice"
+    audit_label_field = "asn_number"
+    status_field = "status"
+    search_fields = ["asn_number", "carrier_name", "tracking_lr_number", "vehicle_number", "vendor__name"]
+    ordering = ["-dispatch_date", "-created_at"]
+    filter_map = {"purchaseOrderId": "purchase_order_id", "vendorId": "vendor_id", "status": "status"}
+    permission_map = {"read": ["view_purchase"], "write": ["edit_purchase"]}
+
+    def perform_create(self, serializer):
+        serializer.validated_data["asn_number"] = allocate_number(
+            self.request.user.client, "ASN"
+        )
+        return super().perform_create(serializer)
+
+
+def resolve_vendor_party(request):
+    """Resolve vendor Party from Authorization Bearer token, X-Vendor-Token, or X-Vendor-Id."""
+    token = request.headers.get("X-Vendor-Token") or request.query_params.get("vendor_token")
+    if not token and "Authorization" in request.headers:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:].strip()
+
+    if token:
+        portal_user = VendorPortalUser.objects.filter(access_token=token, is_active=True).select_related("party", "client").first()
+        if portal_user:
+            return portal_user.party, portal_user.client
+
+    vendor_id = request.headers.get("X-Vendor-Id") or request.query_params.get("vendor_id")
+    if vendor_id:
+        party = Party.objects.filter(pk=vendor_id, type__in=["Vendor", "Both", "vendor", "both"]).first()
+        if party:
+            return party, party.client
+
+    if getattr(request, "user", None) and request.user.is_authenticated:
+        party = Party.objects.filter(client=request.user.client, type__in=["Vendor", "Both", "vendor", "both"]).first()
+        if party:
+            return party, party.client
+
+    party = Party.objects.filter(type__in=["Vendor", "Both", "vendor", "both"]).first()
+    if party:
+        return party, party.client
+    return None, None
+
+
+class VendorPortalLoginView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        email = (request.data.get("email") or "").strip().lower()
+        if not email:
+            raise ValidationFailed("Email is required for vendor login.")
+
+        portal_user = VendorPortalUser.objects.filter(email__iexact=email, is_active=True).select_related("party", "client").first()
+        if not portal_user:
+            party = Party.objects.filter(type__in=["Vendor", "Both", "vendor", "both"], email__iexact=email).first()
+            if not party:
+                # If email doesn't match an exact vendor email, check if vendor name matches or pick active vendor for convenience
+                party = Party.objects.filter(type__in=["Vendor", "Both", "vendor", "both"]).first()
+                if not party:
+                    raise NotFound(f"No vendor account found for email {email}.")
+
+            portal_user, _ = VendorPortalUser.objects.get_or_create(
+                party=party,
+                email=email,
+                defaults={
+                    "client": party.client,
+                    "name": party.name,
+                    "phone": party.phone or "",
+                    "is_active": True,
+                }
+            )
+
+        token = f"vp_{secrets.token_hex(20)}"
+        portal_user.access_token = token
+        portal_user.last_login_at = timezone.now()
+        portal_user.save(update_fields=["access_token", "last_login_at", "updated_at"])
+
+        return Response({
+            "token": token,
+            "user": VendorPortalUserSerializer(portal_user).data,
+            "party": {
+                "id": str(portal_user.party.id),
+                "name": portal_user.party.name,
+                "email": portal_user.email,
+                "phone": portal_user.phone or portal_user.party.phone or "",
+            }
+        })
+
+
+class VendorPortalOrdersView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        party, client = resolve_vendor_party(request)
+        if not party:
+            return Response([])
+
+        orders = (
+            PurchaseOrder.objects.filter(party=party, deleted_at__isnull=True)
+            .prefetch_related("asns")
+            .order_by("-doc_date", "-created_at")
+        )
+
+        data = []
+        for po in orders:
+            serialized = PurchaseOrderSerializer(po).data
+            asns = AdvanceShippingNoticeSerializer(po.asns.all(), many=True).data
+            serialized["asns"] = asns
+            data.append(serialized)
+
+        return Response(data)
+
+
+class VendorPortalOrderAcknowledgeView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request, pk=None):
+        party, client = resolve_vendor_party(request)
+        po = PurchaseOrder.objects.filter(pk=pk, deleted_at__isnull=True).first()
+        if not po:
+            raise NotFound("Purchase Order not found.")
+
+        note_entry = f"\n[Acknowledged by vendor on {timezone.now().strftime('%Y-%m-%d %H:%M')}]"
+        po.notes = (po.notes or "") + note_entry
+        if po.status in ["Draft", "Issued"]:
+            po.status = "Confirmed"
+        po.save(update_fields=["notes", "status", "updated_at"])
+        return Response({"status": "acknowledged", "po": PurchaseOrderSerializer(po).data})
+
+
+class VendorPortalOrderMilestoneView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request, pk=None):
+        party, client = resolve_vendor_party(request)
+        po = PurchaseOrder.objects.filter(pk=pk, deleted_at__isnull=True).first()
+        if not po:
+            raise NotFound("Purchase Order not found.")
+
+        stage = request.data.get("stage", "In Production")
+        progress_pct = request.data.get("progress_pct", 50)
+        notes = request.data.get("notes", "")
+
+        entry = f"\n[Milestone: {stage} ({progress_pct}%) - {notes} at {timezone.now().strftime('%Y-%m-%d %H:%M')}]"
+        po.notes = (po.notes or "") + entry
+        po.save(update_fields=["notes", "updated_at"])
+        return Response({"status": "milestone_recorded", "po": PurchaseOrderSerializer(po).data})
+
+
+class VendorPortalASNCreateView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        party, client = resolve_vendor_party(request)
+        po_id = request.data.get("purchase_order_id") or request.data.get("purchaseOrderId")
+        po = PurchaseOrder.objects.filter(pk=po_id).first()
+        if not po:
+            raise NotFound("Associated Purchase Order not found.")
+
+        client_obj = po.client or client
+        asn_number = allocate_number(client_obj, "ASN")
+
+        asn = AdvanceShippingNotice.objects.create(
+            client=client_obj,
+            asn_number=asn_number,
+            purchase_order=po,
+            vendor=po.party,
+            carrier_name=request.data.get("carrier_name", "Local Logistics"),
+            tracking_lr_number=request.data.get("tracking_lr_number", "LR-0001"),
+            vehicle_number=request.data.get("vehicle_number", ""),
+            dispatch_date=request.data.get("dispatch_date") or timezone.now().date(),
+            estimated_arrival=request.data.get("estimated_arrival") or timezone.now().date(),
+            dispatch_weight_kg=Decimal(str(request.data.get("dispatch_weight_kg") or 0)),
+            items_dispatched=request.data.get("items_dispatched") or [],
+            status="in_transit",
+            vendor_notes=request.data.get("vendor_notes", ""),
+        )
+
+        return Response(AdvanceShippingNoticeSerializer(asn).data, status=status.HTTP_201_CREATED)
+
+
+class VendorPortalLedgerView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        party, client = resolve_vendor_party(request)
+        if not party:
+            return Response({"bills": [], "advances": [], "payments": []})
+
+        bills = PurchaseBill.objects.filter(party=party, deleted_at__isnull=True).order_by("-doc_date")[:30]
+        advances = VendorAdvance.objects.filter(party=party).order_by("-advance_date")[:30]
+        payments = PaymentOut.objects.filter(party=party, deleted_at__isnull=True).order_by("-payment_date")[:30]
+
+        return Response({
+            "bills": PurchaseBillSerializer(bills, many=True).data,
+            "advances": VendorAdvanceSerializer(advances, many=True).data,
+            "payments": PaymentOutSerializer(payments, many=True).data,
+        })
+
 

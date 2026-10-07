@@ -22,7 +22,8 @@ from . import services as stock
 from .models import (
     DemoUnit,
     FaultyPart,
-    QualityStandard,
+    # QualityInspection,  # Hidden: QC out of scope
+    # QualityStandard,  # Hidden: QC out of scope
     ReworkOrder,
     ScrapLog,
     ServiceUsage,
@@ -38,7 +39,8 @@ from .models import (
 from .serializers import (
     DemoUnitSerializer,
     FaultyPartSerializer,
-    QualityStandardSerializer,
+    # QualityInspectionSerializer,  # Hidden: QC out of scope
+    # QualityStandardSerializer,  # Hidden: QC out of scope
     ReworkOrderSerializer,
     ScrapLogSerializer,
     # ServiceUsageSerializer,  # Hidden: out of scope
@@ -695,15 +697,17 @@ class ValuationView(APIView):
         )
 
 
-class QualityStandardViewSet(TenantModelViewSet):
-    queryset = QualityStandard.objects.select_related("category")
-    serializer_class = QualityStandardSerializer
-    audit_entity_type = "QualityStandard"
-    audit_label_field = "name"
-    permission_map = {"read": ["view_purchase"], "write": ["approve_qc"]}
-    status_field = None
-    search_fields = ["name"]
-    ordering = ["name"]
+# Hidden: QC out of scope
+# class QualityStandardViewSet(TenantModelViewSet):
+#     queryset = QualityStandard.objects.select_related("category")
+#     serializer_class = QualityStandardSerializer
+#     audit_entity_type = "QualityStandard"
+#     audit_label_field = "name"
+#     permission_map = {"read": ["view_purchase"], "write": ["approve_qc"]}
+#     status_field = None
+#     search_fields = ["name"]
+#     ordering = ["name"]
+
 
 
 # ---------------------------------------------------------------------------
@@ -808,4 +812,62 @@ class ScrapLogViewSet(ReadOnlyTenantViewSet):
     required_permissions = ["view_inventory"]
     search_fields = ["scrap_number", "item__name", "scrap_reason"]
     ordering = ["-logged_at"]
+
+
+# Hidden: QC out of scope
+# class QualityInspectionViewSet(TenantModelViewSet):
+#     queryset = QualityInspection.objects.select_related("item", "goods_receipt", "inspector", "rework_order")
+#     serializer_class = QualityInspectionSerializer
+#     audit_entity_type = "QualityInspection"
+#     audit_label_field = "inspection_number"
+#     status_field = "status"
+#     search_fields = ["inspection_number", "item__name", "batch_lot_number", "inspector_notes"]
+#     ordering = ["-created_at"]
+#     filter_map = {"status": "status", "itemId": "item_id", "goodsReceiptId": "goods_receipt_id"}
+#     permission_map = {"read": ["view_inventory"], "write": ["edit_inventory"]}
+#
+#     def perform_create(self, serializer):
+#         serializer.validated_data["inspection_number"] = allocate_number(
+#             self.request.user.client, "QC"
+#         )
+#         if not serializer.validated_data.get("inspector"):
+#             serializer.validated_data["inspector"] = self.request.user
+#         return super().perform_create(serializer)
+#
+#     @action(detail=True, methods=["post"], url_path="complete-inspection")
+#     @transaction.atomic
+#     def complete_inspection(self, request, pk=None):
+#         inspection = self.get_object()
+#         status_val = request.data.get("status") or "passed"
+#         accepted_qty = Decimal(str(request.data.get("accepted_qty") or 0))
+#         rejected_qty = Decimal(str(request.data.get("rejected_qty") or 0))
+#         checklist = request.data.get("checklist_results") or []
+#         notes = request.data.get("inspector_notes") or ""
+#
+#         inspection.status = status_val
+#         inspection.accepted_qty = accepted_qty
+#         inspection.rejected_qty = rejected_qty
+#         inspection.checklist_results = checklist
+#         inspection.inspector_notes = notes
+#         inspection.inspector = request.user
+#         inspection.inspected_at = timezone.now()
+#
+#         # If rework was chosen and rejected_qty > 0, auto-link/create rework order
+#         if status_val == "rework" and rejected_qty > 0 and not inspection.rework_order:
+#             rwk_num = allocate_number(inspection.client, "RWK")
+#             rework = ReworkOrder.objects.create(
+#                 client=inspection.client,
+#                 rework_number=rwk_num,
+#                 item=inspection.item,
+#                 goods_receipt=inspection.goods_receipt,
+#                 quantity=rejected_qty,
+#                 defect_reason=notes or "Failed QC inspection tolerance checks",
+#                 status="Pending Inspection",
+#             )
+#             inspection.rework_order = rework
+#
+#         inspection.save()
+#         self.write_audit("complete_inspection", inspection, description=f"QC inspection {inspection.inspection_number} set to {status_val}.")
+#         return Response(self.get_serializer(inspection).data)
+
 

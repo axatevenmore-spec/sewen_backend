@@ -117,6 +117,7 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
         "export": ["view_lead", "export_excel"],
         "destroy": ["delete_lead"],
         "bulk_delete_action": ["delete_lead"],
+        "bulk_assign": ["edit_lead"],
         "write": ["edit_lead"],
     }
 
@@ -530,6 +531,129 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
         return Response(
             envelope(LeadSerializer(rows[:1000], many=True).data)
         )
+
+    @action(detail=False, methods=["post"], url_path="bulk-assign")
+    @transaction.atomic
+    def bulk_assign(self, request):
+        """Bulk assign/reallocate leads with single, round-robin, or capacity-weighted strategy."""
+        from apps.accounts.models import User
+        from apps.core.models import Notification, record_audit
+
+        lead_ids = request.data.get("leadIds") or request.data.get("lead_ids") or []
+        strategy = request.data.get("strategy", "single")
+        assignee_id = request.data.get("assigneeId") or request.data.get("assignee_id")
+        assignee_ids = request.data.get("assigneeIds") or request.data.get("assignee_ids") or []
+        transfer_open_tasks = bool(request.data.get("transferOpenTasks", request.data.get("transfer_open_tasks", True)))
+        reason = request.data.get("reason", "Bulk lead reassignment")
+        send_notification = bool(request.data.get("sendNotification", request.data.get("send_notification", True)))
+
+        if not lead_ids:
+            raise ValidationFailed("leadIds list cannot be empty.", field_errors={"leadIds": ["Please select at least one lead."]})
+
+        leads = list(Lead.objects.filter(pk__in=lead_ids, client_id=request.client_id, deleted_at__isnull=True))
+        if not leads:
+            raise NotFound("No matching active leads found for reassignment.")
+
+        allocation_summary = {}
+
+        if strategy == "single":
+            if not assignee_id:
+                raise ValidationFailed("assigneeId is required for single assignment strategy.")
+            target_user = User.objects.filter(pk=assignee_id, client_id=request.client_id, deleted_at__isnull=True).first()
+            if not target_user:
+                raise NotFound("Target assignee user not found.")
+
+            Lead.objects.filter(pk__in=[l.pk for l in leads]).update(owner=target_user)
+            allocation_summary[str(target_user.pk)] = len(leads)
+            if transfer_open_tasks:
+                Task.objects.filter(lead__in=leads, status__in=["Pending", "In Progress", "pending", "in_progress"], deleted_at__isnull=True).update(assigned_to=target_user)
+
+            if send_notification:
+                Notification.objects.create(
+                    client=request.user.client,
+                    user=target_user,
+                    title="Bulk Leads Assigned",
+                    message=f"{len(leads)} leads have been assigned to you. Reason: {reason}",
+                    channel="in_app",
+                )
+
+        elif strategy == "round_robin":
+            if not assignee_ids:
+                raise ValidationFailed("assigneeIds list is required for round-robin strategy.")
+            target_users = list(User.objects.filter(pk__in=assignee_ids, client_id=request.client_id, deleted_at__isnull=True))
+            if not target_users:
+                raise NotFound("Target assignees not found.")
+
+            for i, lead in enumerate(leads):
+                assigned_user = target_users[i % len(target_users)]
+                lead.owner = assigned_user
+                lead.save(update_fields=["owner"])
+                allocation_summary[str(assigned_user.pk)] = allocation_summary.get(str(assigned_user.pk), 0) + 1
+                if transfer_open_tasks:
+                    Task.objects.filter(lead=lead, status__in=["Pending", "In Progress", "pending", "in_progress"], deleted_at__isnull=True).update(assigned_to=assigned_user)
+
+            if send_notification:
+                for u in target_users:
+                    count = allocation_summary.get(str(u.pk), 0)
+                    if count > 0:
+                        Notification.objects.create(
+                            client=request.user.client,
+                            user=u,
+                            title="Leads Reallocated",
+                            message=f"{count} leads have been allocated to you via Round-Robin. Reason: {reason}",
+                            channel="in_app",
+                        )
+
+        elif strategy == "capacity_weighted":
+            if not assignee_ids:
+                raise ValidationFailed("assigneeIds list is required for capacity-weighted strategy.")
+            target_users = list(User.objects.filter(pk__in=assignee_ids, client_id=request.client_id, deleted_at__isnull=True))
+            if not target_users:
+                raise NotFound("Target assignees not found.")
+
+            load_map = {
+                u: Lead.objects.filter(owner=u, client_id=request.client_id, deleted_at__isnull=True).exclude(stage__name__in=["Won", "Lost", "Closed"]).count()
+                for u in target_users
+            }
+
+            for lead in leads:
+                chosen_user = min(load_map.keys(), key=lambda u: load_map[u])
+                lead.owner = chosen_user
+                lead.save(update_fields=["owner"])
+                load_map[chosen_user] += 1
+                allocation_summary[str(chosen_user.pk)] = allocation_summary.get(str(chosen_user.pk), 0) + 1
+                if transfer_open_tasks:
+                    Task.objects.filter(lead=lead, status__in=["Pending", "In Progress", "pending", "in_progress"], deleted_at__isnull=True).update(assigned_to=chosen_user)
+
+            if send_notification:
+                for u in target_users:
+                    count = allocation_summary.get(str(u.pk), 0)
+                    if count > 0:
+                        Notification.objects.create(
+                            client=request.user.client,
+                            user=u,
+                            title="Leads Allocated",
+                            message=f"{count} leads allocated to you via Capacity-Balancing. Reason: {reason}",
+                            channel="in_app",
+                        )
+        else:
+            raise ValidationFailed(f"Unknown strategy '{strategy}'. Supported: single, round_robin, capacity_weighted.")
+
+        record_audit(
+            client=request.client_id,
+            actor=request.user,
+            action="bulk_assign_leads",
+            entity_type="Lead",
+            description=f"Bulk assigned {len(leads)} leads using strategy '{strategy}'. Reason: {reason}",
+            ip=request_ip(request),
+        )
+
+        return Response({
+            "status": "success",
+            "totalReassigned": len(leads),
+            "allocationSummary": allocation_summary,
+            "strategy": strategy,
+        })
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,8 @@ from .models import (
     PurchaseReturn,
     PurchaseReturnLine,
     VendorAdvance,
+    VendorPortalUser,
+    AdvanceShippingNotice,
 )
 
 PurchaseOrderLineSerializer = line_serializer_for(
@@ -342,3 +344,40 @@ class BillOutstandingSerializer(BaseSerializer):
     dueDate = serializers.DateField(allow_null=True)
     daysOverdue = serializers.IntegerField()
     ageingBucket = serializers.CharField()
+
+
+class VendorPortalUserSerializer(BaseModelSerializer):
+    partyId = TenantPrimaryKeyRelatedField(
+        source="party", model="masters.Party"
+    )
+    partyName = serializers.CharField(source="party.name", read_only=True)
+
+    class Meta:
+        model = VendorPortalUser
+        fields = [
+            "id", "partyId", "partyName", "email", "name", "phone",
+            "is_active", "access_token", "last_login_at", "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+
+class AdvanceShippingNoticeSerializer(BaseModelSerializer):
+    purchaseOrderId = TenantPrimaryKeyRelatedField(
+        source="purchase_order", model="purchase.PurchaseOrder"
+    )
+    poNumber = serializers.CharField(source="purchase_order.po_number", read_only=True)
+    vendorId = TenantPrimaryKeyRelatedField(
+        source="vendor", model="masters.Party"
+    )
+    vendorName = serializers.CharField(source="vendor.name", read_only=True)
+
+    class Meta:
+        model = AdvanceShippingNotice
+        fields = [
+            "id", "asn_number", "purchaseOrderId", "poNumber", "vendorId",
+            "vendorName", "carrier_name", "tracking_lr_number", "vehicle_number",
+            "dispatch_date", "estimated_arrival", "dispatch_weight_kg",
+            "items_dispatched", "status", "vendor_notes", "created_at", "updated_at",
+        ]
+        read_only_fields = ["asn_number", "created_at", "updated_at"]
+

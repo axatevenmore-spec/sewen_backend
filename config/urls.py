@@ -37,6 +37,7 @@ api_v1 = [
     path("dashboard/", include(dashboard_urlpatterns)),
     # Unauthenticated surfaces (api.md §5.3, §9.7, §10.6, §11.5)
     path("public/", include(public_urlpatterns)),
+    path("vendor-portal/", include("apps.purchase.urls")),
     # Platform: files, notifications, audit, settings, search, support
     path("", include("apps.core.urls")),
     # OpenAPI 3.1, generated from the models so it cannot drift (db.md §14.2)

@@ -83,6 +83,8 @@ from .models import (
     EmployeeAward,
     TravelRequest,
     Announcement,
+    MeetingRoom,
+    CompanyMeeting,
 )
 from .serializers import (
     AppraisalCycleSerializer,
@@ -140,6 +142,8 @@ from .serializers import (
     EmployeeAwardSerializer,
     TravelRequestSerializer,
     AnnouncementSerializer,
+    MeetingRoomSerializer,
+    CompanyMeetingSerializer,
 )
 
 
@@ -2486,4 +2490,96 @@ class ScreeningAnswerViewSet(TenantModelViewSet):
     ordering = ["created_at"]
     filter_map = {"applicationId": "application_id", "questionId": "question_id"}
     permission_map = {"read": ["view_staff"], "write": ["create_staff"]}
+
+
+class MeetingRoomViewSet(TenantModelViewSet):
+    queryset = MeetingRoom.objects.all()
+    serializer_class = MeetingRoomSerializer
+    audit_entity_type = "MeetingRoom"
+    audit_label_field = "name"
+    status_field = None
+    search_fields = ["name", "code", "location"]
+    ordering = ["name"]
+    filter_map = {"isActive": "is_active"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+
+class CompanyMeetingViewSet(TenantModelViewSet):
+    queryset = CompanyMeeting.objects.select_related("room", "host_user").prefetch_related("attendees")
+    serializer_class = CompanyMeetingSerializer
+    audit_entity_type = "CompanyMeeting"
+    audit_label_field = "title"
+    status_field = "status"
+    search_fields = ["title", "agenda", "description"]
+    ordering = ["start_time"]
+    filter_map = {"roomId": "room_id", "status": "status", "hostUserId": "host_user_id"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def perform_create(self, serializer):
+        data = serializer.validated_data
+        room = data.get("room")
+        start_time = data.get("start_time")
+        end_time = data.get("end_time")
+
+        if room and start_time and end_time:
+            conflicts = CompanyMeeting.objects.filter(
+                client=self.request.user.client,
+                room=room,
+                status__in=["scheduled", "in_progress"],
+                start_time__lt=end_time,
+                end_time__gt=start_time,
+            )
+            if conflicts.exists():
+                raise ValidationFailed("Selected conference room is already booked for this time slot.")
+
+        if not data.get("host_user"):
+            serializer.validated_data["host_user"] = self.request.user
+
+        video_provider = data.get("video_provider")
+        join_url = data.get("join_url")
+        if not join_url and video_provider in ["zoom", "google_meet"]:
+            import uuid
+            code = uuid.uuid4().hex[:10]
+            if video_provider == "google_meet":
+                serializer.validated_data["join_url"] = f"https://meet.google.com/{code[:3]}-{code[3:7]}-{code[7:10]}"
+            else:
+                serializer.validated_data["join_url"] = f"https://zoom.us/j/{uuid.uuid4().int % 10000000000}"
+
+        return super().perform_create(serializer)
+
+    def perform_update(self, serializer):
+        data = serializer.validated_data
+        instance = serializer.instance
+        room = data.get("room", instance.room)
+        start_time = data.get("start_time", instance.start_time)
+        end_time = data.get("end_time", instance.end_time)
+
+        if room and start_time and end_time:
+            conflicts = CompanyMeeting.objects.filter(
+                client=self.request.user.client,
+                room=room,
+                status__in=["scheduled", "in_progress"],
+                start_time__lt=end_time,
+                end_time__gt=start_time,
+            ).exclude(pk=instance.pk)
+            if conflicts.exists():
+                raise ValidationFailed("Selected conference room is already booked for this time slot.")
+
+        return super().perform_update(serializer)
+
+    @action(detail=True, methods=["post"], url_path="mom")
+    def save_mom(self, request, pk=None):
+        meeting = self.get_object()
+        mom_text = request.data.get("minutes_of_meeting", "")
+        action_items = request.data.get("action_items", [])
+        status_val = request.data.get("status") or "completed"
+
+        meeting.minutes_of_meeting = mom_text
+        meeting.action_items = action_items
+        meeting.status = status_val
+        meeting.save(update_fields=["minutes_of_meeting", "action_items", "status", "updated_at"])
+
+        self.write_audit("save_mom", meeting, description=f"Updated MoM and action items for meeting {meeting.title}.")
+        return Response(self.get_serializer(meeting).data)
+
 

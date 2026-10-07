@@ -447,3 +447,57 @@ class Expense(TenantModel, LegacyIdMixin):
 
     def __str__(self):
         return self.expense_number
+
+
+# ---------------------------------------------------------------------------
+# Vendor Portal & Advance Shipping Notices (Dev Spec §2.8)
+# ---------------------------------------------------------------------------
+class VendorPortalUser(TenantModel, LegacyIdMixin):
+    party = models.ForeignKey(
+        "masters.Party", on_delete=models.CASCADE, related_name="portal_users"
+    )
+    email = models.EmailField()
+    name = models.TextField()
+    phone = models.TextField(blank=True, default="")
+    is_active = models.BooleanField(default=True)
+    access_token = models.TextField(blank=True, default="")
+    last_login_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "vendor_portal_users"
+        ordering = ["name"]
+
+    def __str__(self):
+        return f"{self.name} ({self.party.name})"
+
+
+class AdvanceShippingNotice(TenantModel, LegacyIdMixin):
+    STATUSES = [
+        ("in_transit", "In Transit"),
+        ("dock_received", "Dock Received"),
+        ("inspected", "Inspected"),
+        ("cancelled", "Cancelled"),
+    ]
+
+    asn_number = models.TextField(unique=True)
+    purchase_order = models.ForeignKey(
+        PurchaseOrder, on_delete=models.CASCADE, related_name="asns"
+    )
+    vendor = models.ForeignKey("masters.Party", on_delete=models.CASCADE, related_name="asns")
+    carrier_name = models.TextField()
+    tracking_lr_number = models.TextField()
+    vehicle_number = models.TextField(blank=True, default="")
+    dispatch_date = models.DateField()
+    estimated_arrival = models.DateField()
+    dispatch_weight_kg = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    items_dispatched = models.JSONField(default=list, blank=True)
+    status = models.CharField(max_length=20, choices=STATUSES, default="in_transit")
+    vendor_notes = models.TextField(blank=True, default="")
+
+    class Meta:
+        db_table = "purchase_asns"
+        ordering = ["-dispatch_date", "-created_at"]
+
+    def __str__(self):
+        return f"{self.asn_number} - PO {self.purchase_order.po_number or self.purchase_order.pk}"
+

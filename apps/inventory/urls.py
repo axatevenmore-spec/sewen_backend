@@ -28,6 +28,7 @@ router.register("faulty-parts", views.FaultyPartViewSet, basename="inventory-fau
 router.register("demo-units", views.DemoUnitViewSet, basename="inventory-demo-units")
 router.register("rework-orders", views.ReworkOrderViewSet, basename="inventory-rework-orders")
 router.register("scrap-logs", views.ScrapLogViewSet, basename="inventory-scrap-logs")
+# router.register("quality-inspections", views.QualityInspectionViewSet, basename="inventory-quality-inspections") # Hidden: QC out of scope
 router.register("audits", views.StockAuditViewSet, basename="inventory-audits")
 
 urlpatterns = [

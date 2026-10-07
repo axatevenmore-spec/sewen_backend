@@ -9,6 +9,7 @@ from apps.core.serializers import (
     MoneyField,
     TenantPrimaryKeyRelatedField,
 )
+from apps.accounts.models import User
 
 from . import services
 from .models import (
@@ -71,6 +72,8 @@ from .models import (
     EmployeeAward,
     TravelRequest,
     Announcement,
+    MeetingRoom,
+    CompanyMeeting,
 )
 
 
@@ -1407,4 +1410,53 @@ class AnnouncementSerializer(BaseModelSerializer):
             "author_name", "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
+
+
+class MeetingRoomSerializer(BaseModelSerializer):
+    class Meta:
+        model = MeetingRoom
+        fields = [
+            "id", "name", "code", "capacity", "location", "amenities", "is_active", "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+
+class CompanyMeetingSerializer(BaseModelSerializer):
+    roomId = TenantPrimaryKeyRelatedField(
+        source="room", model="hrms.MeetingRoom", required=False, allow_null=True
+    )
+    roomName = serializers.CharField(source="room.name", read_only=True, allow_null=True)
+    roomCode = serializers.CharField(source="room.code", read_only=True, allow_null=True)
+    hostUserId = TenantPrimaryKeyRelatedField(
+        source="host_user", model="accounts.User", required=False, allow_null=True
+    )
+    hostUserName = serializers.CharField(source="host_user.get_full_name", read_only=True)
+    attendeeIds = serializers.PrimaryKeyRelatedField(
+        source="attendees", many=True, read_only=False, queryset=User.objects.all(), required=False
+    )
+    attendeesDetail = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = CompanyMeeting
+        fields = [
+            "id", "title", "description", "roomId", "roomName", "roomCode", "meeting_type",
+            "start_time", "end_time", "video_provider", "join_url",
+            "hostUserId", "hostUserName", "attendeeIds", "attendeesDetail",
+            "external_attendees", "agenda", "minutes_of_meeting", "action_items",
+            "status", "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        from apps.accounts.models import User
+        if "attendeeIds" in self.fields:
+            self.fields["attendeeIds"].queryset = User.objects.all()
+
+    def get_attendeesDetail(self, obj):
+        return [
+            {"id": str(u.id), "name": u.get_full_name() or u.username, "email": u.email}
+            for u in obj.attendees.all()
+        ]
+
 

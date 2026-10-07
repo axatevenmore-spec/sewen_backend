@@ -560,3 +560,46 @@ class ScrapLog(TenantModel):
     def __str__(self):
         return f"{self.scrap_number} - {self.item}"
 
+
+class QualityInspection(TenantModel, LegacyIdMixin):
+    """Standalone Quality Control inspection desk model (Dev Spec §2.2)."""
+    STATUSES = [
+        ("pending", "Pending Inspection"),
+        ("passed", "Passed & Released"),
+        ("rework", "Under Rework"),
+        ("rejected", "Rejected"),
+    ]
+
+    inspection_number = models.TextField(unique=True)
+    goods_receipt = models.ForeignKey(
+        "purchase.GoodsReceipt",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="qc_inspections",
+    )
+    item = models.ForeignKey("masters.Item", on_delete=models.PROTECT, related_name="qc_inspections")
+    batch_lot_number = models.TextField(blank=True, default="")
+    sample_size = models.DecimalField(max_digits=18, decimal_places=4, default=1)
+    received_qty = models.DecimalField(max_digits=18, decimal_places=4)
+    accepted_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    rejected_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    status = models.CharField(max_length=20, choices=STATUSES, default="pending")
+    checklist_results = models.JSONField(default=list, blank=True)
+    inspector = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="qc_inspections"
+    )
+    inspector_notes = models.TextField(blank=True, default="")
+    inspected_at = models.DateTimeField(null=True, blank=True)
+    rework_order = models.ForeignKey(
+        ReworkOrder, null=True, blank=True, on_delete=models.SET_NULL, related_name="qc_inspections"
+    )
+
+    class Meta:
+        db_table = "quality_inspections"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.inspection_number} ({self.item}) - {self.status}"
+
+

@@ -1578,3 +1578,69 @@ class Announcement(TenantModel, LegacyIdMixin):
     def __str__(self):
         return self.title
 
+
+# ---------------------------------------------------------------------------
+# Universal Meetings & Conference Room Booking (Dev Spec §2.5)
+# ---------------------------------------------------------------------------
+class MeetingRoom(TenantModel, LegacyIdMixin):
+    name = models.TextField()
+    code = models.TextField()
+    capacity = models.PositiveIntegerField(default=6)
+    location = models.TextField(blank=True, default="")
+    amenities = models.JSONField(default=list, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "hrms_meeting_rooms"
+        ordering = ["name"]
+
+    def __str__(self):
+        return f"{self.name} ({self.code})"
+
+
+class CompanyMeeting(TenantModel, LegacyIdMixin):
+    MEETING_TYPES = [
+        ("in_person", "In Person"),
+        ("virtual", "Virtual"),
+        ("hybrid", "Hybrid"),
+    ]
+    VIDEO_PROVIDERS = [
+        ("none", "None"),
+        ("zoom", "Zoom"),
+        ("google_meet", "Google Meet"),
+    ]
+    STATUSES = [
+        ("scheduled", "Scheduled"),
+        ("in_progress", "In Progress"),
+        ("completed", "Completed"),
+        ("cancelled", "Cancelled"),
+    ]
+
+    title = models.TextField()
+    description = models.TextField(blank=True, default="")
+    room = models.ForeignKey(
+        MeetingRoom, null=True, blank=True, on_delete=models.SET_NULL, related_name="meetings"
+    )
+    meeting_type = models.CharField(max_length=20, choices=MEETING_TYPES, default="hybrid")
+    start_time = models.DateTimeField()
+    end_time = models.DateTimeField()
+    video_provider = models.CharField(max_length=20, choices=VIDEO_PROVIDERS, default="none")
+    join_url = models.TextField(blank=True, default="")
+    host_user = models.ForeignKey(
+        "accounts.User", on_delete=models.CASCADE, related_name="hosted_meetings"
+    )
+    attendees = models.ManyToManyField("accounts.User", related_name="attended_meetings", blank=True)
+    external_attendees = models.JSONField(default=list, blank=True)
+    agenda = models.TextField(blank=True, default="")
+    minutes_of_meeting = models.TextField(blank=True, default="")
+    action_items = models.JSONField(default=list, blank=True)
+    status = models.CharField(max_length=20, choices=STATUSES, default="scheduled")
+
+    class Meta:
+        db_table = "hrms_company_meetings"
+        ordering = ["start_time"]
+
+    def __str__(self):
+        return f"{self.title}"
+
+

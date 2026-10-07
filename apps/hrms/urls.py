@@ -103,6 +103,8 @@ router.register(
 router.register("terminations", views.TerminationViewSet, basename="hrms-terminations")
 router.register("resignations", views.ResignationViewSet, basename="hrms-resignations")
 router.register("complaints", views.ComplaintViewSet, basename="hrms-complaints")
+router.register("meeting-rooms", views.MeetingRoomViewSet, basename="hrms-meeting-rooms")
+router.register("meetings", views.CompanyMeetingViewSet, basename="hrms-meetings")
 
 urlpatterns = [
     path("org-chart/", views.OrgChartView.as_view(), name="hrms-org-chart"),

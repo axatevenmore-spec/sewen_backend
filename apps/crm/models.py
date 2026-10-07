@@ -174,6 +174,11 @@ class Lead(TenantModel, LegacyIdMixin):
     created_on = models.DateField(auto_now_add=True)
     #: Values captured by a dynamic form (db.md §9.1).
     custom_values = models.JSONField(default=dict, blank=True)
+    reassigned_at = models.DateTimeField(null=True, blank=True)
+    previous_owner = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="reassigned_leads"
+    )
+    reassignment_reason = models.TextField(blank=True, default="")
 
     class Meta:
         db_table = "crm_leads"
