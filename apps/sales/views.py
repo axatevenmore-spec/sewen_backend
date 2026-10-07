@@ -25,9 +25,10 @@ from apps.core.printing import PdfNotAvailable, print_payload, send_payload
 from apps.core.viewsets import TenantModelViewSet
 from apps.inventory import services as stock
 
-from . import services
+from . import approval_links, services
 from .models import (
     CHALLAN_SHIPPED_STATUSES,
+    SalesApprovalLink,
     METAL_LINE_FIELDS,
     CashPaymentReceipt,
     DeliveryChallan,
@@ -50,6 +51,7 @@ from .models import (
 )
 from .serializers import (
     AllocateSerializer,
+    ApprovalLinkRequestSerializer,
     CashPaymentReceiptSerializer,
     ConvertLinesSerializer,
     DeliveryChallanSerializer,
@@ -72,6 +74,95 @@ MONEY = DecimalField(max_digits=18, decimal_places=2)
 
 def money_sum(field, **kwargs):
     return Coalesce(Sum(field, **kwargs), Value(Decimal("0.00")), output_field=MONEY)
+
+
+class ApprovalLinkActions:
+    """Customer approval links -- the sales twin of the PMS proof share.
+
+        GET/POST {id}/approval-links/                       list / issue
+        POST     {id}/approval-links/{linkId}/revoke/        revoke
+        GET/POST {id}/approval-comments/                     the review thread
+
+    Permissions follow the viewset's read/write buckets: whoever may edit the
+    document may share it. Rules per type: apps/sales/approval_links.py.
+    """
+
+    approval_doc_type = None
+
+    def _approval_spec(self):
+        return approval_links.DOC_TYPES[self.approval_doc_type]
+
+    @action(detail=True, methods=["get", "post"], url_path="approval-links")
+    def approval_links(self, request, pk=None):
+        document = self.get_object()
+        spec = self._approval_spec()
+        if request.method == "POST":
+            serializer = ApprovalLinkRequestSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            data = serializer.validated_data
+            link, token = approval_links.issue_link(
+                spec=spec,
+                document=document,
+                user=request.user,
+                recipient_name=data.get("recipientName"),
+                recipient_email=data.get("recipientEmail"),
+                message=data.get("message"),
+                expiry_days=data["expiryDays"],
+            )
+            return Response(
+                {
+                    "token": token,
+                    # The web app's route, made absolute by the client.
+                    "url": f"/sales/approve/{token}",
+                    "expiresAt": link.expires_at,
+                    "link": approval_links.link_row(link),
+                },
+                status=status.HTTP_201_CREATED,
+            )
+        rows = SalesApprovalLink.objects.filter(
+            client_id=document.client_id,
+            doc_type=spec.key,
+            document_id=document.id,
+            deleted_at__isnull=True,
+        ).select_related("created_by")
+        return Response(envelope([approval_links.link_row(row) for row in rows]))
+
+    @action(
+        detail=True,
+        methods=["post"],
+        url_path=r"approval-links/(?P<link_id>[0-9a-fA-F-]{36})/revoke",
+    )
+    def revoke_approval_link(self, request, pk=None, link_id=None):
+        document = self.get_object()
+        link = SalesApprovalLink.objects.filter(
+            pk=link_id,
+            client_id=document.client_id,
+            doc_type=self.approval_doc_type,
+            document_id=document.id,
+            deleted_at__isnull=True,
+        ).first()
+        if link is None:
+            raise NotFound("That approval link no longer exists.")
+        link = approval_links.revoke_link(link, user=request.user, reason=request.data.get("reason"))
+        return Response(approval_links.link_row(link))
+
+    @action(detail=True, methods=["get", "post"], url_path="approval-comments")
+    def approval_comments(self, request, pk=None):
+        document = self.get_object()
+        spec = self._approval_spec()
+        if request.method == "POST":
+            approval_links.add_comment(
+                spec_key=spec.key,
+                document=document,
+                author_type="Staff",
+                author_name=getattr(request.user, "name", None) or request.user.email,
+                text=request.data.get("text"),
+            )
+        rows = approval_links.comments_for(spec.key, document.id, document.client_id)
+        return Response(
+            envelope(approval_links.comment_rows(rows)),
+            status=status.HTTP_201_CREATED if request.method == "POST" else status.HTTP_200_OK,
+        )
 
 
 class SalesDocumentViewSet(TenantModelViewSet):
@@ -143,8 +234,9 @@ class SalesDocumentViewSet(TenantModelViewSet):
 # ---------------------------------------------------------------------------
 # Estimates (api.md §5.2)
 # ---------------------------------------------------------------------------
-class EstimateViewSet(SalesDocumentViewSet):
+class EstimateViewSet(ApprovalLinkActions, SalesDocumentViewSet):
     queryset = Estimate.objects.all()
+    approval_doc_type = "estimate"
     serializer_class = EstimateSerializer
     audit_entity_type = "Estimate"
     audit_label_field = "estimate_number"
@@ -248,8 +340,9 @@ def _clone_document(source, target_model, overrides, *, number_field, series,
 # ---------------------------------------------------------------------------
 # Quotations (api.md §5.3)
 # ---------------------------------------------------------------------------
-class QuotationViewSet(SalesDocumentViewSet):
+class QuotationViewSet(ApprovalLinkActions, SalesDocumentViewSet):
     queryset = Quotation.objects.all()
+    approval_doc_type = "quotation"
     serializer_class = QuotationSerializer
     audit_entity_type = "Quotation"
     audit_label_field = "quotation_number"
@@ -708,8 +801,9 @@ class SalesOrderViewSet(SalesDocumentViewSet):
 # ---------------------------------------------------------------------------
 # Proforma invoices (api.md §5.5)
 # ---------------------------------------------------------------------------
-class ProformaInvoiceViewSet(SalesDocumentViewSet):
+class ProformaInvoiceViewSet(ApprovalLinkActions, SalesDocumentViewSet):
     queryset = ProformaInvoice.objects.all()
+    approval_doc_type = "proforma_invoice"
     serializer_class = ProformaInvoiceSerializer
     audit_entity_type = "ProformaInvoice"
     audit_label_field = "proforma_number"
@@ -1007,8 +1101,9 @@ class DeliveryChallanViewSet(SalesDocumentViewSet):
 # ---------------------------------------------------------------------------
 # Sales invoices (api.md §5.7)
 # ---------------------------------------------------------------------------
-class SalesInvoiceViewSet(SalesDocumentViewSet):
+class SalesInvoiceViewSet(ApprovalLinkActions, SalesDocumentViewSet):
     queryset = SalesInvoice.objects.all()
+    approval_doc_type = "sales_invoice"
     serializer_class = SalesInvoiceSerializer
     audit_entity_type = "SalesInvoice"
     audit_label_field = "invoice_number"

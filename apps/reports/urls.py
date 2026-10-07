@@ -55,6 +55,22 @@ public_urlpatterns = [
         public_views.PublicProofCommentView.as_view(),
         name="public-proof-comments",
     ),
+    # Sales document approval links (apps/sales/approval_links.py)
+    path(
+        "sales/approve/<str:token>/",
+        public_views.PublicSalesApprovalView.as_view(),
+        name="public-sales-approval",
+    ),
+    path(
+        "sales/approve/<str:token>/decide/",
+        public_views.PublicSalesApprovalDecisionView.as_view(),
+        name="public-sales-approval-decide",
+    ),
+    path(
+        "sales/approve/<str:token>/comments/",
+        public_views.PublicSalesApprovalCommentView.as_view(),
+        name="public-sales-approval-comments",
+    ),
     # Public lead forms (api.md §9.7)
     path(
         "forms/<slug:slug>/",
