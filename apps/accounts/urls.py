@@ -20,6 +20,7 @@ auth_urlpatterns = [
     path("reset-password/", views.ResetPasswordView.as_view(), name="auth-reset-password"),
     path("sessions/", views.SessionListView.as_view(), name="auth-sessions"),
     path("sessions/<uuid:pk>/", views.SessionDetailView.as_view(), name="auth-session-detail"),
+    path("impersonate-customer/", views.ImpersonateCustomerView.as_view(), name="auth-impersonate-customer"),
 ]
 
 admin_urlpatterns = [

@@ -122,8 +122,8 @@ class EstimateSerializer(DocumentSerializer):
 
     class Meta:
         model = Estimate
-        fields = HEADER_FIELDS + ["estimate_number", "status", "valid_until", "crm_lead"]
-        read_only_fields = READ_ONLY_HEADER_FIELDS + ["estimate_number"]
+        fields = HEADER_FIELDS + ["estimate_number", "status", "valid_until", "crm_lead", "converted_challan"]
+        read_only_fields = READ_ONLY_HEADER_FIELDS + ["estimate_number", "converted_challan"]
 
 
 # ---------------------------------------------------------------------------

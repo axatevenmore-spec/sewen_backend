@@ -104,6 +104,9 @@ class PurchaseBill(DocumentHeader):
     purchase_order = models.ForeignKey(
         PurchaseOrder, null=True, blank=True, on_delete=models.SET_NULL, related_name="bills"
     )
+    project = models.ForeignKey(
+        "pms.Project", null=True, blank=True, on_delete=models.SET_NULL, related_name="purchase_bills"
+    )
     location = models.ForeignKey(
         "masters.Location", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
@@ -289,6 +292,56 @@ class PaymentOut(TenantModel, LegacyIdMixin):
 
 
 # ---------------------------------------------------------------------------
+# Vendor Advances (Dev Spec §2.1)
+# ---------------------------------------------------------------------------
+class VendorAdvance(TenantModel, LegacyIdMixin):
+    """Upfront advance payments linked directly to purchase orders."""
+
+    ADVANCE_STATUSES = [
+        "Pending", "Disbursed", "Partially Reconciled", "Reconciled", "Cancelled"
+    ]
+
+    advance_number = models.TextField()
+    party = models.ForeignKey(
+        "masters.Party", on_delete=models.PROTECT, related_name="vendor_advances"
+    )
+    purchase_order = models.ForeignKey(
+        PurchaseOrder, null=True, blank=True, on_delete=models.SET_NULL, related_name="advances"
+    )
+    advance_date = models.DateField()
+    amount = models.DecimalField(max_digits=18, decimal_places=2)
+    reconciled_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    mode = models.TextField(choices=choices(PAYMENT_MODES), default="Bank")
+    bank_account = models.ForeignKey(
+        "accounting.BankAccount", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    reference_number = models.TextField(null=True, blank=True)
+    status = models.TextField(choices=choices(ADVANCE_STATUSES), default="Disbursed")
+    notes = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "vendor_advances"
+        ordering = ["-advance_date", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "advance_number"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_vendor_advances_number",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(amount__gt=0), name="ck_vendor_advance_amount"
+            ),
+        ]
+
+    def __str__(self):
+        return self.advance_number
+
+    @property
+    def unallocated_amount(self):
+        return (self.amount or 0) - (self.reconciled_amount or 0)
+
+
+# ---------------------------------------------------------------------------
 # Purchase returns / debit notes (api.md §6.5)
 # ---------------------------------------------------------------------------
 class PurchaseReturn(DocumentHeader):
@@ -354,6 +407,9 @@ class Expense(TenantModel, LegacyIdMixin):
     )
     party = models.ForeignKey(
         "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="expenses"
+    )
+    project = models.ForeignKey(
+        "pms.Project", null=True, blank=True, on_delete=models.SET_NULL, related_name="direct_expenses"
     )
     expense_date = models.DateField()
     amount = models.DecimalField(max_digits=18, decimal_places=2)

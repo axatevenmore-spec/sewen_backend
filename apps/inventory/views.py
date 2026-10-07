@@ -20,8 +20,11 @@ from apps.masters.models import Item, Location
 
 from . import services as stock
 from .models import (
+    DemoUnit,
     FaultyPart,
     QualityStandard,
+    ReworkOrder,
+    ScrapLog,
     ServiceUsage,
     StockAudit,
     StockAuditLine,
@@ -33,8 +36,11 @@ from .models import (
     ZoneRequestLine,
 )
 from .serializers import (
+    DemoUnitSerializer,
     FaultyPartSerializer,
     QualityStandardSerializer,
+    ReworkOrderSerializer,
+    ScrapLogSerializer,
     # ServiceUsageSerializer,  # Hidden: out of scope
     StockAdjustmentSerializer,
     StockAuditSerializer,
@@ -698,3 +704,108 @@ class QualityStandardViewSet(TenantModelViewSet):
     status_field = None
     search_fields = ["name"]
     ordering = ["name"]
+
+
+# ---------------------------------------------------------------------------
+# Demo-Unit Tracking (Dev Spec §2.2)
+# ---------------------------------------------------------------------------
+class DemoUnitViewSet(TenantModelViewSet):
+    queryset = DemoUnit.objects.select_related("item", "serial", "prospect_party")
+    serializer_class = DemoUnitSerializer
+    audit_entity_type = "DemoUnit"
+    audit_label_field = "demo_number"
+    status_field = "status"
+    default_date_field = "dispatch_date"
+    search_fields = ["demo_number", "prospect_name", "item__name", "notes"]
+    ordering = ["-dispatch_date", "-created_at"]
+    filter_map = {"status": "status", "itemId": "item_id"}
+    permission_map = {"read": ["view_inventory"], "write": ["edit_inventory"]}
+
+    def perform_create(self, serializer):
+        serializer.validated_data["demo_number"] = allocate_number(
+            self.request.user.client, "DEMO", serializer.validated_data.get("dispatch_date")
+        )
+        return super().perform_create(serializer)
+
+    @action(detail=True, methods=["post"], url_path="return-inspection")
+    @transaction.atomic
+    def return_inspection(self, request, pk=None):
+        demo = self.get_object()
+        demo.actual_return_date = timezone.now().date()
+        demo.status = "Returned - Inspected"
+        demo.condition_on_return = request.data.get("condition") or "Good"
+        demo.inspection_notes = request.data.get("notes") or "Inspected upon return"
+        demo.save(update_fields=["actual_return_date", "status", "condition_on_return", "inspection_notes", "updated_at"])
+        self.write_audit("return_inspection", demo, description=f"Demo unit returned. Condition: {demo.condition_on_return}")
+        return Response(self.get_serializer(demo).data)
+
+    @action(detail=True, methods=["post"], url_path="convert-to-sale")
+    @transaction.atomic
+    def convert_to_sale(self, request, pk=None):
+        demo = self.get_object()
+        demo.status = "Converted to Sale"
+        demo.sale_invoice_ref = request.data.get("invoice_ref") or "Pending Invoice"
+        demo.save(update_fields=["status", "sale_invoice_ref", "updated_at"])
+        self.write_audit("convert_sale", demo, description="Demo unit converted to final sale.")
+        return Response(self.get_serializer(demo).data)
+
+
+# ---------------------------------------------------------------------------
+# Dedicated Rework Tracking & Scrap Dashboard (Dev Spec §2.4)
+# ---------------------------------------------------------------------------
+class ReworkOrderViewSet(TenantModelViewSet):
+    queryset = ReworkOrder.objects.select_related("item", "goods_receipt")
+    serializer_class = ReworkOrderSerializer
+    audit_entity_type = "ReworkOrder"
+    audit_label_field = "rework_number"
+    status_field = "status"
+    search_fields = ["rework_number", "item__name", "defect_reason", "assigned_technician"]
+    ordering = ["-created_at"]
+    filter_map = {"status": "status", "itemId": "item_id"}
+    permission_map = {"read": ["view_inventory"], "write": ["edit_inventory"]}
+
+    def perform_create(self, serializer):
+        serializer.validated_data["rework_number"] = allocate_number(
+            self.request.user.client, "RWK"
+        )
+        return super().perform_create(serializer)
+
+    @action(detail=True, methods=["post"], url_path="log-scrap")
+    @transaction.atomic
+    def log_scrap(self, request, pk=None):
+        rework = self.get_object()
+        scrap_qty = Decimal(str(request.data.get("scrap_qty") or 1))
+        scrap_reason = request.data.get("reason") or "Failed rework inspection"
+        loss_amt = Decimal(str(request.data.get("loss_amount") or 0))
+
+        rework.scrap_qty += scrap_qty
+        if rework.quantity > 0:
+            rework.scrap_rate_pct = round2((rework.scrap_qty / rework.quantity) * 100)
+        rework.status = "Scrapped" if rework.scrap_qty >= rework.quantity else "In Rework"
+        rework.save(update_fields=["scrap_qty", "scrap_rate_pct", "status", "updated_at"])
+
+        scr_num = allocate_number(request.user.client, "SCR")
+        scrap = ScrapLog.objects.create(
+            client=rework.client,
+            scrap_number=scr_num,
+            item=rework.item,
+            quantity=scrap_qty,
+            scrap_reason=scrap_reason,
+            estimated_loss=loss_amt,
+            rework_order=rework,
+            logged_by=request.user,
+        )
+        self.write_audit("log_scrap", rework, description=f"Scrapped {scrap_qty} units under {scr_num}.")
+        return Response({
+            "rework": self.get_serializer(rework).data,
+            "scrap_number": scr_num,
+        })
+
+
+class ScrapLogViewSet(ReadOnlyTenantViewSet):
+    queryset = ScrapLog.objects.select_related("item", "rework_order", "logged_by")
+    serializer_class = ScrapLogSerializer
+    required_permissions = ["view_inventory"]
+    search_fields = ["scrap_number", "item__name", "scrap_reason"]
+    ordering = ["-logged_at"]
+

@@ -416,6 +416,7 @@ class LeaveType(TenantModel, LegacyIdMixin):
     )
     is_encashable = models.BooleanField(default=False)
     is_paid = models.BooleanField(default=True)
+    enforce_sandwich_rule = models.BooleanField(default=False)
 
     class Meta:
         db_table = "hrms_leave_types"
@@ -545,6 +546,9 @@ class SalaryStructure(TenantModel, LegacyIdMixin):
     basic_pct = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
     hra_pct = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
     components = models.JSONField(default=list, blank=True)
+    overtime_monthly_cap_hours = models.DecimalField(max_digits=6, decimal_places=2, default=30)
+    overtime_saturation_threshold = models.DecimalField(max_digits=6, decimal_places=2, default=25)
+    require_overtime_approval = models.BooleanField(default=True)
     is_active = models.BooleanField(default=True)
 
     class Meta:
@@ -1409,3 +1413,168 @@ class Complaint(TenantModel):
     class Meta:
         db_table = "hrms_complaints"
         ordering = ["-created_at"]
+
+
+# ---------------------------------------------------------------------------
+# Transfers, Promotions & Warnings (Dev Spec §2.5.1)
+# ---------------------------------------------------------------------------
+class EmployeeTransfer(TenantModel, LegacyIdMixin):
+    STATUSES = [
+        ("Pending", "Pending"),
+        ("Approved", "Approved"),
+        ("Rejected", "Rejected"),
+        ("Completed", "Completed"),
+    ]
+
+    transfer_number = models.TextField()
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="transfers")
+    from_department = models.ForeignKey(Department, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    to_department = models.ForeignKey(Department, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    from_location = models.ForeignKey(Location, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    to_location = models.ForeignKey(Location, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    effective_date = models.DateField()
+    reason = models.TextField(null=True, blank=True)
+    status = models.TextField(choices=STATUSES, default="Pending")
+
+    class Meta:
+        db_table = "hrms_employee_transfers"
+        ordering = ["-effective_date", "-created_at"]
+
+
+class EmployeePromotion(TenantModel, LegacyIdMixin):
+    STATUSES = [
+        ("Pending", "Pending"),
+        ("Approved", "Approved"),
+        ("Rejected", "Rejected"),
+        ("Effective", "Effective"),
+    ]
+
+    promotion_number = models.TextField()
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="promotions")
+    from_designation = models.ForeignKey(Designation, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    to_designation = models.ForeignKey(Designation, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    previous_salary = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    new_salary = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    effective_date = models.DateField()
+    justification = models.TextField(null=True, blank=True)
+    status = models.TextField(choices=STATUSES, default="Pending")
+
+    class Meta:
+        db_table = "hrms_employee_promotions"
+        ordering = ["-effective_date", "-created_at"]
+
+
+class EmployeeWarning(TenantModel, LegacyIdMixin):
+    SEVERITIES = [
+        ("Verbal", "Verbal"),
+        ("First Written", "First Written"),
+        ("Final Written", "Final Written"),
+        ("Suspension", "Suspension"),
+    ]
+    STATUSES = [
+        ("Draft", "Draft"),
+        ("Issued", "Issued"),
+        ("Acknowledged", "Acknowledged"),
+        ("Appealed", "Appealed"),
+        ("Closed", "Closed"),
+    ]
+
+    warning_number = models.TextField()
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="warnings")
+    issue_date = models.DateField()
+    severity = models.TextField(choices=SEVERITIES, default="First Written")
+    incident_date = models.DateField(null=True, blank=True)
+    subject = models.TextField()
+    description = models.TextField()
+    corrective_action = models.TextField(null=True, blank=True)
+    status = models.TextField(choices=STATUSES, default="Issued")
+    employee_explanation = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "hrms_employee_warnings"
+        ordering = ["-issue_date", "-created_at"]
+
+
+# ---------------------------------------------------------------------------
+# Employee Awards & Recognitions (Dev Spec §2.5.4)
+# ---------------------------------------------------------------------------
+class EmployeeAward(TenantModel, LegacyIdMixin):
+    award_number = models.TextField()
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="awards")
+    award_name = models.TextField()
+    category = models.TextField(default="Excellence")  # Star Performer, Innovation, Customer Hero, Leadership
+    award_date = models.DateField()
+    gift_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    citation = models.TextField(null=True, blank=True)
+    badge_icon = models.TextField(default="Trophy")
+
+    class Meta:
+        db_table = "hrms_employee_awards"
+        ordering = ["-award_date", "-created_at"]
+
+    def __str__(self):
+        return f"{self.award_name} - {self.employee}"
+
+
+# ---------------------------------------------------------------------------
+# Travel Requisitions & Expense Advances (Dev Spec §2.5.6)
+# ---------------------------------------------------------------------------
+class TravelRequest(TenantModel, LegacyIdMixin):
+    STATUSES = [
+        ("Submitted", "Submitted"),
+        ("Approved", "Approved"),
+        ("Disbursed", "Disbursed"),
+        ("Settled", "Settled"),
+        ("Rejected", "Rejected"),
+        ("Cancelled", "Cancelled"),
+    ]
+
+    travel_number = models.TextField()
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="travel_requests")
+    purpose = models.TextField()
+    destination = models.TextField()
+    start_date = models.DateField()
+    end_date = models.DateField()
+    advance_requested = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    advance_disbursed = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    actual_expenses = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    settlement_notes = models.TextField(null=True, blank=True)
+    status = models.TextField(choices=STATUSES, default="Submitted")
+
+    class Meta:
+        db_table = "hrms_travel_requests"
+        ordering = ["-start_date", "-created_at"]
+
+    def __str__(self):
+        return f"{self.travel_number} - {self.destination}"
+
+
+# ---------------------------------------------------------------------------
+# Company Announcements & Notice Board (Dev Spec §2.5.6)
+# ---------------------------------------------------------------------------
+class Announcement(TenantModel, LegacyIdMixin):
+    PRIORITIES = [
+        ("Low", "Low"),
+        ("Medium", "Medium"),
+        ("High", "High"),
+        ("Urgent", "Urgent"),
+    ]
+
+    title = models.TextField()
+    content = models.TextField()
+    priority = models.TextField(choices=PRIORITIES, default="Medium")
+    target_department = models.ForeignKey(
+        Department, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    is_pinned = models.BooleanField(default=False)
+    publish_date = models.DateField()
+    expiry_date = models.DateField(null=True, blank=True)
+    author_name = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "hrms_announcements"
+        ordering = ["-is_pinned", "-publish_date", "-created_at"]
+
+    def __str__(self):
+        return self.title
+

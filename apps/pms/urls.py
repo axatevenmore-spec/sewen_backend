@@ -9,8 +9,13 @@ router.register("departments", views.DepartmentViewSet, basename="pms-department
 router.register("stage-configs", views.StageConfigViewSet, basename="pms-stage-configs")
 router.register("projects", views.ProjectViewSet, basename="pms-projects")
 router.register("delays", views.DelayViewSet, basename="pms-delays")
+router.register("bugs", views.ProjectBugViewSet, basename="pms-bugs")
+router.register("delegated-tasks", views.DelegatedTaskViewSet, basename="pms-delegated-tasks")
+router.register("timesheets", views.TimesheetViewSet, basename="pms-timesheets")
+router.register("timesheet-entries", views.TimesheetEntryViewSet, basename="pms-timesheet-entries")
 
 urlpatterns = [
+    path("calendar-schedule/", views.CrossProjectCalendarScheduleView.as_view(), name="pms-calendar-schedule"),
     path("settings/", views.PmsSettingsView.as_view(), name="pms-settings"),
     path("my-tasks/", views.MyTasksView.as_view(), name="pms-my-tasks"),
     path("my-projects/", views.MyProjectsView.as_view(), name="pms-my-projects"),

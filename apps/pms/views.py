@@ -29,6 +29,8 @@ from apps.core.viewsets import TenantModelViewSet
 
 from . import chat, services
 from .chat_views import CHAT_PERMISSIONS, ProjectChatMixin
+from django.db.models import Count, Q, Sum
+from apps.core.money import round2, ZERO
 from .models import (
     CLOSED_STAGE_STATUSES,
     Approval,
@@ -41,6 +43,10 @@ from .models import (
     ProofShare,
     StageConfig,
     Task,
+    ProjectBug,
+    DelegatedTask,
+    Timesheet,
+    TimesheetEntry,
 )
 from .serializers import (
     ApplyTemplateSerializer,
@@ -72,6 +78,10 @@ from .serializers import (
     StagePercentagesSerializer,
     StageStatusSerializer,
     TaskSerializer,
+    ProjectBugSerializer,
+    DelegatedTaskSerializer,
+    TimesheetSerializer,
+    TimesheetEntrySerializer,
 )
 
 
@@ -786,6 +796,99 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
         check_customer_tracking_permission(request.user, project)
         ctx = _customer_tracking_context(project, request=request)
         return Response(CustomerProjectTrackingSerializer(project, context=ctx).data)
+
+    @action(detail=True, methods=["get"], url_path="profitability")
+    def profitability(self, request, pk=None):
+        """Live project profitability report (Dev Spec §2.6.3)."""
+        from apps.purchase.models import PurchaseBill, Expense
+        from apps.sales.models import SalesInvoice
+        from .models import TimesheetEntry
+
+        project = self.get_object()
+
+        # 1. Revenue
+        revenue = Decimal("0.00")
+        if project.sales_order and project.sales_order.total_amount:
+            revenue = project.sales_order.total_amount
+        else:
+            invoiced = SalesInvoice.objects.filter(
+                client_id=request.client_id,
+                sales_order=project.sales_order,
+                deleted_at__isnull=True
+            ).exclude(status="Cancelled").aggregate(tot=Sum("grand_total"))["tot"]
+            if invoiced:
+                revenue = invoiced
+
+        # 2. Direct Vendor Bills (Materials)
+        bills = list(PurchaseBill.objects.filter(
+            client_id=request.client_id,
+            project=project,
+            deleted_at__isnull=True
+        ).exclude(status="Cancelled").select_related("party"))
+        material_cost = sum([b.grand_total for b in bills if b.grand_total], Decimal("0.00"))
+
+        # 3. Direct Expenses (Cash / Travel / Subcontracting)
+        expenses = list(Expense.objects.filter(
+            client_id=request.client_id,
+            project=project,
+            deleted_at__isnull=True
+        ).exclude(status="Rejected").select_related("category"))
+        expense_cost = sum([e.amount for e in expenses if e.amount], Decimal("0.00"))
+
+        # 4. Labor Cost (Timesheets)
+        entries = TimesheetEntry.objects.filter(
+            client_id=request.client_id,
+            project=project,
+            deleted_at__isnull=True
+        ).select_related("user")
+        total_hours = Decimal("0.00")
+        labor_cost = Decimal("0.00")
+        for ent in entries:
+            hrs = ent.duration_hours or Decimal("0.00")
+            total_hours += hrs
+            hourly_rate = Decimal("500.00")
+            labor_cost += (hrs * hourly_rate)
+
+        total_costs = round2(material_cost + expense_cost + labor_cost)
+        gross_profit = round2(revenue - total_costs)
+        margin_pct = round(float(gross_profit) / float(revenue) * 100, 2) if revenue else 0.0
+
+        return Response({
+            "project_id": str(project.id),
+            "project_code": project.code,
+            "project_name": project.name,
+            "revenue": round2(revenue),
+            "material_cost": round2(material_cost),
+            "expense_cost": round2(expense_cost),
+            "labor_cost": round2(labor_cost),
+            "total_hours_logged": round2(total_hours),
+            "total_costs": total_costs,
+            "gross_profit": gross_profit,
+            "margin_pct": margin_pct,
+            "bills": [
+                {
+                    "id": b.id,
+                    "bill_number": b.bill_number,
+                    "vendor_name": b.party.name if b.party else None,
+                    "amount": float(b.grand_total or 0),
+                    "status": b.status,
+                    "date": b.bill_date,
+                }
+                for b in bills[:50]
+            ],
+            "expenses": [
+                {
+                    "id": e.id,
+                    "expense_number": e.expense_number,
+                    "category": e.category.name if e.category else None,
+                    "amount": float(e.amount or 0),
+                    "status": e.status,
+                    "date": e.date,
+                }
+                for e in expenses[:50]
+            ],
+        })
+
 
     # -- stages ------------------------------------------------------------
     def _get_stage(self, project, stage_id):
@@ -2085,3 +2188,257 @@ class CustomerTrackingView(APIView):
             qs = qs.filter(party_id__in=customer_party_ids)
 
         return Response(envelope(CustomerProjectTrackingListSerializer(qs, many=True).data))
+
+
+# ---------------------------------------------------------------------------
+# Cross-Project Calendar Schedule (Dev Spec §2.6.2)
+# ---------------------------------------------------------------------------
+class CrossProjectCalendarScheduleView(APIView):
+    """``GET /pms/calendar-schedule/`` -- all active project deadlines & tasks."""
+
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_pms"]
+
+    def get(self, request):
+        client_id = request.client_id
+        tasks = Task.objects.filter(
+            project__client_id=client_id,
+            deleted_at__isnull=True,
+            project__deleted_at__isnull=True,
+        ).select_related("project", "assigned_user", "stage")
+
+        stages = ProjectStage.objects.filter(
+            project__client_id=client_id,
+            deleted_at__isnull=True,
+            project__deleted_at__isnull=True,
+        ).select_related("project")
+
+        events = []
+        for t in tasks:
+            events.append({
+                "id": f"task-{t.id}",
+                "taskId": str(t.id),
+                "title": t.task_name,
+                "projectId": str(t.project_id),
+                "projectCode": t.project.code if t.project else "",
+                "projectName": t.project.name if t.project else "",
+                "start": t.start_date.isoformat() if t.start_date else None,
+                "end": t.due_date.isoformat() if t.due_date else None,
+                "type": "task",
+                "status": t.status,
+                "priority": t.priority,
+                "completionPct": t.completion_pct,
+                "assignedUser": t.assigned_user.name if t.assigned_user else None,
+            })
+
+        for s in stages:
+            events.append({
+                "id": f"stage-{s.id}",
+                "stageId": str(s.id),
+                "title": f"Stage: {s.name}",
+                "projectId": str(s.project_id),
+                "projectCode": s.project.code if s.project else "",
+                "projectName": s.project.name if s.project else "",
+                "start": s.actual_start_datetime.isoformat() if s.actual_start_datetime else (s.created_at.isoformat() if s.created_at else None),
+                "end": s.expected_completion_datetime.isoformat() if s.expected_completion_datetime else None,
+                "type": "stage",
+                "status": s.status,
+                "completionPct": s.completion_pct,
+            })
+
+        return Response({"events": events, "count": len(events)})
+
+
+# ---------------------------------------------------------------------------
+# Bugs & Defects (Dev Spec §2.6.1)
+# ---------------------------------------------------------------------------
+class ProjectBugViewSet(TenantModelViewSet):
+    queryset = ProjectBug.objects.select_related("project", "task", "assigned_to", "reported_by")
+    serializer_class = ProjectBugSerializer
+    audit_entity_type = "ProjectBug"
+    audit_label_field = "bug_number"
+    status_field = "status"
+    search_fields = ["bug_number", "title", "project__code", "project__name"]
+    ordering = ["-created_at"]
+    filter_map = {"projectId": "project_id", "severity": "severity", "status": "status", "assignedToId": "assigned_to_id"}
+    permission_map = {"read": ["view_pms"], "write": ["manage_pms_tasks"]}
+
+    def perform_create(self, serializer):
+        serializer.validated_data["bug_number"] = allocate_number(self.request.user.client, "BUG")
+        serializer.validated_data["reported_by"] = self.request.user
+        return super().perform_create(serializer)
+
+
+# ---------------------------------------------------------------------------
+# Delegated Tasks (Dev Spec §2.6.1)
+# ---------------------------------------------------------------------------
+class DelegatedTaskViewSet(TenantModelViewSet):
+    queryset = DelegatedTask.objects.select_related("delegated_by", "assigned_to")
+    serializer_class = DelegatedTaskSerializer
+    audit_entity_type = "DelegatedTask"
+    audit_label_field = "task_number"
+    status_field = "status"
+    search_fields = ["task_number", "title", "description"]
+    ordering = ["-created_at"]
+    filter_map = {"status": "status", "priority": "priority"}
+    permission_map = {"read": ["view_pms"], "write": ["view_pms"]}
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        tab = self.request.query_params.get("tab")
+        if tab == "delegated_by_me":
+            qs = qs.filter(delegated_by=self.request.user)
+        elif tab == "assigned_to_me":
+            qs = qs.filter(assigned_to=self.request.user)
+        return qs
+
+    def perform_create(self, serializer):
+        serializer.validated_data["task_number"] = allocate_number(self.request.user.client, "DEL")
+        serializer.validated_data["delegated_by"] = self.request.user
+        return super().perform_create(serializer)
+
+    @action(detail=True, methods=["post"])
+    def accept(self, request, pk=None):
+        task = self.get_object()
+        task.status = "Accepted"
+        task.save(update_fields=["status", "updated_at"])
+        return Response(self.get_serializer(task).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        task = self.get_object()
+        task.status = "Rejected"
+        task.rejection_reason = request.data.get("reason", "")
+        task.save(update_fields=["status", "rejection_reason", "updated_at"])
+        return Response(self.get_serializer(task).data)
+
+    @action(detail=True, methods=["post"])
+    def complete(self, request, pk=None):
+        task = self.get_object()
+        task.status = "Completed"
+        task.completion_notes = request.data.get("notes", "")
+        task.completed_at = timezone.now()
+        task.save(update_fields=["status", "completion_notes", "completed_at", "updated_at"])
+        return Response(self.get_serializer(task).data)
+
+
+# ---------------------------------------------------------------------------
+# Timesheets & Timers (Dev Spec §2.6.2)
+# ---------------------------------------------------------------------------
+class TimesheetViewSet(TenantModelViewSet):
+    queryset = Timesheet.objects.select_related("employee", "approved_by").prefetch_related("entries")
+    serializer_class = TimesheetSerializer
+    audit_entity_type = "Timesheet"
+    audit_label_field = "timesheet_number"
+    status_field = "status"
+    search_fields = ["timesheet_number", "employee__name"]
+    ordering = ["-week_start", "-created_at"]
+    filter_map = {"employeeId": "employee_id", "status": "status"}
+    permission_map = {"read": ["view_pms"], "write": ["manage_pms_tasks"]}
+
+    def perform_create(self, serializer):
+        serializer.validated_data["timesheet_number"] = allocate_number(self.request.user.client, "TSH")
+        return super().perform_create(serializer)
+
+    @action(detail=True, methods=["post"])
+    def submit(self, request, pk=None):
+        ts = self.get_object()
+        ts.status = "Submitted"
+        # recalculate total hours from entries
+        total = ts.entries.filter(deleted_at__isnull=True).aggregate(tot=Sum("duration_hours"))["tot"] or Decimal("0.00")
+        ts.total_hours = total
+        ts.save(update_fields=["status", "total_hours", "updated_at"])
+        return Response(self.get_serializer(ts).data)
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        ts = self.get_object()
+        ts.status = "Approved"
+        ts.approved_by = request.user
+        ts.save(update_fields=["status", "approved_by", "updated_at"])
+        return Response(self.get_serializer(ts).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        ts = self.get_object()
+        ts.status = "Rejected"
+        ts.rejection_reason = request.data.get("reason", "")
+        ts.save(update_fields=["status", "rejection_reason", "updated_at"])
+        return Response(self.get_serializer(ts).data)
+
+
+class TimesheetEntryViewSet(TenantModelViewSet):
+    queryset = TimesheetEntry.objects.select_related("user", "project", "task", "timesheet")
+    serializer_class = TimesheetEntrySerializer
+    audit_entity_type = "TimesheetEntry"
+    status_field = None
+    ordering = ["-date", "-created_at"]
+    filter_map = {"projectId": "project_id", "taskId": "task_id", "timesheetId": "timesheet_id", "userId": "user_id"}
+    permission_map = {"read": ["view_pms"], "write": ["view_pms"]}
+
+    def perform_create(self, serializer):
+        if not serializer.validated_data.get("user"):
+            serializer.validated_data["user"] = self.request.user
+        return super().perform_create(serializer)
+
+    @action(detail=False, methods=["post"], url_path="start-timer")
+    def start_timer(self, request):
+        """Starts a live timer for a task/project."""
+        # Stop any existing running timer for this user
+        now = timezone.now()
+        running = TimesheetEntry.objects.filter(
+            client_id=request.client_id,
+            user=request.user,
+            is_running=True,
+            deleted_at__isnull=True,
+        )
+        for r in running:
+            delta = now - r.start_time if r.start_time else timedelta(seconds=0)
+            hours = Decimal(str(round(delta.total_seconds() / 3600, 2)))
+            r.duration_hours = hours
+            r.end_time = now
+            r.is_running = False
+            r.save(update_fields=["duration_hours", "end_time", "is_running", "updated_at"])
+
+        entry = TimesheetEntry.objects.create(
+            client_id=request.client_id,
+            user=request.user,
+            project_id=request.data.get("projectId") or request.data.get("project_id"),
+            task_id=request.data.get("taskId") or request.data.get("task_id"),
+            date=now.date(),
+            start_time=now,
+            is_running=True,
+            is_billable=request.data.get("isBillable", True),
+            description=request.data.get("description", "Working..."),
+        )
+        return Response(self.get_serializer(entry).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="stop-timer")
+    def stop_timer(self, request, pk=None):
+        """Stops the specified live timer and finalizes duration."""
+        entry = self.get_object()
+        if not entry.is_running:
+            return Response(self.get_serializer(entry).data)
+
+        now = timezone.now()
+        delta = now - entry.start_time if entry.start_time else timedelta(seconds=0)
+        hours = Decimal(str(round(delta.total_seconds() / 3600, 2)))
+        entry.duration_hours = max(Decimal("0.01"), hours)
+        entry.end_time = now
+        entry.is_running = False
+        entry.save(update_fields=["duration_hours", "end_time", "is_running", "updated_at"])
+        return Response(self.get_serializer(entry).data)
+
+    @action(detail=False, methods=["get"], url_path="active-timer")
+    def active_timer(self, request):
+        """Retrieves currently running timer for the authenticated user."""
+        entry = TimesheetEntry.objects.filter(
+            client_id=request.client_id,
+            user=request.user,
+            is_running=True,
+            deleted_at__isnull=True,
+        ).first()
+        if not entry:
+            return Response({"active": False, "timer": None})
+        return Response({"active": True, "timer": self.get_serializer(entry).data})
+

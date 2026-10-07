@@ -25,9 +25,9 @@ router.register("locations", LocationViewSet, basename="inventory-locations")
 router.register("movements", views.StockMovementViewSet, basename="inventory-movements")
 router.register("transfers", views.StockTransferViewSet, basename="inventory-transfers")
 router.register("faulty-parts", views.FaultyPartViewSet, basename="inventory-faulty-parts")
-# Hidden: Service Usage & Zone Requests out of scope (Sweven spec)
-# router.register("service-usage", views.ServiceUsageViewSet, basename="inventory-service-usage")
-# router.register("zone-requests", views.ZoneRequestViewSet, basename="inventory-zone-requests")
+router.register("demo-units", views.DemoUnitViewSet, basename="inventory-demo-units")
+router.register("rework-orders", views.ReworkOrderViewSet, basename="inventory-rework-orders")
+router.register("scrap-logs", views.ScrapLogViewSet, basename="inventory-scrap-logs")
 router.register("audits", views.StockAuditViewSet, basename="inventory-audits")
 
 urlpatterns = [

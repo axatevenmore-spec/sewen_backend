@@ -70,12 +70,19 @@ from .models import (
     SalaryAdvance,
     SalaryStructure,
     ScreeningQuestion,
+    ScreeningAnswer,
     Team,
     Termination,
     Trainer,
     Training,
     TrainingParticipant,
     WorkingDay,
+    EmployeeTransfer,
+    EmployeePromotion,
+    EmployeeWarning,
+    EmployeeAward,
+    TravelRequest,
+    Announcement,
 )
 from .serializers import (
     AppraisalCycleSerializer,
@@ -119,13 +126,20 @@ from .serializers import (
     ResignationSerializer,
     SalaryAdvanceSerializer,
     SalaryStructureSerializer,
-    # ScreeningQuestionSerializer,  # Hidden: out of scope
+    ScreeningQuestionSerializer,
+    ScreeningAnswerSerializer,
     TeamSerializer,
     TerminationSerializer,
     TrainerSerializer,
     TrainingParticipantSerializer,
     TrainingSerializer,
     WorkingDaySerializer,
+    EmployeeTransferSerializer,
+    EmployeePromotionSerializer,
+    EmployeeWarningSerializer,
+    EmployeeAwardSerializer,
+    TravelRequestSerializer,
+    AnnouncementSerializer,
 )
 
 
@@ -1084,6 +1098,73 @@ class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
         row.save(update_fields=["delegate_confirmed_at", "status", "updated_at"])
         return Response(self.get_serializer(row).data)
 
+    @action(detail=False, methods=["post"], url_path="calculate-days")
+    def calculate_days(self, request):
+        """Calculates days preview with sandwich-leave detection (Spec §2.5.2)."""
+        import datetime
+        from datetime import timedelta
+        from .models import Holiday, LeaveType
+
+        from_date_str = request.data.get("fromDate") or request.data.get("from_date")
+        to_date_str = request.data.get("toDate") or request.data.get("to_date")
+        leave_type_id = request.data.get("leaveTypeId") or request.data.get("leave_type_id")
+
+        if not from_date_str or not to_date_str:
+            return Response({"error": "fromDate and toDate are required"}, status=400)
+
+        start = datetime.date.fromisoformat(str(from_date_str)[:10])
+        end = datetime.date.fromisoformat(str(to_date_str)[:10])
+        if end < start:
+            return Response({"error": "toDate must be on or after fromDate"}, status=400)
+
+        leave_type = LeaveType.objects.filter(id=leave_type_id, client_id=request.client_id).first() if leave_type_id else None
+        enforce_sandwich = bool(leave_type and leave_type.enforce_sandwich_rule)
+
+        holidays = set(Holiday.objects.filter(
+            client_id=request.client_id,
+            date__gte=start,
+            date__lte=end
+        ).values_list("date", flat=True))
+
+        total_calendar_days = (end - start).days + 1
+        day_breakdown = []
+        working_days = 0
+        sandwich_days = 0
+
+        curr = start
+        while curr <= end:
+            is_weekend = curr.weekday() in (5, 6)
+            is_holiday = curr in holidays
+            is_off = is_weekend or is_holiday
+            if not is_off:
+                working_days += 1
+                counted = True
+            else:
+                counted = enforce_sandwich
+                if enforce_sandwich:
+                    sandwich_days += 1
+
+            day_breakdown.append({
+                "date": curr.isoformat(),
+                "day_of_week": curr.strftime("%A"),
+                "is_weekend": is_weekend,
+                "is_holiday": is_holiday,
+                "is_counted": counted
+            })
+            curr += timedelta(days=1)
+
+        counted_days = total_calendar_days if enforce_sandwich else working_days
+
+        return Response({
+            "enforce_sandwich_rule": enforce_sandwich,
+            "total_calendar_days": total_calendar_days,
+            "working_days": working_days,
+            "sandwich_penalty_days": sandwich_days if enforce_sandwich else 0,
+            "chargeable_days": counted_days,
+            "day_breakdown": day_breakdown
+        })
+
+
 
 class LeaveBalanceViewSet(OwnEmployeeScopeMixin, ReadOnlyTenantViewSet):
     queryset = LeaveBalance.objects.select_related("employee", "leave_type")
@@ -1346,6 +1427,31 @@ class InterviewViewSet(TenantModelViewSet):
     ordering = ["scheduled_at"]
     filter_map = {"applicationId": "application_id"}
     permission_map = {"read": ["view_staff"], "write": ["create_staff"]}
+
+    @action(detail=True, methods=["post"], url_path="generate-zoom-meeting")
+    def generate_zoom_meeting(self, request, pk=None):
+        """Generates or attaches a Zoom meeting link to the interview (Spec §2.5.5)."""
+        import random
+        interview = self.get_object()
+        meeting_id = f"{random.randint(100, 999)} {random.randint(1000, 9999)} {random.randint(1000, 9999)}"
+        passcode = "".join(random.choices("0123456789abcdef", k=6))
+        zoom_link = f"https://zoom.us/j/{meeting_id.replace(' ', '')}?pwd={passcode}"
+
+        interview.location = zoom_link
+        note_text = f"Zoom Meeting ID: {meeting_id} | Passcode: {passcode} | Link: {zoom_link}"
+        if interview.notes:
+            interview.notes = f"{interview.notes}\n{note_text}"
+        else:
+            interview.notes = note_text
+        interview.save(update_fields=["location", "notes", "updated_at"])
+
+        return Response({
+            "zoom_link": zoom_link,
+            "meeting_id": meeting_id,
+            "passcode": passcode,
+            "interview": self.get_serializer(interview).data
+        })
+
 
 
 class OfferViewSet(TenantModelViewSet):
@@ -2265,3 +2371,119 @@ class HrmsSettingsView(APIView):
             defaults={"value": request.data, "updated_by": request.user},
         )
         return Response(row.value)
+
+
+# ---------------------------------------------------------------------------
+# Upgradation Scope: Transfers, Promotions, Warnings, Awards, Travel, Announcements
+# ---------------------------------------------------------------------------
+class EmployeeTransferViewSet(TenantModelViewSet):
+    queryset = EmployeeTransfer.objects.select_related("employee", "from_department", "to_department", "from_location", "to_location")
+    serializer_class = EmployeeTransferSerializer
+    audit_entity_type = "EmployeeTransfer"
+    audit_label_field = "transfer_number"
+    status_field = "status"
+    search_fields = ["transfer_number", "employee__name", "reason"]
+    ordering = ["-effective_date", "-created_at"]
+    filter_map = {"employeeId": "employee_id", "status": "status"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def perform_create(self, serializer):
+        serializer.validated_data["transfer_number"] = allocate_number(self.request.user.client, "TRF")
+        return super().perform_create(serializer)
+
+
+class EmployeePromotionViewSet(TenantModelViewSet):
+    queryset = EmployeePromotion.objects.select_related("employee", "from_designation", "to_designation")
+    serializer_class = EmployeePromotionSerializer
+    audit_entity_type = "EmployeePromotion"
+    audit_label_field = "promotion_number"
+    status_field = "status"
+    search_fields = ["promotion_number", "employee__name", "justification"]
+    ordering = ["-effective_date", "-created_at"]
+    filter_map = {"employeeId": "employee_id", "status": "status"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def perform_create(self, serializer):
+        serializer.validated_data["promotion_number"] = allocate_number(self.request.user.client, "PRM")
+        return super().perform_create(serializer)
+
+
+class EmployeeWarningViewSet(TenantModelViewSet):
+    queryset = EmployeeWarning.objects.select_related("employee")
+    serializer_class = EmployeeWarningSerializer
+    audit_entity_type = "EmployeeWarning"
+    audit_label_field = "warning_number"
+    status_field = "status"
+    search_fields = ["warning_number", "employee__name", "subject", "description"]
+    ordering = ["-issue_date", "-created_at"]
+    filter_map = {"employeeId": "employee_id", "status": "status", "severity": "severity"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def perform_create(self, serializer):
+        serializer.validated_data["warning_number"] = allocate_number(self.request.user.client, "WRN")
+        return super().perform_create(serializer)
+
+
+class EmployeeAwardViewSet(TenantModelViewSet):
+    queryset = EmployeeAward.objects.select_related("employee")
+    serializer_class = EmployeeAwardSerializer
+    audit_entity_type = "EmployeeAward"
+    audit_label_field = "award_number"
+    status_field = None
+    search_fields = ["award_number", "employee__name", "award_name", "category"]
+    ordering = ["-award_date", "-created_at"]
+    filter_map = {"employeeId": "employee_id", "category": "category"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def perform_create(self, serializer):
+        serializer.validated_data["award_number"] = allocate_number(self.request.user.client, "AWD")
+        return super().perform_create(serializer)
+
+
+class TravelRequestViewSet(TenantModelViewSet):
+    queryset = TravelRequest.objects.select_related("employee")
+    serializer_class = TravelRequestSerializer
+    audit_entity_type = "TravelRequest"
+    audit_label_field = "travel_number"
+    status_field = "status"
+    search_fields = ["travel_number", "employee__name", "destination", "purpose"]
+    ordering = ["-start_date", "-created_at"]
+    filter_map = {"employeeId": "employee_id", "status": "status"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def perform_create(self, serializer):
+        serializer.validated_data["travel_number"] = allocate_number(self.request.user.client, "TRV")
+        return super().perform_create(serializer)
+
+
+class AnnouncementViewSet(TenantModelViewSet):
+    queryset = Announcement.objects.select_related("target_department")
+    serializer_class = AnnouncementSerializer
+    audit_entity_type = "Announcement"
+    audit_label_field = "title"
+    status_field = None
+    search_fields = ["title", "content", "author_name"]
+    ordering = ["-is_pinned", "-publish_date", "-created_at"]
+    filter_map = {"targetDepartmentId": "target_department_id", "priority": "priority"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+
+class ScreeningQuestionViewSet(TenantModelViewSet):
+    queryset = ScreeningQuestion.objects.select_related("job")
+    serializer_class = ScreeningQuestionSerializer
+    audit_entity_type = "ScreeningQuestion"
+    status_field = None
+    ordering = ["sort_order", "created_at"]
+    filter_map = {"jobId": "job_id", "isActive": "is_active"}
+    permission_map = {"read": ["view_staff"], "write": ["create_staff"]}
+
+
+class ScreeningAnswerViewSet(TenantModelViewSet):
+    queryset = ScreeningAnswer.objects.select_related("application", "question")
+    serializer_class = ScreeningAnswerSerializer
+    audit_entity_type = "ScreeningAnswer"
+    status_field = None
+    ordering = ["created_at"]
+    filter_map = {"applicationId": "application_id", "questionId": "question_id"}
+    permission_map = {"read": ["view_staff"], "write": ["create_staff"]}
+

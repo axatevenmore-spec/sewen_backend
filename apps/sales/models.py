@@ -109,6 +109,9 @@ class Estimate(DocumentHeader):
     converted_quotation = models.ForeignKey(
         "Quotation", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
+    converted_challan = models.ForeignKey(
+        "DeliveryChallan", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
     crm_lead = models.ForeignKey(
         "crm.Lead", null=True, blank=True, on_delete=models.SET_NULL, related_name="estimates"
     )

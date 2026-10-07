@@ -11,6 +11,7 @@ router.register("orders", views.PurchaseOrderViewSet, basename="purchase-orders"
 router.register("bills", views.PurchaseBillViewSet, basename="purchase-bills")
 router.register("receipts", views.GoodsReceiptViewSet, basename="purchase-receipts")
 router.register("payments", views.PaymentOutViewSet, basename="purchase-payments")
+router.register("advances", views.VendorAdvanceViewSet, basename="purchase-advances")
 router.register("returns", views.PurchaseReturnViewSet, basename="purchase-returns")
 router.register("expenses", views.ExpenseViewSet, basename="purchase-expenses")
 router.register("vendors", views.VendorLookupViewSet, basename="purchase-vendors")

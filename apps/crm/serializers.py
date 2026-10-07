@@ -554,6 +554,9 @@ class ContractSerializer(BaseModelSerializer):
             "projectId", "template_key", "contract_type", "value", "start_date",
             "end_date", "status", "displayStatus", "body", "description", "terms",
             "attachments", "notify_customer", "signed_file", "signed_at",
+            "client_signature", "client_signed_by", "client_signed_at",
+            "company_signature", "company_signed_by", "company_signed_at",
+            "rejection_reason", "pdf_file", "pdf_generated_at", "email_dispatched_at",
             "expiring_soon_days", "createdByName", "created_at", "updated_at",
         ]
         read_only_fields = ["contract_number", "deal", "created_at", "updated_at"]

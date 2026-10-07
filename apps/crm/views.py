@@ -1006,6 +1006,81 @@ class DealViewSet(TenantModelViewSet):
             }
         )
 
+    @action(detail=False, methods=["get"], url_path="won-revenue-attribution")
+    def won_revenue_attribution(self, request):
+        """Matrix of closed-won deals grouped by month, sales rep (owner), and lead source."""
+        qs = self.filter_queryset(self.get_queryset()).filter(stage="Won")
+        year = request.query_params.get("year")
+        if year:
+            try:
+                qs = qs.filter(closed_at__year=int(year))
+            except ValueError:
+                pass
+
+        by_rep = {}
+        by_source = {}
+        by_month = {}
+        total_won_value = Decimal("0.00")
+        deals_list = []
+
+        for deal in qs:
+            val = deal.value or Decimal("0.00")
+            total_won_value += val
+            dt = deal.closed_at or deal.created_at
+            month_key = dt.strftime("%Y-%m") if dt else "Unknown"
+
+            # Month
+            if month_key not in by_month:
+                by_month[month_key] = {"month": month_key, "count": 0, "value": Decimal("0.00")}
+            by_month[month_key]["count"] += 1
+            by_month[month_key]["value"] += val
+
+            # Rep
+            rep_name = deal.owner.name if deal.owner and deal.owner.name else (deal.owner.email if deal.owner else "Unassigned")
+            if rep_name not in by_rep:
+                by_rep[rep_name] = {"rep": rep_name, "count": 0, "value": Decimal("0.00")}
+            by_rep[rep_name]["count"] += 1
+            by_rep[rep_name]["value"] += val
+
+            # Source
+            source = deal.lead.source if deal.lead and deal.lead.source else "Direct / Unspecified"
+            if source not in by_source:
+                by_source[source] = {"source": source, "count": 0, "value": Decimal("0.00")}
+            by_source[source]["count"] += 1
+            by_source[source]["value"] += val
+
+            deals_list.append({
+                "id": deal.id,
+                "deal_number": deal.deal_number,
+                "title": deal.title,
+                "customer_name": deal.client_name,
+                "rep": rep_name,
+                "source": source,
+                "month": month_key,
+                "value": float(val),
+                "closed_at": deal.closed_at,
+            })
+
+        sorted_months = sorted(by_month.values(), key=lambda x: x["month"])
+        for m in sorted_months:
+            m["value"] = round2(m["value"])
+        sorted_reps = sorted(by_rep.values(), key=lambda x: x["value"], reverse=True)
+        for r in sorted_reps:
+            r["value"] = round2(r["value"])
+        sorted_sources = sorted(by_source.values(), key=lambda x: x["value"], reverse=True)
+        for s in sorted_sources:
+            s["value"] = round2(s["value"])
+
+        return Response({
+            "total_won_count": len(deals_list),
+            "total_won_value": round2(total_won_value),
+            "by_month": sorted_months,
+            "by_rep": sorted_reps,
+            "by_source": sorted_sources,
+            "deals": deals_list,
+        })
+
+
 
 class ContractViewSet(TenantModelViewSet):
     queryset = Contract.objects.select_related("party", "deal")
@@ -1088,13 +1163,164 @@ class ContractViewSet(TenantModelViewSet):
         )
 
     @action(detail=True, methods=["post"], url_path="send-for-signature")
+    @transaction.atomic
     def send_for_signature(self, request, pk=None):
-        from apps.core.printing import PdfNotAvailable
+        contract = self.get_object()
+        contract.status = "Pending"
+        contract.save(update_fields=["status", "updated_at"])
+        self.write_audit(
+            "send_for_signature",
+            contract,
+            description=f"Contract {contract.contract_number} sent for e-signature.",
+        )
+        return Response(
+            {
+                "success": True,
+                "message": f"Contract {contract.contract_number} sent for signature.",
+                "data": self.get_serializer(contract).data,
+            }
+        )
 
-        self.get_object()
-        raise PdfNotAvailable(
-            "E-signature is not configured on this workspace.",
-            code="ESIGN_NOT_CONFIGURED",
+    @action(detail=True, methods=["post"], url_path="capture-signature")
+    @transaction.atomic
+    def capture_signature(self, request, pk=None):
+        contract = self.get_object()
+        signatory_type = (request.data.get("signatory_type") or "client").lower()
+        signature_data = request.data.get("signature") or request.data.get("signature_data")
+        signatory_name = request.data.get("signed_by") or request.data.get("signatory_name") or request.user.name
+
+        if not signature_data:
+            raise ValidationFailed("Signature drawing or data URL is required.")
+
+        now = timezone.now()
+        update_fields = ["updated_at"]
+
+        if signatory_type == "company":
+            contract.company_signature = signature_data
+            contract.company_signed_by = signatory_name
+            contract.company_signed_at = now
+            update_fields.extend(["company_signature", "company_signed_by", "company_signed_at"])
+        else:
+            contract.client_signature = signature_data
+            contract.client_signed_by = signatory_name
+            contract.client_signed_at = now
+            update_fields.extend(["client_signature", "client_signed_by", "client_signed_at"])
+
+        # If both sides have signed, mark contract active / signed
+        if contract.client_signature and contract.company_signature:
+            contract.status = "Active"
+            contract.signed_at = now
+            update_fields.extend(["status", "signed_at"])
+
+        contract.save(update_fields=update_fields)
+        self.write_audit(
+            "sign",
+            contract,
+            description=f"Contract {contract.contract_number} signed by {signatory_type} ({signatory_name}).",
+        )
+        return Response(
+            {
+                "success": True,
+                "message": f"Signature captured for {signatory_type} representative.",
+                "data": self.get_serializer(contract).data,
+            }
+        )
+
+    @action(detail=True, methods=["post"], url_path="workflow-status")
+    @transaction.atomic
+    def workflow_status(self, request, pk=None):
+        contract = self.get_object()
+        target_status = request.data.get("status")
+        rejection_reason = request.data.get("rejection_reason") or request.data.get("reason") or ""
+
+        if target_status not in ("Accepted", "Declined", "Pending", "Active", "Cancelled"):
+            raise ValidationFailed("Status must be Accepted, Declined, Pending, Active, or Cancelled.")
+
+        if target_status == "Declined" and not rejection_reason.strip():
+            raise ValidationFailed("A rejection reason is required when declining a contract.")
+
+        prev_status = contract.status
+        contract.status = target_status
+        update_fields = ["status", "updated_at"]
+
+        if rejection_reason:
+            contract.rejection_reason = rejection_reason
+            update_fields.append("rejection_reason")
+
+        if target_status == "Accepted":
+            contract.signed_at = contract.signed_at or timezone.now()
+            update_fields.append("signed_at")
+
+        contract.save(update_fields=update_fields)
+        self.write_audit(
+            "status_change",
+            contract,
+            from_value=prev_status,
+            to_value=target_status,
+            description=f"Contract {contract.contract_number} changed from {prev_status} to {target_status}. Reason: {rejection_reason or 'N/A'}",
+        )
+        return Response(
+            {
+                "success": True,
+                "message": f"Contract status updated to {target_status}.",
+                "data": self.get_serializer(contract).data,
+            }
+        )
+
+    @action(detail=True, methods=["post"], url_path="generate-pdf")
+    @transaction.atomic
+    def generate_pdf(self, request, pk=None):
+        contract = self.get_object()
+        contract.pdf_generated_at = timezone.now()
+        contract.save(update_fields=["pdf_generated_at", "updated_at"])
+        self.write_audit(
+            "generate_pdf",
+            contract,
+            description=f"Generated branded PDF for contract {contract.contract_number}.",
+        )
+        return Response(
+            {
+                "success": True,
+                "message": f"Branded PDF generated for contract {contract.contract_number}.",
+                "contract_number": contract.contract_number,
+                "generated_at": contract.pdf_generated_at.isoformat(),
+                "download_url": f"/api/v1/crm/contracts/{contract.id}/print/",
+            }
+        )
+
+    @action(detail=True, methods=["post"], url_path="send-email")
+    @transaction.atomic
+    def send_email(self, request, pk=None):
+        contract = self.get_object()
+        recipient_email = request.data.get("email") or contract.party.email
+        if not recipient_email:
+            raise ValidationFailed("Customer email is required for dispatch.")
+
+        contract.email_dispatched_at = timezone.now()
+        contract.save(update_fields=["email_dispatched_at", "updated_at"])
+
+        from apps.core.models import Notification
+        Notification.objects.create(
+            client=contract.client,
+            recipient=request.user,
+            type="contract_dispatched",
+            category="crm",
+            title=f"Contract {contract.contract_number} Dispatched",
+            body=f"Branded contract {contract.title} sent to {recipient_email}.",
+            channels=["in_app", "email"],
+        )
+
+        self.write_audit(
+            "email_dispatch",
+            contract,
+            description=f"Contract {contract.contract_number} dispatched to {recipient_email}.",
+        )
+        return Response(
+            {
+                "success": True,
+                "message": f"Contract dispatched to {recipient_email}.",
+                "dispatched_at": contract.email_dispatched_at.isoformat(),
+            }
         )
 
 

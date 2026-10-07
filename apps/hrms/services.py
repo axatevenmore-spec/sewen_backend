@@ -1042,6 +1042,25 @@ def process_payroll(*, client, period_month, employee_ids=None, user=None):
         )
         split = split_structure(employee.salary_structure, result["earnedSalary"])
 
+        # Overtime capping logic (Spec §2.5.3)
+        ot_sum = Attendance.objects.filter(
+            client=client,
+            employee=employee,
+            work_date__gte=period_month,
+            work_date__lte=month_end,
+            deleted_at__isnull=True,
+        ).aggregate(tot=Sum("overtime_hours"))["tot"] or Decimal("0.00")
+
+        structure = employee.salary_structure
+        max_ot = structure.max_overtime_hours_month if structure and structure.max_overtime_hours_month else None
+        capped_ot = min(ot_sum, Decimal(str(max_ot))) if max_ot is not None else ot_sum
+        multiplier = Decimal(str(structure.overtime_rate_multiplier)) if structure and structure.overtime_rate_multiplier else Decimal("1.5")
+        hourly_rate = (employee.standard_salary / (total_days * Decimal("8.0"))) if total_days else Decimal("0.00")
+        ot_pay = round2(capped_ot * hourly_rate * multiplier)
+
+        additional_earnings = ot_pay
+        net_payable = round2(result["netPayable"] + additional_earnings)
+
         payslip, created = Payslip.objects.update_or_create(
             payroll_run=run,
             employee=employee,
@@ -1057,16 +1076,21 @@ def process_payroll(*, client, period_month, employee_ids=None, user=None):
                 "basic": split["basic"],
                 "hra": split["hra"],
                 "allowances": split["allowances"],
-                "additional_earnings": ZERO,
+                "additional_earnings": additional_earnings,
                 "deductions": ZERO,
                 "advance_recovery": advance,
-                "net_payable": result["netPayable"],
+                "net_payable": net_payable,
                 "status": "In Progress",
             },
         )
 
         PayslipComponent.objects.filter(payslip=payslip).delete()
-        if split["components"]:
+        components = list(split["components"] or [])
+        if ot_pay > 0:
+            comp_name = "Overtime Pay (Capped)" if (max_ot and ot_sum > capped_ot) else "Overtime Pay"
+            components.append({"name": comp_name, "kind": "Earning", "amount": ot_pay})
+
+        if components:
             PayslipComponent.objects.bulk_create(
                 [
                     PayslipComponent(
@@ -1076,7 +1100,7 @@ def process_payroll(*, client, period_month, employee_ids=None, user=None):
                         kind=component["kind"],
                         amount=component["amount"],
                     )
-                    for component in split["components"]
+                    for component in components
                 ]
             )
         payslips.append(payslip)

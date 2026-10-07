@@ -27,6 +27,7 @@ from .models import (
     PurchaseOrderLine,
     PurchaseReturn,
     PurchaseReturnLine,
+    VendorAdvance,
 )
 
 PurchaseOrderLineSerializer = line_serializer_for(
@@ -133,12 +134,15 @@ class PurchaseBillSerializer(DocumentSerializer):
     )
     goodsReceived = serializers.BooleanField(source="goods_received", read_only=True)
     qcStatus = serializers.CharField(source="qc_status", read_only=True)
+    projectId = TenantPrimaryKeyRelatedField(
+        source="project", model="pms.Project", required=False, allow_null=True
+    )
 
     class Meta:
         model = PurchaseBill
         fields = HEADER_FIELDS + [
             "bill_number", "vendorBillNumber", "status", "due_date",
-            "purchase_order", "location", "goodsReceived", "received_date",
+            "purchase_order", "projectId", "location", "goodsReceived", "received_date",
             "qcStatus", "qc_note", "vendorId", "vendorName",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + [
@@ -284,17 +288,50 @@ class ExpenseSerializer(BaseModelSerializer):
     receiptFileId = TenantPrimaryKeyRelatedField(
         source="receipt_file", model="core.File", required=False, allow_null=True
     )
+    projectId = TenantPrimaryKeyRelatedField(
+        source="project", model="pms.Project", required=False, allow_null=True
+    )
     date = serializers.DateField(source="expense_date")
 
     class Meta:
         model = Expense
         fields = [
             "id", "expense_number", "categoryId", "categoryName", "vendorId",
-            "vendorName", "date", "amount", "tax_amount", "total", "payment_mode",
+            "vendorName", "projectId", "date", "amount", "tax_amount", "total", "payment_mode",
             "bankAccountId", "receiptFileId", "account", "reference_number",
             "notes", "status", "created_at", "updated_at",
         ]
         read_only_fields = ["expense_number", "total", "created_at", "updated_at"]
+
+
+class VendorAdvanceSerializer(BaseModelSerializer):
+    vendorId = TenantPrimaryKeyRelatedField(
+        source="party", model="masters.Party"
+    )
+    vendorName = serializers.CharField(source="party.name", read_only=True)
+    purchaseOrderId = TenantPrimaryKeyRelatedField(
+        source="purchase_order", model="purchase.PurchaseOrder", required=False, allow_null=True
+    )
+    poNumber = serializers.CharField(source="purchase_order.po_number", read_only=True)
+    bankAccountId = TenantPrimaryKeyRelatedField(
+        source="bank_account", model="accounting.BankAccount", required=False, allow_null=True
+    )
+    unallocatedAmount = serializers.SerializerMethodField()
+
+    class Meta:
+        model = VendorAdvance
+        fields = [
+            "id", "advance_number", "vendorId", "vendorName", "purchaseOrderId",
+            "poNumber", "advance_date", "amount", "reconciled_amount",
+            "unallocatedAmount", "mode", "bankAccountId", "reference_number",
+            "status", "notes", "created_at", "updated_at",
+        ]
+        read_only_fields = [
+            "advance_number", "reconciled_amount", "created_at", "updated_at",
+        ]
+
+    def get_unallocatedAmount(self, advance):
+        return advance.unallocated_amount
 
 
 

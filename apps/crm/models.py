@@ -597,6 +597,9 @@ class Contract(TenantModel, LegacyIdMixin):
 
     STATUSES = [
         ("Draft", "Draft"),
+        ("Pending", "Pending"),
+        ("Accepted", "Accepted"),
+        ("Declined", "Declined"),
         ("Active", "Active"),
         ("Closed", "Closed"),
         ("Cancelled", "Cancelled"),
@@ -624,6 +627,19 @@ class Contract(TenantModel, LegacyIdMixin):
     customer_name = models.TextField(null=True, blank=True)
     description = models.TextField(null=True, blank=True)
     terms = models.TextField(null=True, blank=True)
+    #: Dual e-signature capture (client and company authorized representatives)
+    client_signature = models.TextField(null=True, blank=True)
+    client_signed_by = models.TextField(null=True, blank=True)
+    client_signed_at = models.DateTimeField(null=True, blank=True)
+    company_signature = models.TextField(null=True, blank=True)
+    company_signed_by = models.TextField(null=True, blank=True)
+    company_signed_at = models.DateTimeField(null=True, blank=True)
+    rejection_reason = models.TextField(null=True, blank=True)
+    pdf_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    pdf_generated_at = models.DateTimeField(null=True, blank=True)
+    email_dispatched_at = models.DateTimeField(null=True, blank=True)
     #: ``[{fileId, name, size, mimeType, uploadedBy, createdAt}]`` -- uploaded ``core.File`` refs.
     attachments = models.JSONField(default=list, blank=True)
     notify_customer = models.BooleanField(default=False)

@@ -546,3 +546,75 @@ class ExportJob(TenantModel):
     class Meta:
         db_table = "export_jobs"
         ordering = ["-created_at"]
+
+
+# ---------------------------------------------------------------------------
+# Dynamic Custom Field Engine & Form Builder (Dev Spec §6.2)
+# ---------------------------------------------------------------------------
+class CustomFieldDefinition(TenantModel, LegacyIdMixin):
+    FIELD_TYPES = [
+        ("text", "Text"),
+        ("number", "Number"),
+        ("date", "Date"),
+        ("select", "Select"),
+        ("checkbox", "Checkbox"),
+        ("textarea", "Textarea"),
+    ]
+
+    entity_type = models.TextField()  # lead | deal | customer | item | project | employee | invoice
+    field_label = models.TextField()
+    field_name = models.TextField()
+    field_type = models.TextField(choices=FIELD_TYPES, default="text")
+    options = models.JSONField(default=list, blank=True)
+    is_required = models.BooleanField(default=False)
+    default_value = models.TextField(null=True, blank=True)
+    sort_order = models.IntegerField(default=0)
+
+    class Meta:
+        db_table = "custom_field_definitions"
+        ordering = ["entity_type", "sort_order", "field_label"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "entity_type", "field_name"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_custom_field_entity_name",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.entity_type}.{self.field_name} ({self.field_label})"
+
+
+# ---------------------------------------------------------------------------
+# Omnichannel Integrations & Outgoing Webhooks (Dev Spec §6.4)
+# ---------------------------------------------------------------------------
+class WebhookEndpoint(TenantModel, LegacyIdMixin):
+    name = models.TextField()
+    target_url = models.URLField()
+    secret_key = models.TextField(null=True, blank=True)
+    events = models.JSONField(default=list, blank=True)  # contract.signed, lead.won, etc.
+    is_active = models.BooleanField(default=True)
+    description = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "webhook_endpoints"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.name} ({self.target_url})"
+
+
+class WebhookDelivery(TenantModel):
+    endpoint = models.ForeignKey(WebhookEndpoint, on_delete=models.CASCADE, related_name="deliveries")
+    event_name = models.TextField()
+    payload = models.JSONField(default=dict)
+    response_status = models.IntegerField(null=True, blank=True)
+    response_body = models.TextField(null=True, blank=True)
+    status = models.TextField(default="sent")  # sent | failed
+    error = models.TextField(null=True, blank=True)
+    attempted_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "webhook_deliveries"
+        ordering = ["-attempted_at"]
+

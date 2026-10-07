@@ -8,6 +8,8 @@ router = DefaultRouter(trailing_slash=True)
 router.register("files", views.FileViewSet, basename="files")
 router.register("notifications", views.NotificationViewSet, basename="notifications")
 router.register("audit", views.AuditLogViewSet, basename="audit")
+router.register("custom-fields", views.CustomFieldDefinitionViewSet, basename="custom-fields")
+router.register("webhooks", views.WebhookEndpointViewSet, basename="webhooks")
 
 file_urlpatterns = [
     path("upload-url/", views.UploadUrlView.as_view(), name="file-upload-url"),
@@ -50,6 +52,7 @@ urlpatterns = [
     path("settings/", include(settings_urlpatterns)),
     path("support/", include(support_router.urls)),
     path("events/stream/", views.EventStreamView.as_view(), name="events-stream"),
+    path("notifications/send-omnichannel/", views.SendOmnichannelNotificationView.as_view(), name="notifications-send-omnichannel"),
     path("search/", views.GlobalSearchView.as_view(), name="global-search"),
     path("", include(router.urls)),
 ]

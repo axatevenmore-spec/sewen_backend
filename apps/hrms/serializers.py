@@ -65,6 +65,12 @@ from .models import (
     Training,
     TrainingParticipant,
     WorkingDay,
+    EmployeeTransfer,
+    EmployeePromotion,
+    EmployeeWarning,
+    EmployeeAward,
+    TravelRequest,
+    Announcement,
 )
 
 
@@ -525,7 +531,8 @@ class LeaveTypeSerializer(BaseModelSerializer):
         model = LeaveType
         fields = [
             "id", "name", "code", "annual_entitlement", "accrual",
-            "carry_forward_cap", "is_encashable", "is_paid", "created_at",
+            "carry_forward_cap", "is_encashable", "is_paid", "enforce_sandwich_rule",
+            "created_at",
         ]
 
 
@@ -623,9 +630,11 @@ class SalaryStructureSerializer(BaseModelSerializer):
     class Meta:
         model = SalaryStructure
         fields = [
-            "id", "name", "basic_pct", "hra_pct", "components", "is_active",
+            "id", "name", "basic_pct", "hra_pct", "components",
+            "max_overtime_hours_month", "overtime_rate_multiplier", "is_active",
             "created_at", "updated_at",
         ]
+
 
 
 class PayslipComponentSerializer(BaseModelSerializer):
@@ -827,15 +836,26 @@ class OnboardingTaskSerializer(BaseModelSerializer):
         fields = ["id", "candidateId", "title", "owner", "due_date", "completed_at"]
 
 
-# Hidden: Screening Questions out of scope (Sweven spec) -- restore by uncommenting this block.
-# class ScreeningQuestionSerializer(BaseModelSerializer):
-#     jobId = TenantPrimaryKeyRelatedField(
-#         source="job", model="hrms.Job", required=False, allow_null=True
-#     )
+class ScreeningQuestionSerializer(BaseModelSerializer):
+    jobId = TenantPrimaryKeyRelatedField(
+        source="job", model="hrms.Job", required=False, allow_null=True
+    )
+    jobTitle = serializers.CharField(source="job.title", read_only=True)
 
-#     class Meta:
-#         model = ScreeningQuestion
-#         fields = ["id", "jobId", "question", "type", "options", "is_active", "sort_order"]
+    class Meta:
+        model = ScreeningQuestion
+        fields = ["id", "jobId", "jobTitle", "question", "type", "options", "is_active", "sort_order", "created_at"]
+
+
+class ScreeningAnswerSerializer(BaseModelSerializer):
+    applicationId = TenantPrimaryKeyRelatedField(source="application", model="hrms.Application")
+    questionId = TenantPrimaryKeyRelatedField(source="question", model="hrms.ScreeningQuestion")
+    questionText = serializers.CharField(source="question.question", read_only=True)
+
+    class Meta:
+        model = ScreeningAnswer
+        fields = ["id", "applicationId", "questionId", "questionText", "answer", "created_at"]
+
 
 
 # ---------------------------------------------------------------------------
@@ -1280,3 +1300,111 @@ class ComplaintSerializer(BaseModelSerializer):
 
     def get_againstName(self, complaint):
         return complaint.against_employee.name if complaint.against_employee_id else None
+
+
+# ---------------------------------------------------------------------------
+# Upgradation Scope: Transfers, Promotions, Warnings, Awards, Travel, Announcements
+# ---------------------------------------------------------------------------
+class EmployeeTransferSerializer(BaseModelSerializer):
+    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
+    fromDepartmentId = TenantPrimaryKeyRelatedField(source="from_department", model="hrms.Department", required=False, allow_null=True)
+    fromDepartmentName = serializers.CharField(source="from_department.name", read_only=True)
+    toDepartmentId = TenantPrimaryKeyRelatedField(source="to_department", model="hrms.Department", required=False, allow_null=True)
+    toDepartmentName = serializers.CharField(source="to_department.name", read_only=True)
+    fromLocationId = TenantPrimaryKeyRelatedField(source="from_location", model="hrms.Location", required=False, allow_null=True)
+    fromLocationName = serializers.CharField(source="from_location.name", read_only=True)
+    toLocationId = TenantPrimaryKeyRelatedField(source="to_location", model="hrms.Location", required=False, allow_null=True)
+    toLocationName = serializers.CharField(source="to_location.name", read_only=True)
+
+    class Meta:
+        model = EmployeeTransfer
+        fields = [
+            "id", "transfer_number", "employeeId", "employeeName", "employeeCode",
+            "fromDepartmentId", "fromDepartmentName", "toDepartmentId", "toDepartmentName",
+            "fromLocationId", "fromLocationName", "toLocationId", "toLocationName",
+            "effective_date", "reason", "status", "created_at", "updated_at",
+        ]
+        read_only_fields = ["transfer_number", "created_at", "updated_at"]
+
+
+class EmployeePromotionSerializer(BaseModelSerializer):
+    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
+    fromDesignationId = TenantPrimaryKeyRelatedField(source="from_designation", model="hrms.Designation", required=False, allow_null=True)
+    fromDesignationTitle = serializers.CharField(source="from_designation.title", read_only=True)
+    toDesignationId = TenantPrimaryKeyRelatedField(source="to_designation", model="hrms.Designation", required=False, allow_null=True)
+    toDesignationTitle = serializers.CharField(source="to_designation.title", read_only=True)
+
+    class Meta:
+        model = EmployeePromotion
+        fields = [
+            "id", "promotion_number", "employeeId", "employeeName", "employeeCode",
+            "fromDesignationId", "fromDesignationTitle", "toDesignationId", "toDesignationTitle",
+            "previous_salary", "new_salary", "effective_date", "justification", "status",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["promotion_number", "created_at", "updated_at"]
+
+
+class EmployeeWarningSerializer(BaseModelSerializer):
+    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
+
+    class Meta:
+        model = EmployeeWarning
+        fields = [
+            "id", "warning_number", "employeeId", "employeeName", "employeeCode",
+            "issue_date", "severity", "incident_date", "subject", "description",
+            "corrective_action", "status", "employee_explanation", "created_at", "updated_at",
+        ]
+        read_only_fields = ["warning_number", "created_at", "updated_at"]
+
+
+class EmployeeAwardSerializer(BaseModelSerializer):
+    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
+
+    class Meta:
+        model = EmployeeAward
+        fields = [
+            "id", "award_number", "employeeId", "employeeName", "employeeCode",
+            "award_name", "category", "award_date", "gift_amount", "citation",
+            "badge_icon", "created_at",
+        ]
+        read_only_fields = ["award_number", "created_at"]
+
+
+class TravelRequestSerializer(BaseModelSerializer):
+    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
+
+    class Meta:
+        model = TravelRequest
+        fields = [
+            "id", "travel_number", "employeeId", "employeeName", "employeeCode",
+            "purpose", "destination", "start_date", "end_date", "advance_requested",
+            "advance_disbursed", "actual_expenses", "settlement_notes", "status",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["travel_number", "created_at", "updated_at"]
+
+
+class AnnouncementSerializer(BaseModelSerializer):
+    targetDepartmentId = TenantPrimaryKeyRelatedField(source="target_department", model="hrms.Department", required=False, allow_null=True)
+    targetDepartmentName = serializers.CharField(source="target_department.name", read_only=True)
+
+    class Meta:
+        model = Announcement
+        fields = [
+            "id", "title", "content", "priority", "targetDepartmentId",
+            "targetDepartmentName", "is_pinned", "publish_date", "expiry_date",
+            "author_name", "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+

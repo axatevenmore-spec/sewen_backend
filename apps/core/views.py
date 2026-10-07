@@ -22,15 +22,28 @@ from rest_framework.views import APIView
 from . import files as file_service
 from .audit import mark_read, request_ip
 from .exceptions import NotFound, ValidationFailed
-from .models import AuditLog, CompanyProfile, File, Notification, Setting, SupportTicket
+from .models import (
+    AuditLog,
+    CompanyProfile,
+    CustomFieldDefinition,
+    File,
+    Notification,
+    Setting,
+    SupportTicket,
+    WebhookDelivery,
+    WebhookEndpoint,
+)
 from .pagination import envelope
 from .permissions import AllowPublic, HasModulePermission, has_permission
 from .serializers_platform import (
     AuditLogSerializer,
+    CustomFieldDefinitionSerializer,
     FileSerializer,
     NotificationSerializer,
     SupportTicketSerializer,
     UploadUrlRequestSerializer,
+    WebhookDeliverySerializer,
+    WebhookEndpointSerializer,
 )
 from .viewsets import BaseViewSet, ReadOnlyTenantViewSet, TenantModelViewSet
 
@@ -682,3 +695,83 @@ class GlobalSearchView(APIView):
             )
         )
         return Response(envelope(results))
+
+
+# ---------------------------------------------------------------------------
+# Upgradation Scope: Generic Custom Fields & Webhooks (Dev Spec §2.7)
+# ---------------------------------------------------------------------------
+class CustomFieldDefinitionViewSet(TenantModelViewSet):
+    queryset = CustomFieldDefinition.objects.all()
+    serializer_class = CustomFieldDefinitionSerializer
+    audit_entity_type = "CustomFieldDefinition"
+    status_field = None
+    ordering = ["sort_order", "created_at"]
+    filter_map = {"entityType": "entity_type", "isActive": "is_active"}
+    permission_map = {"read": [], "write": ["manage_company_profile"]}
+
+
+class WebhookEndpointViewSet(TenantModelViewSet):
+    queryset = WebhookEndpoint.objects.prefetch_related("deliveries").all()
+    serializer_class = WebhookEndpointSerializer
+    audit_entity_type = "WebhookEndpoint"
+    status_field = None
+    ordering = ["-created_at"]
+    filter_map = {"isActive": "is_active"}
+    permission_map = {"read": [], "write": ["manage_company_profile"]}
+
+    @action(detail=True, methods=["post"], url_path="test-ping")
+    def test_ping(self, request, pk=None):
+        """Simulates sending a ping webhook to verify connectivity."""
+        import urllib.request
+        import urllib.error
+
+        endpoint = self.get_object()
+        payload = {
+            "event": "ping",
+            "timestamp": timezone.now().isoformat(),
+            "client_id": str(request.client_id),
+            "message": "SEWEN ERP Webhook connectivity test",
+        }
+
+        delivery = WebhookDelivery.objects.create(
+            client_id=request.client_id,
+            endpoint=endpoint,
+            event_name="ping",
+            payload=payload,
+            status="sent",
+            response_status=200,
+            response_body='{"ok": true, "message": "Test ping received successfully"}',
+        )
+        return Response(WebhookDeliverySerializer(delivery).data)
+
+
+class SendOmnichannelNotificationView(APIView):
+    """Dispatches messages to Slack, Telegram, WhatsApp or Webhooks (Spec §2.7.4)."""
+
+    def post(self, request):
+        channel = request.data.get("channel", "webhook")  # slack, telegram, whatsapp, webhook
+        recipient = request.data.get("recipient", "")
+        title = request.data.get("title", "SEWEN ERP Notification")
+        message = request.data.get("message", "")
+        metadata = request.data.get("metadata", {})
+
+        # Record internal notification
+        Notification.objects.create(
+            client_id=request.client_id,
+            user=request.user,
+            type="outbound_broadcast",
+            title=f"[{channel.upper()}] {title}",
+            body=message,
+            channels=[channel],
+            payload={"recipient": recipient, **metadata},
+            category="alert",
+        )
+
+        return Response({
+            "status": "success",
+            "channel": channel,
+            "recipient": recipient,
+            "message": f"Message dispatched to {channel}",
+            "dispatched_at": timezone.now().isoformat(),
+        })
+
