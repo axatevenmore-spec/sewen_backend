@@ -137,11 +137,16 @@ class ProductionRateThrottle(SimpleRateThrottle):
 
 class SafeUserRateThrottle(ProductionRateThrottle):
     """
-    Default authenticated user throttle: 120 requests per minute per user.
+    Default authenticated user throttle: 120 requests per minute per user (bypassed in DEBUG).
     """
     scope = "user"
     setting_name = "AUTHENTICATED_RATE_LIMIT"
     default_rate = "120/minute"
+
+    def allow_request(self, request, view):
+        if getattr(settings, "DEBUG", False):
+            return True
+        return super().allow_request(request, view)
 
     def get_cache_key(self, request, view):
         if request.user and request.user.is_authenticated:
@@ -151,12 +156,17 @@ class SafeUserRateThrottle(ProductionRateThrottle):
 
 class SafeAnonRateThrottle(ProductionRateThrottle):
     """
-    Default unauthenticated throttle: 30 requests per minute per IP.
+    Default unauthenticated throttle: 30 requests per minute per IP (bypassed in DEBUG).
     Only applies to unauthenticated callers.
     """
     scope = "anon"
     setting_name = "ANONYMOUS_RATE_LIMIT"
     default_rate = "30/minute"
+
+    def allow_request(self, request, view):
+        if getattr(settings, "DEBUG", False):
+            return True
+        return super().allow_request(request, view)
 
     def get_cache_key(self, request, view):
         if request.user and request.user.is_authenticated:
