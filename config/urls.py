@@ -5,8 +5,6 @@ Base path ``/api/v1`` with DRF trailing slashes (api.md §1.1). Every path here
 matches what ``services/domainServices.js`` already emits -- api.md §0 is
 explicit that those signatures are part of the contract.
 """
-from django.conf import settings
-from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import include, path
 from drf_spectacular.views import (
@@ -56,5 +54,12 @@ urlpatterns = [
     path("django-admin/", admin.site.urls),
 ]
 
-if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+# Uploads are never mounted at MEDIA_URL: they are served only through the
+# signed FileDownloadView, which sets the anti-XSS headers (apps/core/views.py).
+
+# Errors raised outside a DRF view (URL resolution, middleware) still answer in
+# the api.md §1.5 envelope -- never Django's HTML pages.
+handler400 = "apps.core.error_views.bad_request"
+handler403 = "apps.core.error_views.permission_denied"
+handler404 = "apps.core.error_views.not_found"
+handler500 = "apps.core.error_views.server_error"

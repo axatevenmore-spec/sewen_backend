@@ -10,6 +10,7 @@ Authentication is also where the tenant is resolved, because it is the only
 place that has read the JWT. It stamps ``request.client_id`` and publishes the
 tenant to the database session for RLS (db.md §1.3).
 """
+from django.core.exceptions import ValidationError
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework_simplejwt.exceptions import (
     AuthenticationFailed as JWTAuthenticationFailed,
@@ -21,6 +22,8 @@ from apps.core.tenancy import set_current_client_id
 
 CLIENT_CLAIM = "client_id"
 PERMISSIONS_CLAIM = "perms"
+#: The ``user_sessions`` row a token was minted for (``build_tokens``).
+SESSION_CLAIM = "sid"
 
 
 class TenantJWTAuthentication(JWTAuthentication):
@@ -58,7 +61,7 @@ class TenantJWTAuthentication(JWTAuthentication):
         # permission alive until the access token expired. The claim is still
         # minted for clients that read it, but it is never trusted here.
         user.permission_ids = user.effective_permissions()
-        user.session_id = token.get("sid")
+        user.session_id = token.get(SESSION_CLAIM)
         return user, token
 
     def get_user(self, validated_token):
@@ -71,7 +74,36 @@ class TenantJWTAuthentication(JWTAuthentication):
 
         if user.deleted_at is not None or user.status == "Deleted":
             raise NotAuthenticated("This account no longer exists.", code="TOKEN_INVALID")
+
+        # A signed-out session must stop working now, not when its access
+        # token expires: logout, "sign out other devices", a password change
+        # and deactivation all revoke the session row this token points at.
+        # Here rather than in authenticate() so the Socket.IO handshake
+        # (apps/core/realtime.py) gets the same check.
+        session_id = validated_token.get(SESSION_CLAIM)
+        if session_id and not _session_is_live(session_id, user):
+            raise NotAuthenticated(
+                "Your session has been signed out. Please sign in again.",
+                code="TOKEN_REVOKED",
+            )
         return user
+
+
+def _session_is_live(session_id, user):
+    from django.utils import timezone
+
+    from .models import UserSession
+
+    try:
+        return UserSession.objects.filter(
+            pk=session_id,
+            user=user,
+            revoked_at__isnull=True,
+            expires_at__gt=timezone.now(),
+        ).exists()
+    except (ValueError, ValidationError):
+        # Not a UUID -- not a session this server issued.
+        return False
 
 
 def build_tokens(user, *, session=None):
@@ -82,12 +114,12 @@ def build_tokens(user, *, session=None):
     refresh[CLIENT_CLAIM] = str(user.client_id)
     refresh[PERMISSIONS_CLAIM] = sorted(user.effective_permissions())
     if session is not None:
-        refresh["sid"] = str(session.id)
+        refresh[SESSION_CLAIM] = str(session.id)
 
     access = refresh.access_token
     access[CLIENT_CLAIM] = str(user.client_id)
     access[PERMISSIONS_CLAIM] = refresh[PERMISSIONS_CLAIM]
     if session is not None:
-        access["sid"] = str(session.id)
+        access[SESSION_CLAIM] = str(session.id)
 
     return {"access": str(access), "refresh": str(refresh)}

@@ -144,7 +144,9 @@ class UserManager(BaseUserManager):
         if password and str(password).strip():
             user.set_password(str(password).strip())
         else:
-            user.set_password("")
+            # No default password: nothing can sign in until the owner sets one
+            # through the emailed activation flow (apps/accounts/invites.py).
+            user.set_unusable_password()
         user.save(using=self._db)
         return user
 

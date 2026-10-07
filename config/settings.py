@@ -33,9 +33,34 @@ def env_list(key, default=""):
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
-SECRET_KEY = env("DJANGO_SECRET_KEY", "dev-insecure-key-do-not-use-in-production")
-DEBUG = env_bool("DJANGO_DEBUG", True)
-ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1,0.0.0.0,testserver")
+# Off unless the environment turns it on: a forgotten flag must fail closed,
+# never into the debug page (stack traces, settings, SQL).
+DEBUG = env_bool("DJANGO_DEBUG", False)
+DJANGO_ENV = (env("DJANGO_ENV") or ("development" if DEBUG else "production")).strip().lower()
+
+# Signs every JWT, password-reset token and file link. A key from the repo
+# would let anyone mint a token for any user in any tenant, so outside local
+# development there is no fallback -- the process refuses to start.
+SECRET_KEY = env("DJANGO_SECRET_KEY")
+_DEV_ONLY_SECRET_KEY = (
+    "django-insecure-development-only-key-must-never-be-used-in-production-0123456789abcdef"
+)
+if not SECRET_KEY:
+    if DJANGO_ENV == "production" or not DEBUG:
+        from django.core.exceptions import ImproperlyConfigured
+
+        raise ImproperlyConfigured(
+            "DJANGO_SECRET_KEY is required when DEBUG is off. Generate one with: "
+            "python -c \"import secrets; print(secrets.token_urlsafe(64))\""
+        )
+    SECRET_KEY = _DEV_ONLY_SECRET_KEY
+elif len(SECRET_KEY) < 50 and not DEBUG:
+    # HS256 wants >= 32 bytes; Django's own deploy check wants 50 characters.
+    from django.core.exceptions import ImproperlyConfigured
+
+    raise ImproperlyConfigured("DJANGO_SECRET_KEY must be at least 50 characters long.")
+
+ALLOWED_HOSTS = env_list("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1")
 
 INSTALLED_APPS = [
     # First, so `manage.py runserver` serves the ASGI app -- Django plus the
@@ -247,9 +272,31 @@ CORS_ALLOW_HEADERS = (
 CORS_EXPOSE_HEADERS = ("last-modified", "idempotency-replayed")
 
 # --------------------------------------------------------------------------
+# Transport security (`manage.py check --deploy`). The API authenticates with
+# a bearer header, so cookies only matter for /django-admin/, but they must
+# still never travel over plain HTTP outside development.
+# --------------------------------------------------------------------------
+SECURE_CONTENT_TYPE_NOSNIFF = True
+X_FRAME_OPTIONS = "DENY"
+SESSION_COOKIE_SECURE = env_bool("DJANGO_SESSION_COOKIE_SECURE", not DEBUG)
+CSRF_COOKIE_SECURE = env_bool("DJANGO_CSRF_COOKIE_SECURE", not DEBUG)
+CSRF_TRUSTED_ORIGINS = env_list("DJANGO_CSRF_TRUSTED_ORIGINS", "")
+# HTTPS redirect and HSTS are opt-in: turning them on before TLS is in front of
+# the app locks browsers out of the site, so the deployment decides.
+SECURE_SSL_REDIRECT = env_bool("DJANGO_SECURE_SSL_REDIRECT", False)
+SECURE_HSTS_SECONDS = int(env("DJANGO_SECURE_HSTS_SECONDS", "0"))
+SECURE_HSTS_INCLUDE_SUBDOMAINS = env_bool("DJANGO_SECURE_HSTS_INCLUDE_SUBDOMAINS", False)
+SECURE_HSTS_PRELOAD = env_bool("DJANGO_SECURE_HSTS_PRELOAD", False)
+if env_bool("DJANGO_SECURE_PROXY_SSL_HEADER", False):
+    # Only behind a proxy that overwrites X-Forwarded-Proto on every request.
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+# --------------------------------------------------------------------------
 # Application settings
 # --------------------------------------------------------------------------
 API_BASE_PATH = "/api/v1"
+#: Where emailed links (account invites) point -- the web app, not this API.
+FRONTEND_URL = env("FRONTEND_URL", "http://localhost:5173").rstrip("/")
 FILE_STORAGE_BACKEND = env("FILE_STORAGE_BACKEND", "local")
 FILE_MAX_BYTES = int(env("FILE_MAX_BYTES", str(25 * 1024 * 1024)))
 PMS_PROOF_MAX_BYTES = int(env("PMS_PROOF_MAX_BYTES", str(50 * 1024 * 1024)))

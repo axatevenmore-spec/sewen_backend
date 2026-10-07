@@ -161,8 +161,25 @@ class FileDownloadView(APIView):
         if not path.exists():
             raise NotFound("That file is no longer available.")
 
-        response = FileResponse(open(path, "rb"), content_type=row.content_type)
-        response["Content-Disposition"] = f'inline; filename="{row.file_name}"'
+        # Uploads are user content served from the API's own origin. Only types
+        # a browser cannot run script from open inline; anything else (HTML,
+        # SVG, XML, unknown) is forced to download. FileResponse builds the
+        # Content-Disposition header itself, so a quote or newline in the
+        # uploaded name cannot inject header parameters.
+        inline = row.content_type in file_service.INLINE_SAFE_CONTENT_TYPES
+        response = FileResponse(
+            open(path, "rb"),
+            content_type=row.content_type,
+            as_attachment=not inline,
+            filename=row.file_name,
+        )
+        # Never let the browser second-guess the declared type into HTML.
+        response["X-Content-Type-Options"] = "nosniff"
+        if row.content_type != "application/pdf":
+            # Even if a document is rendered, it gets no script, no origin.
+            # Not on PDFs: Chrome refuses to render a PDF in a sandboxed
+            # document, and the proof viewer needs it inline.
+            response["Content-Security-Policy"] = "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; sandbox"
         # The PMS proof viewer renders PDFs in an <iframe> on the same origin
         # (vite dev proxy / same deployment), which the global DENY policy
         # would block. Relax clickjacking protection for this response only.

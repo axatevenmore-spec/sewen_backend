@@ -153,3 +153,53 @@ def send_password_reset_otp_email(email: str, otp: str, user_name: str = "", exp
     except Exception as exc:
         logger.exception("Failed to send password reset OTP email to %s: %s", email, exc)
         return False
+
+
+def send_account_invite_email(email: str, user_name: str = "", workspace: str = "", activate_url: str = "") -> bool:
+    """Tell a newly created user how to set their first password.
+
+    The account is created without a usable password; the link opens the
+    sign-in page's "Forgot password" flow, where an emailed one-time code
+    proves the address before any password is set.
+    """
+    from html import escape
+
+    subject = "Your Evenmore ERP account is ready - set your password"
+    greeting = f"Hello {user_name}," if user_name else "Hello,"
+    where = f" for {workspace}" if workspace else ""
+
+    plain_text = (
+        f"{greeting}\n\n"
+        f"An Evenmore ERP account{where} has been created for {email}.\n\n"
+        f"To activate it, open the link below, request a verification code and choose your password:\n\n"
+        f"    {activate_url}\n\n"
+        f"If you were not expecting this, you can ignore this email.\n\n"
+        f"— The Evenmore ERP Team\n"
+    )
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background-color: #f8fafc; color: #1e293b;">
+  <div style="max-width: 520px; margin: 40px auto; background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 32px 28px;">
+    <p style="font-size: 15px; font-weight: 600; margin-top: 0;">{escape(greeting)}</p>
+    <p style="font-size: 14px; color: #475569; line-height: 1.6;">
+      An Evenmore ERP account{escape(where)} has been created for <strong>{escape(email)}</strong>.
+      To activate it, request a verification code and choose your password.
+    </p>
+    <p style="text-align: center; margin: 28px 0;">
+      <a href="{escape(activate_url, quote=True)}" style="background: #2563eb; color: #ffffff; padding: 12px 22px; border-radius: 10px; text-decoration: none; font-weight: 600;">Set your password</a>
+    </p>
+    <p style="font-size: 12px; color: #64748b;">If you were not expecting this, you can ignore this email.</p>
+  </div>
+</body>
+</html>
+"""
+    from_email = getattr(settings, "DEFAULT_FROM_EMAIL", "Evenmore ERP <noreply@evenmore.io>")
+    msg = EmailMultiAlternatives(subject=subject, body=plain_text, from_email=from_email, to=[email])
+    msg.attach_alternative(html_content, "text/html")
+    try:
+        msg.send(fail_silently=False)
+        logger.info("Sent account invite email to %s", email)
+        return True
+    except Exception as exc:
+        logger.exception("Failed to send account invite email to %s: %s", email, exc)
+        return False

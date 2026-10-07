@@ -10,6 +10,7 @@ from apps.core.serializers import (
     TenantPrimaryKeyRelatedField,
 )
 
+from .invites import send_invite_on_commit
 from .models import Client, Permission, Role, RolePermission, User, UserPermission, UserSession
 
 
@@ -310,12 +311,14 @@ class UserSerializer(BaseModelSerializer):
         if password and str(password).strip():
             user.set_password(str(password).strip())
         else:
-            user.set_password("Password@123")
+            # Never a shared default: the user sets their own via the invite.
+            user.set_unusable_password()
 
         if not user.status or user.status == "Invited":
             user.status = "Active"
         user.is_active = True
         user.save()
+        send_invite_on_commit(user)
         return user
 
     def update(self, instance, validated_data):
