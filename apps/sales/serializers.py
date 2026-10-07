@@ -164,6 +164,15 @@ class QuotationActivitySerializer(BaseModelSerializer):
         fields = ["id", "event", "actor_label", "comment", "ip", "created_at"]
 
 
+class ApprovalLinkRequestSerializer(BaseSerializer):
+    """``POST /sales/{documents}/{id}/approval-links/`` (apps/sales/approval_links.py)."""
+
+    recipientName = serializers.CharField(required=False, allow_blank=True, max_length=200)
+    recipientEmail = serializers.EmailField(required=False, allow_blank=True)
+    expiryDays = serializers.IntegerField(required=False, default=14, min_value=1, max_value=365)
+    message = serializers.CharField(required=False, allow_blank=True, max_length=2000)
+
+
 class ShareRequestSerializer(BaseSerializer):
     expiryDays = serializers.IntegerField(required=False, default=14, min_value=1, max_value=365)
     recipients = serializers.ListField(child=serializers.CharField(), required=False, default=list)

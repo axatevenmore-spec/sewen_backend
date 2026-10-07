@@ -69,14 +69,18 @@ class Command(BaseCommand):
 # Hourly
 # ---------------------------------------------------------------------------
 def expire_shares(command):
-    """``quotation_shares`` and ``pms_proof_shares`` past ``expires_at``."""
+    """``pms_proof_shares`` and ``sales_approval_links`` past ``expires_at``."""
     from apps.pms.models import ProofShare
+    from apps.sales.models import SalesApprovalLink
 
     now = timezone.now()
     proofs = ProofShare.objects.filter(
         status="Active", expires_at__lt=now, deleted_at__isnull=True
     ).update(status="Expired")
-    return {"message": f"{proofs} proof share(s) expired"}
+    sales = SalesApprovalLink.objects.filter(
+        status="Active", expires_at__lt=now, deleted_at__isnull=True
+    ).update(status="Expired")
+    return {"message": f"{proofs} proof share(s), {sales} sales approval link(s) expired"}
 
 
 def sweep_pending_files(command):

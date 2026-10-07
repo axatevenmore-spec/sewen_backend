@@ -357,6 +357,78 @@ class PublicProofDecisionView(PublicWriteView):
 
 
 # ---------------------------------------------------------------------------
+# Sales document approval links -- estimates, quotations, proforma invoices and
+# sales invoices; the sales twin of the PMS proof link above
+# (apps/sales/approval_links.py).
+# ---------------------------------------------------------------------------
+class PublicSalesApprovalView(PublicView):
+    """``GET /public/sales/approve/{token}/`` -- marks ``openedAt`` on first fetch."""
+
+    def get(self, request, token):
+        from apps.sales import approval_links
+
+        link = approval_links.resolve_public_link(token)
+        spec, document = approval_links.load_document(link)
+        approval_links.mark_opened(link, spec, document, request)
+        return Response(approval_links.public_payload(link, request))
+
+
+class PublicSalesApprovalCommentView(PublicView):
+    """``GET/POST /public/sales/approve/{token}/comments/`` -- open while the
+    link is live, decided or not."""
+
+    def get_throttles(self):
+        # Reading the thread is a read; only posting counts as a write.
+        if self.request.method == "POST":
+            return [SafeAnonRateThrottle(), PublicWriteThrottle()]
+        return super().get_throttles()
+
+    def get(self, request, token):
+        from apps.sales import approval_links
+
+        link = approval_links.resolve_public_link(token)
+        spec, document = approval_links.load_document(link)
+        rows = approval_links.comments_for(spec.key, document.id, link.client_id)
+        return Response({"results": approval_links.comment_rows(rows)})
+
+    def post(self, request, token):
+        from apps.sales import approval_links
+
+        link = approval_links.resolve_public_link(token)
+        spec, document = approval_links.load_document(link)
+        approval_links.add_comment(
+            link=link,
+            spec_key=spec.key,
+            document=document,
+            author_type="Client",
+            author_name=request.data.get("authorName") or link.recipient_name or "Customer",
+            text=request.data.get("text"),
+        )
+        rows = approval_links.comments_for(spec.key, document.id, link.client_id)
+        return Response(
+            {"results": approval_links.comment_rows(rows)}, status=status.HTTP_201_CREATED
+        )
+
+
+class PublicSalesApprovalDecisionView(PublicWriteView):
+    """``POST /public/sales/approve/{token}/decide/`` -- one decision per link."""
+
+    def post(self, request, token):
+        from apps.sales import approval_links
+
+        link = approval_links.resolve_public_link(token)
+        link = approval_links.record_decision(
+            link,
+            decision=request.data.get("decision"),
+            decided_by=request.data.get("decidedBy"),
+            comments=request.data.get("comments"),
+            rejection_reason=request.data.get("rejectionReason"),
+            ip=request_ip(request),
+        )
+        return Response({"decision": link.decision, "decidedAt": link.decided_at})
+
+
+# ---------------------------------------------------------------------------
 # Public lead forms (api.md §9.7)
 # ---------------------------------------------------------------------------
 class PublicFormView(PublicView):

@@ -241,6 +241,78 @@ class QuotationActivity(models.Model):
         ordering = ["-created_at"]
 
 
+class SalesApprovalLink(TenantModel):
+    """A customer approval link for an estimate, quotation, proforma or invoice.
+
+    The sales counterpart of ``pms.ProofShare`` (``/sales/approve/:token``
+    outside the app shell): opaque token hashed at rest, expiring, revocable,
+    one decision per link. ``decided_by`` is text -- the customer has no
+    account. The document is addressed by ``doc_type`` + ``document_id`` so one
+    table serves the four document types (apps/sales/approval_links.py).
+    """
+
+    DOC_TYPES = [
+        ("estimate", "Estimate"),
+        ("quotation", "Quotation"),
+        ("proforma_invoice", "Proforma invoice"),
+        ("sales_invoice", "Sales invoice"),
+    ]
+    STATUSES = [("Active", "Active"), ("Revoked", "Revoked"), ("Expired", "Expired")]
+    DECISIONS = [("Approved", "Approved"), ("Rejected", "Rejected")]
+
+    doc_type = models.TextField(choices=DOC_TYPES)
+    document_id = models.UUIDField()
+    #: The number as it was when shared, for lists and notifications.
+    document_number = models.TextField(null=True, blank=True)
+    token_hash = models.TextField(unique=True)
+    recipient_name = models.TextField(null=True, blank=True)
+    recipient_email = models.EmailField(null=True, blank=True)
+    #: The covering note shown to the customer above the document.
+    message = models.TextField(null=True, blank=True)
+    status = models.TextField(choices=STATUSES, default="Active")
+    decision = models.TextField(choices=DECISIONS, null=True, blank=True)
+    decided_at = models.DateTimeField(null=True, blank=True)
+    decided_by = models.TextField(null=True, blank=True)
+    decision_comments = models.TextField(null=True, blank=True)
+    rejection_reason = models.TextField(null=True, blank=True)
+    opened_at = models.DateTimeField(null=True, blank=True)
+    expires_at = models.DateTimeField()
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    revoked_reason = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "sales_approval_links"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["doc_type", "document_id"], name="ix_sales_approval_links_doc"),
+        ]
+
+
+class SalesApprovalComment(TenantModel):
+    """The review thread on one shared document, written by staff and customer."""
+
+    AUTHOR_TYPES = [("Staff", "Staff"), ("Client", "Client")]
+
+    doc_type = models.TextField(choices=SalesApprovalLink.DOC_TYPES)
+    document_id = models.UUIDField()
+    link = models.ForeignKey(
+        SalesApprovalLink, null=True, blank=True, on_delete=models.SET_NULL, related_name="comments"
+    )
+    author_type = models.TextField(choices=AUTHOR_TYPES, default="Staff")
+    author_name = models.TextField(null=True, blank=True)
+    text = models.TextField()
+
+    class Meta:
+        db_table = "sales_approval_comments"
+        ordering = ["created_at"]
+        indexes = [
+            models.Index(
+                fields=["doc_type", "document_id", "created_at"],
+                name="ix_sales_approval_comments",
+            ),
+        ]
+
+
 # ---------------------------------------------------------------------------
 # Sales orders (api.md §5.4)
 # ---------------------------------------------------------------------------
