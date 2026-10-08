@@ -2072,11 +2072,26 @@ def check_customer_tracking_permission(user, project=None):
     - Other internal roles without view_pms or view_projects:
       - PermissionDenied('You do not have permission to view customer project tracking.', code='NO_TRACKING_PERMISSION').
     """
-    if getattr(user, "is_superuser", False):
-        return True
-
     role_code = getattr(getattr(user, "role", None), "code", "")
     role_name = str(getattr(getattr(user, "role", None), "name", "")).lower()
+
+    is_customer = (
+        getattr(user, "is_customer", False)
+        or role_code == "CU"
+        or "customer" in role_name
+    )
+    if is_customer:
+        if project is not None:
+            allowed_parties = user.get_customer_party_ids() if hasattr(user, "get_customer_party_ids") else set()
+            if not project.party_id or project.party_id not in allowed_parties:
+                raise PermissionDenied(
+                    "You do not have permission to view this customer project.",
+                    code="CUSTOMER_PROJECT_DENIED",
+                )
+        return True
+
+    if getattr(user, "is_superuser", False):
+        return True
 
     if role_code in ("AD", "PM") or "admin" in role_name or "project manager" in role_name:
         return True
@@ -2086,13 +2101,7 @@ def check_customer_tracking_permission(user, project=None):
     if "view_pms" in granted:
         return True
 
-    is_customer = (
-        getattr(user, "is_customer", False)
-        or role_code == "CU"
-        or "customer" in role_name
-        or "view_projects" in granted
-    )
-    if is_customer:
+    if "view_projects" in granted:
         if project is not None:
             allowed_parties = user.get_customer_party_ids() if hasattr(user, "get_customer_party_ids") else set()
             if not project.party_id or project.party_id not in allowed_parties:
@@ -2171,12 +2180,21 @@ class CustomerTrackingView(APIView):
         from apps.core.permissions import granted_permissions
         granted = granted_permissions(user)
 
+        is_customer = (
+            getattr(user, "is_customer", False)
+            or role_code == "CU"
+            or "customer" in role_name
+        )
+
         is_staff_manager = (
-            getattr(user, "is_superuser", False)
-            or role_code in ("AD", "PM")
-            or "admin" in role_name
-            or "project manager" in role_name
-            or "view_pms" in granted
+            not is_customer
+            and (
+                getattr(user, "is_superuser", False)
+                or role_code in ("AD", "PM")
+                or "admin" in role_name
+                or "project manager" in role_name
+                or "view_pms" in granted
+            )
         )
 
         qs = Project.objects.filter(client_id=client_id, deleted_at__isnull=True).select_related(
