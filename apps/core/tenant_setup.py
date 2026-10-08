@@ -81,13 +81,13 @@ DEFAULT_PMS_DEPARTMENTS = (
     ("Installation", "#1d4ed8", 8),
 )
 
-#: (name, department, duration in days, needs document, needs approval)
+#: (name, department, duration in days, needs document, needs approval, assigned role)
 DEFAULT_PMS_STAGES = (
-    ("Design & Drawing", "Design", "3", True, True),
-    ("Fabrication", "Production", "7", False, False),
-    ("Quality Inspection", "Quality", "2", True, False),
-    ("Packaging", "Packaging", "1", False, False),
-    ("Installation", "Installation", "2", False, True),
+    ("Design & Drawing", "Design", "3", True, True, "Project Manager"),
+    ("Fabrication", "Production", "7", False, False, "Fabrication Technician"),
+    ("Quality Inspection", "Quality", "2", True, False, "Quality Assurance Inspector"),
+    ("Packaging", "Packaging", "1", False, False, "Store Keeper"),
+    ("Installation", "Installation", "2", False, True, "Assembly Technician"),
 )
 
 #: (name, annual entitlement, accrual, paid)
@@ -149,7 +149,7 @@ def bootstrap_configuration(client):
         departments[name], _ = Department.objects.get_or_create(
             client=client, name=name, defaults={"color": color, "capacity": capacity}
         )
-    for sequence, (name, department, duration, needs_doc, needs_approval) in enumerate(
+    for sequence, (name, department, duration, needs_doc, needs_approval, assigned_role) in enumerate(
         DEFAULT_PMS_STAGES, start=1
     ):
         StageConfig.objects.get_or_create(
@@ -160,6 +160,7 @@ def bootstrap_configuration(client):
                 "department": departments[department],
                 "default_duration": Decimal(duration),
                 "duration_unit": "Days",
+                "assigned_role": assigned_role,
                 "required_document": needs_doc,
                 "required_approval": needs_approval,
             },

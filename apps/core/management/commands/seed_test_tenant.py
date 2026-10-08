@@ -403,23 +403,34 @@ class Command(BaseCommand):
             "Packaging": ["Crate & label"],
             "Installation": ["Site installation", "Commissioning trial"],
         }
-        workers = [self._user("employee.welder"), self._user("employee.fabrication"), self._user("employee.assembly")]
+        stage_workers = {
+            "Design & Drawing": [self._user("project.manager")],
+            "Fabrication": [self._user("employee.fabrication"), self._user("employee.welder")],
+            "Quality Inspection": [self._user("project.manager")],
+            "Packaging": [self._user("store.executive"), self._user("employee.assembly")],
+            "Installation": [self._user("employee.assembly")],
+        }
         today = timezone.localdate()
         for project in Project.objects.filter(client=self.client_obj, deleted_at__isnull=True):
             for stage in project.stages.filter(deleted_at__isnull=True).order_by("sequence"):
+                # Ensure stage assignee matches the stage role
+                workers = stage_workers.get(stage.name, [stage.assigned_user or self._user("project.manager")])
+                if stage.assigned_user != workers[0]:
+                    stage.assigned_user = workers[0]
+                    stage.save(update_fields=["assigned_user"])
+
                 for n, name in enumerate(plans.get(stage.name, [])):
                     started = stage.status not in ("Not Started",)
                     done = stage.status == "Completed" or (started and n == 0 and stage.completion_pct >= 50)
                     Task.objects.create(
                         client=self.client_obj, project=project, stage=stage, task_name=name,
-                        assigned_user=(workers[n % len(workers)] if stage.name == "Fabrication"
-                                       else stage.assigned_user),
+                        assigned_user=workers[n % len(workers)],
                         department=stage.department,
                         start_date=today - timedelta(days=5) if started else today + timedelta(days=7),
                         due_date=today + timedelta(days=2 + n) if started else today + timedelta(days=14),
                         completion_pct=100 if done else (40 if started else 0),
                         status="Completed" if done else ("In Progress" if started else "Not Started"),
-                        priority="High" if stage.name == "Fabrication" else "Medium",
+                        priority="High" if stage.name in ("Fabrication", "Quality Inspection") else "Medium",
                     )
                     made += 1
         return f"{made} tasks"

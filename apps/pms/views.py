@@ -412,23 +412,27 @@ def apply_stage_template(project, config_ids, *, stage_weights=None, user=None):
             else:
                 weight = Decimal(str(equal_pct))
 
-        created.append(
-            ProjectStage.objects.create(
-                client_id=project.client_id,
-                project=project,
-                stage_config=config,
-                name=config.name,
-                sequence=start_sequence + offset,
-                department=config.department,
-                planned_duration=config.default_duration,
-                duration_unit=config.duration_unit,
-                required_approval=config.required_approval,
-                required_document=config.required_document,
-                weight_pct=weight,
-                status="Not Started",
-                created_by=user if getattr(user, "is_authenticated", False) else None,
-            )
+        stage_assignee = services.resolve_stage_assignee(
+            project.client_id, config.name, config.department, project.project_manager
         )
+        stage_obj = ProjectStage.objects.create(
+            client_id=project.client_id,
+            project=project,
+            stage_config=config,
+            name=config.name,
+            sequence=start_sequence + offset,
+            department=config.department,
+            assigned_user=stage_assignee,
+            planned_duration=config.default_duration,
+            duration_unit=config.duration_unit,
+            required_approval=config.required_approval,
+            required_document=config.required_document,
+            weight_pct=weight,
+            status="Not Started",
+            created_by=user if getattr(user, "is_authenticated", False) else None,
+        )
+        created.append(stage_obj)
+        services.populate_default_stage_tasks(stage_obj, project.client_id, user=user)
 
     if project.current_stage_id is None and created:
         project.current_stage = created[0]
@@ -478,6 +482,8 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
         "customer_tracking": [("view_pms", "view_projects")],
         # Anyone who can see the project can take part in its proof review.
         "document_comments": ["view_pms"],
+        "stage_tasks": [("view_pms", "create_pms_project")],
+        "stage_task_detail": [("view_pms", "create_pms_project")],
         **CHAT_PERMISSIONS,
     }
     #: The UI uses ``code`` in URLs, so both a uuid and a code resolve.
@@ -1757,7 +1763,7 @@ def apply_document_decision(*, document, decision, comments=None, revision_reaso
 # ---------------------------------------------------------------------------
 class MyTasksView(APIView):
     permission_classes = [HasModulePermission]
-    required_permissions = ["view_pms"]
+    required_permissions = [("view_pms", "view_task")]
 
     def get(self, request):
         queryset = Task.objects.filter(

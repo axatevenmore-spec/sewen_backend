@@ -792,3 +792,195 @@ PMS_REPORTS = {
     "delay-reason-pareto": report_delay_reason_pareto,
     "department-efficiency": report_department_efficiency,
 }
+
+
+# ---------------------------------------------------------------------------
+# Stage-to-Employee and Stage Task Catalogue
+# ---------------------------------------------------------------------------
+DEFAULT_STAGE_TASK_CATALOGUE = {
+    "Fabrication": [
+        ("Cut MS plates & sections to size", Decimal("25.00"), "High", ["Fabrication Technician", "Welder & Fitter"]),
+        ("Fitment & tack welding of structure", Decimal("25.00"), "High", ["Welder & Fitter", "Fabrication Technician"]),
+        ("Full seam welding of frame & stiffeners", Decimal("30.00"), "High", ["Welder & Fitter"]),
+        ("Grind, de-slag & weld finishing", Decimal("20.00"), "Medium", ["Fabrication Technician", "Welder & Fitter"]),
+    ],
+    "Fabrication & Welding": [
+        ("Cut MS plates & sections to size", Decimal("25.00"), "High", ["Fabrication Technician", "Welder & Fitter"]),
+        ("Fitment & tack welding of structure", Decimal("25.00"), "High", ["Welder & Fitter", "Fabrication Technician"]),
+        ("Full seam welding of frame & stiffeners", Decimal("30.00"), "High", ["Welder & Fitter"]),
+        ("Grind, de-slag & weld finishing", Decimal("20.00"), "Medium", ["Fabrication Technician", "Welder & Fitter"]),
+    ],
+    "Design & Drawing": [
+        ("Prepare GA & engineering drawings", Decimal("35.00"), "Medium", ["Project Manager", "Design"]),
+        ("3D CAD modeling & layout design", Decimal("35.00"), "Medium", ["Project Manager", "Design"]),
+        ("Client design review & sign-off", Decimal("30.00"), "High", ["Project Manager"]),
+    ],
+    "Engineering & CAD Design": [
+        ("Prepare GA & engineering drawings", Decimal("35.00"), "Medium", ["Project Manager", "Design"]),
+        ("3D CAD modeling & layout design", Decimal("35.00"), "Medium", ["Project Manager", "Design"]),
+        ("Client design review & sign-off", Decimal("30.00"), "High", ["Project Manager"]),
+    ],
+    "Material Procurement & Cutting": [
+        ("Raw steel plate & section verification", Decimal("30.00"), "Medium", ["Purchase Officer", "Store Keeper"]),
+        ("CNC laser / plasma cutting & nesting", Decimal("40.00"), "High", ["Fabrication Technician", "Welder & Fitter"]),
+        ("Edge deburring & bevel preparation", Decimal("30.00"), "Medium", ["Fabrication Technician"]),
+    ],
+    "Surface Treatment & Powder Coating": [
+        ("Surface shot blasting & degreasing", Decimal("30.00"), "Medium", ["Fabrication Technician", "Assembly Technician"]),
+        ("Primer coating application", Decimal("30.00"), "Medium", ["Fabrication Technician"]),
+        ("Powder coating / polyurethane finish", Decimal("40.00"), "High", ["Fabrication Technician"]),
+    ],
+    "Quality Inspection": [
+        ("Dimensional verification & tolerance audit", Decimal("35.00"), "High", ["Quality Assurance Inspector", "Quality"]),
+        ("Visual & NDT weld inspection report", Decimal("35.00"), "High", ["Quality Assurance Inspector", "Quality"]),
+        ("Issue Quality Clearance Certificate", Decimal("30.00"), "Urgent", ["Quality Assurance Inspector", "Quality"]),
+    ],
+    "Quality Assurance & Inspection": [
+        ("Dimensional verification & tolerance audit", Decimal("35.00"), "High", ["Quality Assurance Inspector", "Quality"]),
+        ("Visual & NDT weld inspection report", Decimal("35.00"), "High", ["Quality Assurance Inspector", "Quality"]),
+        ("Issue Quality Clearance Certificate", Decimal("30.00"), "Urgent", ["Quality Assurance Inspector", "Quality"]),
+    ],
+    "Packaging": [
+        ("Clean & apply anti-corrosion protection", Decimal("50.00"), "Medium", ["Store Keeper", "Assembly Technician"]),
+        ("Crate, label & pack for dispatch", Decimal("50.00"), "Medium", ["Assembly Technician", "Store Keeper"]),
+    ],
+    "Packaging & Dispatch": [
+        ("Clean & apply anti-corrosion protection", Decimal("40.00"), "Medium", ["Store Keeper", "Assembly Technician"]),
+        ("Crate, label & pack for dispatch", Decimal("40.00"), "Medium", ["Assembly Technician", "Store Keeper"]),
+        ("Dispatch loading & shipping challan sign-off", Decimal("20.00"), "High", ["Store Keeper"]),
+    ],
+    "Installation": [
+        ("Site delivery, positioning & layout", Decimal("30.00"), "Medium", ["Assembly Technician", "Project Manager"]),
+        ("Mechanical erection, leveling & anchoring", Decimal("40.00"), "High", ["Assembly Technician"]),
+        ("Commissioning trial & customer sign-off", Decimal("30.00"), "Urgent", ["Assembly Technician", "Project Manager"]),
+    ],
+    "Installation & Commissioning": [
+        ("Site delivery, positioning & layout", Decimal("30.00"), "Medium", ["Assembly Technician", "Project Manager"]),
+        ("Mechanical erection, leveling & anchoring", Decimal("40.00"), "High", ["Assembly Technician"]),
+        ("Commissioning trial & customer sign-off", Decimal("30.00"), "Urgent", ["Assembly Technician", "Project Manager"]),
+    ],
+}
+
+
+def resolve_stage_assignee(client_id, stage_name, department=None, fallback_user=None):
+    """Find the most appropriate active employee for a project stage."""
+    from apps.accounts.models import User
+
+    users = list(
+        User.objects.filter(client_id=client_id, status="Active", deleted_at__isnull=True)
+        .select_related("employee", "employee__designation", "employee__department", "role")
+    )
+    if not users:
+        return fallback_user
+
+    sname_lower = stage_name.lower()
+    dept_name = department.name.lower() if department and hasattr(department, "name") else ""
+
+    # Preference rules by stage type
+    targets = []
+    if any(k in sname_lower for k in ("fabricat", "weld", "cut", "steel")):
+        targets = ["Fabrication Technician", "Welder & Fitter", "Production Supervisor"]
+    elif any(k in sname_lower for k in ("quality", "inspect", "qa", "qc")):
+        targets = ["Quality Assurance Inspector", "Quality", "QA"]
+    elif any(k in sname_lower for k in ("pack", "dispatch", "crate", "store")):
+        targets = ["Store Keeper", "Assembly Technician", "Stores & Logistics"]
+    elif any(k in sname_lower for k in ("install", "erect", "site", "commission")):
+        targets = ["Assembly Technician", "Welder & Fitter", "Project Manager"]
+    elif any(k in sname_lower for k in ("design", "draw", "cad", "engineer")):
+        targets = ["Project Manager", "Design Lead", "General Manager"]
+
+    # Try matching against targets
+    for target in targets:
+        for u in users:
+            desig = u.employee.designation.name if u.employee and u.employee.designation else ""
+            udept = u.department or (u.employee.department.name if u.employee and u.employee.department else "")
+            rcode = u.role.code if u.role else ""
+            if target.lower() in desig.lower() or (target == "Project Manager" and rcode == "PM"):
+                return u
+            if target.lower() in udept.lower():
+                return u
+
+    # Try matching by department
+    if dept_name:
+        for u in users:
+            udept = u.department or (u.employee.department.name if u.employee and u.employee.department else "")
+            if dept_name in udept.lower():
+                return u
+
+    return fallback_user or users[0]
+
+
+def populate_default_stage_tasks(stage, client_id, start_date=None, user=None):
+    """Automatically populate standard stage tasks and link to the stage-related employees."""
+    from apps.accounts.models import User
+    from apps.pms.models import ProjectMember, Task
+
+    matched_specs = None
+    for pattern, specs in DEFAULT_STAGE_TASK_CATALOGUE.items():
+        if pattern.lower() in stage.name.lower() or stage.name.lower() in pattern.lower():
+            matched_specs = specs
+            break
+
+    if not matched_specs:
+        return []
+
+    users = list(
+        User.objects.filter(client_id=client_id, status="Active", deleted_at__isnull=True)
+        .select_related("employee", "employee__designation", "employee__department", "role")
+    )
+
+    base_date = start_date or (stage.start_datetime.date() if stage.start_datetime else timezone.localdate())
+    created_tasks = []
+
+    for idx, (tname, weight, prio, role_preferences) in enumerate(matched_specs):
+        assignee = None
+        for role_title in role_preferences:
+            for u in users:
+                desig = u.employee.designation.name if u.employee and u.employee.designation else ""
+                udept = u.department or (u.employee.department.name if u.employee and u.employee.department else "")
+                rcode = u.role.code if u.role else ""
+                if role_title.lower() in desig.lower():
+                    assignee = u
+                    break
+                if role_title == "Project Manager" and rcode == "PM":
+                    assignee = u
+                    break
+                if role_title.lower() in udept.lower():
+                    assignee = u
+                    break
+            if assignee:
+                break
+
+        if not assignee:
+            assignee = stage.assigned_user or stage.project.project_manager
+
+        task = Task.objects.create(
+            client_id=client_id,
+            project=stage.project,
+            stage=stage,
+            task_name=tname,
+            weight_pct=weight,
+            priority=prio,
+            assigned_user=assignee,
+            department=stage.department,
+            start_date=base_date,
+            due_date=base_date + timedelta(days=2 + idx),
+            status="Not Started",
+            completion_pct=0,
+            created_by=user if getattr(user, "is_authenticated", False) else None,
+        )
+        created_tasks.append(task)
+
+        if assignee:
+            ProjectMember.objects.get_or_create(
+                client_id=client_id,
+                project=stage.project,
+                user=assignee,
+                defaults={
+                    "department": stage.department,
+                    "added_by": user if getattr(user, "is_authenticated", False) else None,
+                },
+            )
+
+    return created_tasks
+

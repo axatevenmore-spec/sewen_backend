@@ -762,6 +762,17 @@ class Command(BaseCommand):
                 "phone": "+91 98250 33000",
                 "emp_code": "EMP-013",
             },
+            {
+                "email": "employee.qa@sweven.com",
+                "name": "Suresh Verma",
+                "role_code": "EM",
+                "department": "Quality Assurance",
+                "desig": "Quality Assurance Inspector",
+                "dept_code": "QA",
+                "is_staff": False,
+                "phone": "+91 98250 33004",
+                "emp_code": "EMP-014",
+            },
             # 5. Customers (Portal Users)
             {
                 "email": "customer.apex@sweven.com",
@@ -1132,9 +1143,13 @@ class Command(BaseCommand):
     def _seed_pms_projects(self, client, parties, sales_orders, users):
         pm = users.get("project.manager@sweven.com")
         fab_worker = users.get("employee.fabrication@sweven.com")
+        welder_worker = users.get("employee.welder@sweven.com")
+        assembly_worker = users.get("employee.assembly@sweven.com")
+        qa_worker = users.get("employee.qa@sweven.com") or pm
+        store_worker = users.get("store.executive@sweven.com") or assembly_worker
         pms_depts = {d.name: d for d in pms_models.Department.objects.filter(client=client)}
-        pms_configs = list(StageConfig.objects.filter(client=client).order_by("sequence"))
         now = timezone.now()
+        today = timezone.localdate()
 
         # Project 1: Heavy Duty MS Fabrication Tables Batch #101
         so1 = sales_orders["SO-2026-001"]
@@ -1162,9 +1177,9 @@ class Command(BaseCommand):
             stage_specs = [
                 ("Design & Drawing", 1, "Design", pm, "Approved", 100, Decimal("20.00"), True, True),
                 ("Fabrication", 2, "Production", fab_worker, "In Progress", 60, Decimal("40.00"), False, False),
-                ("Quality Inspection", 3, "Quality", pm, "Not Started", 0, Decimal("15.00"), True, False),
-                ("Packaging", 4, "Packaging", fab_worker, "Not Started", 0, Decimal("10.00"), False, False),
-                ("Installation", 5, "Installation", pm, "Not Started", 0, Decimal("15.00"), False, True),
+                ("Quality Inspection", 3, "Quality", qa_worker, "Not Started", 0, Decimal("15.00"), True, False),
+                ("Packaging", 4, "Packaging", store_worker, "Not Started", 0, Decimal("10.00"), False, False),
+                ("Installation", 5, "Installation", assembly_worker, "Not Started", 0, Decimal("15.00"), False, True),
             ]
             first_in_prog = None
             for sname, seq, dname, usr, s_stat, pct, wt, req_doc, req_app in stage_specs:
@@ -1187,10 +1202,98 @@ class Command(BaseCommand):
                 )
                 if s_stat == "In Progress" and not first_in_prog:
                     first_in_prog = stage
+
+                # Seed Stage Tasks connected to the respective stage employee
+                if sname == "Design & Drawing":
+                    pms_models.Task.objects.create(
+                        client=client, project=prj1, stage=stage, task_name="Prepare GA & structural drawing",
+                        assigned_user=pm, department=stage.department, start_date=today - timedelta(days=6),
+                        due_date=today - timedelta(days=4), completion_pct=100, status="Completed", priority="Medium",
+                        weight_pct=Decimal("50.00"),
+                    )
+                    pms_models.Task.objects.create(
+                        client=client, project=prj1, stage=stage, task_name="Client design sign-off",
+                        assigned_user=pm, department=stage.department, start_date=today - timedelta(days=4),
+                        due_date=today - timedelta(days=3), completion_pct=100, status="Completed", priority="High",
+                        weight_pct=Decimal("50.00"),
+                    )
+                elif sname == "Fabrication":
+                    pms_models.Task.objects.create(
+                        client=client, project=prj1, stage=stage, task_name="Cut MS plates to size (Laser/Plasma)",
+                        assigned_user=fab_worker, department=stage.department, start_date=today - timedelta(days=3),
+                        due_date=today - timedelta(days=1), completion_pct=100, status="Completed", priority="High",
+                        weight_pct=Decimal("25.00"),
+                    )
+                    pms_models.Task.objects.create(
+                        client=client, project=prj1, stage=stage, task_name="Fitment & tack welding of table frame",
+                        assigned_user=welder_worker, department=stage.department, start_date=today - timedelta(days=2),
+                        due_date=today, completion_pct=100, status="Completed", priority="High",
+                        weight_pct=Decimal("25.00"),
+                    )
+                    pms_models.Task.objects.create(
+                        client=client, project=prj1, stage=stage, task_name="Weld frame & stiffeners (Full seam)",
+                        assigned_user=welder_worker, department=stage.department, start_date=today,
+                        due_date=today + timedelta(days=2), completion_pct=60, status="In Progress", priority="High",
+                        weight_pct=Decimal("30.00"),
+                    )
+                    pms_models.Task.objects.create(
+                        client=client, project=prj1, stage=stage, task_name="Grind, de-slag & finish welds",
+                        assigned_user=fab_worker, department=stage.department, start_date=today + timedelta(days=1),
+                        due_date=today + timedelta(days=3), completion_pct=0, status="Not Started", priority="Medium",
+                        weight_pct=Decimal("20.00"),
+                    )
+                elif sname == "Quality Inspection":
+                    pms_models.Task.objects.create(
+                        client=client, project=prj1, stage=stage, task_name="Dimensional inspection & flatness audit",
+                        assigned_user=qa_worker, department=stage.department, start_date=today + timedelta(days=4),
+                        due_date=today + timedelta(days=5), completion_pct=0, status="Not Started", priority="High",
+                        weight_pct=Decimal("50.00"),
+                    )
+                    pms_models.Task.objects.create(
+                        client=client, project=prj1, stage=stage, task_name="Visual & NDT weld inspection report",
+                        assigned_user=qa_worker, department=stage.department, start_date=today + timedelta(days=5),
+                        due_date=today + timedelta(days=6), completion_pct=0, status="Not Started", priority="High",
+                        weight_pct=Decimal("50.00"),
+                    )
+                elif sname == "Packaging":
+                    pms_models.Task.objects.create(
+                        client=client, project=prj1, stage=stage, task_name="Clean, anti-rust spray & protective wrapping",
+                        assigned_user=store_worker, department=stage.department, start_date=today + timedelta(days=7),
+                        due_date=today + timedelta(days=8), completion_pct=0, status="Not Started", priority="Medium",
+                        weight_pct=Decimal("50.00"),
+                    )
+                    pms_models.Task.objects.create(
+                        client=client, project=prj1, stage=stage, task_name="Crate, label & pack for dispatch",
+                        assigned_user=assembly_worker, department=stage.department, start_date=today + timedelta(days=8),
+                        due_date=today + timedelta(days=9), completion_pct=0, status="Not Started", priority="Medium",
+                        weight_pct=Decimal("50.00"),
+                    )
+                elif sname == "Installation":
+                    pms_models.Task.objects.create(
+                        client=client, project=prj1, stage=stage, task_name="Site delivery, positioning & layout",
+                        assigned_user=assembly_worker, department=stage.department, start_date=today + timedelta(days=10),
+                        due_date=today + timedelta(days=11), completion_pct=0, status="Not Started", priority="Medium",
+                        weight_pct=Decimal("50.00"),
+                    )
+                    pms_models.Task.objects.create(
+                        client=client, project=prj1, stage=stage, task_name="Mechanical leveling & commissioning trial",
+                        assigned_user=assembly_worker, department=stage.department, start_date=today + timedelta(days=11),
+                        due_date=today + timedelta(days=12), completion_pct=0, status="Not Started", priority="High",
+                        weight_pct=Decimal("50.00"),
+                    )
+
             if first_in_prog:
                 prj1.current_stage = first_in_prog
                 prj1.current_department = first_in_prog.department
                 prj1.save(update_fields=["current_stage", "current_department"])
+
+            # Ensure all workers are added as Project Members
+            for member_user in (fab_worker, welder_worker, assembly_worker, qa_worker, store_worker):
+                if member_user:
+                    pms_models.ProjectMember.objects.get_or_create(
+                        client=client, project=prj1, user=member_user,
+                        defaults={"added_by": pm}
+                    )
 
         # Project 2: CNC Laser Machine Installation
         so2 = sales_orders["SO-2026-002"]
@@ -1218,9 +1321,9 @@ class Command(BaseCommand):
             stage_specs_2 = [
                 ("Design & Drawing", 1, "Design", pm, "Approved", 100, Decimal("15.00"), True, True),
                 ("Fabrication", 2, "Production", fab_worker, "Completed", 100, Decimal("45.00"), False, False),
-                ("Quality Inspection", 3, "Quality", pm, "In Progress", 50, Decimal("20.00"), True, False),
-                ("Packaging", 4, "Packaging", fab_worker, "Not Started", 0, Decimal("10.00"), False, False),
-                ("Installation", 5, "Installation", pm, "Not Started", 0, Decimal("10.00"), False, True),
+                ("Quality Inspection", 3, "Quality", qa_worker, "In Progress", 50, Decimal("20.00"), True, False),
+                ("Packaging", 4, "Packaging", store_worker, "Not Started", 0, Decimal("10.00"), False, False),
+                ("Installation", 5, "Installation", assembly_worker, "Not Started", 0, Decimal("10.00"), False, True),
             ]
             current_s = None
             for sname, seq, dname, usr, s_stat, pct, wt, req_doc, req_app in stage_specs_2:
@@ -1242,10 +1345,68 @@ class Command(BaseCommand):
                 )
                 if s_stat == "In Progress":
                     current_s = stage
+
+                # Seed Stage Tasks for PRJ-2026-002
+                if sname == "Design & Drawing":
+                    pms_models.Task.objects.create(
+                        client=client, project=prj2, stage=stage, task_name="Machine layout & power foundation drawing",
+                        assigned_user=pm, department=stage.department, start_date=today - timedelta(days=10),
+                        due_date=today - timedelta(days=8), completion_pct=100, status="Completed", priority="Medium",
+                        weight_pct=Decimal("100.00"),
+                    )
+                elif sname == "Fabrication":
+                    pms_models.Task.objects.create(
+                        client=client, project=prj2, stage=stage, task_name="Cut & prepare machine chassis components",
+                        assigned_user=fab_worker, department=stage.department, start_date=today - timedelta(days=8),
+                        due_date=today - timedelta(days=5), completion_pct=100, status="Completed", priority="High",
+                        weight_pct=Decimal("50.00"),
+                    )
+                    pms_models.Task.objects.create(
+                        client=client, project=prj2, stage=stage, task_name="Weld laser gantry & stress relieve",
+                        assigned_user=welder_worker, department=stage.department, start_date=today - timedelta(days=5),
+                        due_date=today - timedelta(days=2), completion_pct=100, status="Completed", priority="High",
+                        weight_pct=Decimal("50.00"),
+                    )
+                elif sname == "Quality Inspection":
+                    pms_models.Task.objects.create(
+                        client=client, project=prj2, stage=stage, task_name="Gantry squareness & linear rail runout test",
+                        assigned_user=qa_worker, department=stage.department, start_date=today - timedelta(days=2),
+                        due_date=today + timedelta(days=1), completion_pct=50, status="In Progress", priority="High",
+                        weight_pct=Decimal("50.00"),
+                    )
+                    pms_models.Task.objects.create(
+                        client=client, project=prj2, stage=stage, task_name="Laser source optical power output test",
+                        assigned_user=qa_worker, department=stage.department, start_date=today,
+                        due_date=today + timedelta(days=2), completion_pct=0, status="Not Started", priority="High",
+                        weight_pct=Decimal("50.00"),
+                    )
+                elif sname == "Packaging":
+                    pms_models.Task.objects.create(
+                        client=client, project=prj2, stage=stage, task_name="Heavy machinery export crating & moisture sealing",
+                        assigned_user=store_worker, department=stage.department, start_date=today + timedelta(days=4),
+                        due_date=today + timedelta(days=6), completion_pct=0, status="Not Started", priority="Medium",
+                        weight_pct=Decimal("100.00"),
+                    )
+                elif sname == "Installation":
+                    pms_models.Task.objects.create(
+                        client=client, project=prj2, stage=stage, task_name="On-site machine leveling, gas setup & cutting trial",
+                        assigned_user=assembly_worker, department=stage.department, start_date=today + timedelta(days=7),
+                        due_date=today + timedelta(days=10), completion_pct=0, status="Not Started", priority="Urgent",
+                        weight_pct=Decimal("100.00"),
+                    )
+
             if current_s:
                 prj2.current_stage = current_s
                 prj2.current_department = current_s.department
                 prj2.save(update_fields=["current_stage", "current_department"])
+
+            # Ensure all workers are added as Project Members
+            for member_user in (fab_worker, welder_worker, assembly_worker, qa_worker, store_worker):
+                if member_user:
+                    pms_models.ProjectMember.objects.get_or_create(
+                        client=client, project=prj2, user=member_user,
+                        defaults={"added_by": pm}
+                    )
 
     def _seed_bank_accounts(self, client):
         bank_acc = Account.objects.filter(client=client, system_key="bank").first()
