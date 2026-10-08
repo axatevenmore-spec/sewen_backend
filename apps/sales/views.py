@@ -1466,6 +1466,8 @@ class PaymentInViewSet(TenantModelViewSet):
             ).first()
             if invoice is None and payment_type == "WITH_BILL":
                 raise NotFound("That invoice no longer exists.")
+            if invoice and invoice.party_id != data["party"].id:
+                raise ValidationError({"invoiceId": ["Cannot allocate payment to another customer's invoice."]})
 
         payment = services.record_payment_in(
             client=self.request.user.client,

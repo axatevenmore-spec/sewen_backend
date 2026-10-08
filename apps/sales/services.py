@@ -1187,6 +1187,11 @@ def allocate_payment_in(payment, allocations, *, user=None):
                 "Cannot record payment against a draft invoice. Finalize it first.",
                 code=Codes.PAYMENT_ON_DRAFT,
             )
+        if invoice.party_id != payment.party_id:
+            raise BusinessRuleViolation(
+                f"Cannot allocate payment from customer {payment.party_id} to invoice of customer {invoice.party_id}.",
+                code="CROSS_CUSTOMER_ALLOCATION_NOT_ALLOWED",
+            )
 
         already = round2(allocated_to(payment.client_id, "SalesInvoice", invoice.id))
         balance = round2(D(invoice.total) - already)
