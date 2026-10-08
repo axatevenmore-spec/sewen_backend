@@ -152,6 +152,53 @@ from .serializers import (
 #: locked HR Manager -- who approves but does not apply -- out of the queue.
 LEAVE_READERS = ("apply_leave", "approve_leave")
 PAY_READERS = ("view_own_payslip", "generate_payroll", "approve_payroll")
+#: Company-wide pay -- every payslip, the salary templates. HR admin, super
+#: admin and any executive role granted one of these.
+PAY_MANAGERS = ("generate_payroll", "approve_payroll", "edit_salary_structure")
+
+def _as_date(value):
+    """``YYYY-MM-DD`` (or a date) to a date; anything else to None."""
+    if not value:
+        return None
+    if hasattr(value, "year"):
+        return value
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _as_moment(value, day):
+    """An ISO datetime, or ``HH:MM`` on ``day``, as an aware datetime."""
+    if not value:
+        return None
+    from django.utils.dateparse import parse_datetime
+
+    text = str(value).strip()
+    moment = parse_datetime(text) if "T" in text or " " in text else None
+    if moment is None:
+        try:
+            moment = datetime.combine(day, datetime.strptime(text[:5], "%H:%M").time())
+        except ValueError:
+            raise ValidationFailed(
+                f"'{text}' is not a time.", field_errors={"checkIn": ["Use HH:MM."]}
+            )
+    return timezone.make_aware(moment) if timezone.is_naive(moment) else moment
+
+
+def reporting_chain_ids(client_id, manager_id):
+    """Ids of every employee below ``manager_id`` (direct and indirect reports)."""
+    found, frontier = set(), {manager_id}
+    while frontier:
+        below = set(
+            Employee.objects.filter(
+                client_id=client_id, manager_id__in=frontier, deleted_at__isnull=True
+            ).values_list("id", flat=True)
+        ) - found - {manager_id}
+        found |= below
+        frontier = below
+    return found
+
 
 class OwnEmployeeScopeMixin:
     """Record-level scope for self-service HR data.
@@ -164,6 +211,13 @@ class OwnEmployeeScopeMixin:
     """
 
     team_scope_permissions = ()
+    #: When True, a reporting manager without the team permission may also
+    #: *read* the rows of everyone below them in the reporting chain. Writes
+    #: stay limited to their own rows.
+    manager_read_scope = False
+    #: A field naming an employee who may also *read* the row -- the colleague
+    #: a leave hands work over to sees it in "Assigned to me".
+    delegate_read_field = None
 
     def has_team_scope(self):
         return has_permission(self.request.user, tuple(self.team_scope_permissions))
@@ -173,7 +227,17 @@ class OwnEmployeeScopeMixin:
         if self.has_team_scope():
             return queryset
         employee_id = getattr(self.request.user, "employee_id", None)
-        return queryset.filter(employee_id=employee_id) if employee_id else queryset.none()
+        if not employee_id:
+            return queryset.none()
+        if self.request.method not in ("GET", "HEAD", "OPTIONS"):
+            return queryset.filter(employee_id=employee_id)
+        visible = [employee_id]
+        if self.manager_read_scope:
+            visible += reporting_chain_ids(self.request.client_id, employee_id)
+        scope = Q(employee_id__in=visible)
+        if self.delegate_read_field:
+            scope |= Q(**{self.delegate_read_field: employee_id})
+        return queryset.filter(scope)
 
     def check_own_employee(self, employee):
         if self.has_team_scope():
@@ -250,7 +314,58 @@ class EmployeeViewSet(TenantModelViewSet):
         "managerId": "manager_id",
         "employmentType": "employment_type",
     }
-    permission_map = {"read": ["view_staff"], "write": ["edit_staff"], "create": ["create_staff"]}
+    permission_map = {
+        "read": ["view_staff"],
+        "write": ["edit_staff"],
+        "create": ["create_staff"],
+        # Anyone who applies for leave picks a colleague to hand work over to.
+        "colleagues": [LEAVE_READERS],
+        # Every signed-in employee may read their own record.
+        "me": [],
+    }
+
+    @action(detail=False, methods=["get"])
+    def me(self, request):
+        """``GET /hrms/employees/me/`` -- the caller's own employee record.
+
+        Self-service: no permission beyond being signed in, and only ever the
+        record linked to this login, so it cannot be pointed at anyone else.
+        """
+        employee_id = getattr(request.user, "employee_id", None)
+        employee = (
+            self.get_queryset().filter(pk=employee_id).first()
+            if employee_id else None
+        )
+        if employee is None:
+            raise NotFound(
+                "Your login is not linked to an employee record. Ask HR to link it.",
+                code="NO_EMPLOYEE",
+            )
+        return Response(self.get_serializer(employee).data)
+
+    @action(detail=False, methods=["get"])
+    def colleagues(self, request):
+        """``GET /hrms/employees/colleagues/`` -- names only, for the delegate picker.
+
+        Self-service cannot read the staff directory (`view_staff`), so this
+        hands out just enough to choose who covers your work: no contact,
+        pay or personal fields.
+        """
+        rows = (
+            Employee.objects.filter(client_id=request.client_id, deleted_at__isnull=True)
+            .exclude(status__in=["Resigned", "Terminated"])
+            .select_related("department", "designation")
+            .order_by("name")
+        )
+        return Response(envelope([
+            {
+                "id": str(e.id),
+                "name": e.name,
+                "department": e.department.name if e.department_id else "",
+                "designation": e.designation.name if e.designation_id else "",
+            }
+            for e in rows
+        ]))
 
     def get_aggregates(self, queryset):
         return queryset.aggregate(
@@ -590,18 +705,30 @@ class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
         "date": "work_date",
     }
     permission_map = {
-        "read": ["view_team_attendance"],
-        "write": ["mark_attendance"],
+        # Everyone who marks attendance reads their own rows (the mixin scopes
+        # them); `view_team_attendance` reads the whole register.
+        "read": [("view_team_attendance", "mark_attendance")],
+        # Editing the register by hand is HR's. An employee's own attendance
+        # comes from Punch In / Punch Out, and corrections go through
+        # regularization.
+        "write": ["mark_attendance", "view_team_attendance"],
         # Marking a whole day for many people is a team action.
         "bulk": ["mark_attendance", "view_team_attendance"],
+        # Tenant-wide figures and the edit trail.
+        "summary": ["view_team_attendance"],
+        "audit": ["view_team_attendance"],
         "today": [],
         "punch": [],
         "correct_punch": ["regularize_attendance", "mark_attendance"],
         "punches": [],
         "punch_timeline": [],
     }
-    # Without it, `mark_attendance` covers the caller's own row only.
     team_scope_permissions = ("view_team_attendance",)
+
+    def _own_or_team(self, employee):
+        """Someone else's attendance needs the team permission."""
+        if employee is not None and not self.has_team_scope():
+            self.check_own_employee(employee)
 
     def get_aggregates(self, queryset):
         return queryset.aggregate(
@@ -682,12 +809,13 @@ class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
                 ).first()
             if employee is None:
                 continue
+            day = _as_date(record.get("date")) or work_date
             services.mark_attendance(
                 client=request.user.client,
                 employee=employee,
-                work_date=record.get("date") or work_date,
-                check_in=record.get("checkIn"),
-                check_out=record.get("checkOut"),
+                work_date=day,
+                check_in=_as_moment(record.get("checkIn"), day),
+                check_out=_as_moment(record.get("checkOut"), day),
                 status=record.get("status"),
                 remark=record.get("remark"),
                 source="bulk",
@@ -717,6 +845,13 @@ class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
 
     @action(detail=False, methods=["get"], url_path=r"individual/(?P<employee_id>[^/.]+)")
     def individual(self, request, employee_id=None):
+        if not self.has_team_scope():
+            target = self._resolve_employee(request, employee_id) if employee_id else None
+            if target is None:
+                raise PermissionDenied(
+                    "You can only view your own attendance.", code="view_team_attendance"
+                )
+            self.check_own_employee(target)
         rows = Attendance.objects.filter(
             client_id=request.client_id, employee_id=employee_id, deleted_at__isnull=True
         ).order_by("work_date")
@@ -788,6 +923,8 @@ class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
         """``GET /hrms/attendance/today/`` -- punch state for current employee today."""
         employee_id = request.query_params.get("employeeId")
         employee = self._resolve_employee(request, employee_id)
+        if employee_id:
+            self._own_or_team(employee)
         if not employee:
             return Response({
                 "has_employee": False,
@@ -920,6 +1057,8 @@ class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
         employee_id = request.query_params.get("employeeId")
         date_str = request.query_params.get("date") or request.query_params.get("work_date")
         employee = self._resolve_employee(request, employee_id)
+        if employee_id:
+            self._own_or_team(employee)
         if not employee:
             return Response([])
 
@@ -1037,6 +1176,8 @@ class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
     search_fields = ["employee__name", "reason"]
     filter_map = {"employeeId": "employee_id", "type": "leave_type__name", "leaveTypeId": "leave_type_id"}
     team_scope_permissions = ("approve_leave",)
+    manager_read_scope = True
+    delegate_read_field = "delegate_employee_id"
     permission_map = {"read": [LEAVE_READERS], "create": ["apply_leave"], "write": ["approve_leave"]}
 
     def get_aggregates(self, queryset):
@@ -1177,6 +1318,7 @@ class LeaveBalanceViewSet(OwnEmployeeScopeMixin, ReadOnlyTenantViewSet):
     filter_map = {"employeeId": "employee_id", "leaveTypeId": "leave_type_id", "year": "period_year"}
     ordering = ["employee__name"]
     team_scope_permissions = ("approve_leave",)
+    manager_read_scope = True
     permission_map = {"read": [LEAVE_READERS]}
 
 
@@ -1189,6 +1331,7 @@ class CompOffViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
     ordering = ["-worked_date"]
     filter_map = {"employeeId": "employee_id", "used": "used"}
     team_scope_permissions = ("approve_leave",)
+    manager_read_scope = True
     permission_map = {"read": [LEAVE_READERS], "write": ["approve_leave"]}
 
 
@@ -1200,6 +1343,7 @@ class LeaveEncashmentViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
     ordering = ["-created_at"]
     filter_map = {"employeeId": "employee_id"}
     team_scope_permissions = ("approve_leave",)
+    manager_read_scope = True
     permission_map = {"read": [LEAVE_READERS], "write": ["approve_leave"]}
 
 
@@ -1341,7 +1485,8 @@ class SalaryStructureViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = None
     ordering = ["name"]
-    permission_map = {"read": [PAY_READERS], "write": ["edit_salary_structure"]}
+    # The pay templates are company data, not the employee's own slip.
+    permission_map = {"read": [PAY_MANAGERS], "write": ["edit_salary_structure"]}
 
 
 class SalaryAdvanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):

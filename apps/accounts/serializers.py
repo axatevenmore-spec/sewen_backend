@@ -30,6 +30,8 @@ class MeUserSerializer(BaseModelSerializer):
 
     role = RoleRefSerializer(read_only=True)
     employeeId = serializers.SerializerMethodField()
+    employeeRecordId = serializers.SerializerMethodField()
+    managesTeam = serializers.SerializerMethodField()
     avatar = serializers.SerializerMethodField()
     reportingManager = serializers.SerializerMethodField()
     lastLogin = serializers.DateTimeField(source="last_login_at", read_only=True)
@@ -40,13 +42,25 @@ class MeUserSerializer(BaseModelSerializer):
     class Meta:
         model = User
         fields = [
-            "id", "name", "email", "phone", "avatar", "employeeId", "role",
-            "department", "location", "reportingManager", "status", "lastLogin",
+            "id", "name", "email", "phone", "avatar", "employeeId", "employeeRecordId",
+            "managesTeam", "role", "department", "location", "reportingManager", "status", "lastLogin",
             "partyId", "partyName", "isCustomer",
         ]
 
     def get_employeeId(self, user):
         return user.employee.employee_code if user.employee_id else None
+
+    def get_employeeRecordId(self, user):
+        # `employeeId` is the human code (EMP-012); `?employeeId=` filters take
+        # the record's primary key, which is this.
+        return str(user.employee_id) if user.employee_id else None
+
+    def get_managesTeam(self, user):
+        # Someone reports to this user: they may read their team's leave
+        # (hrms OwnEmployeeScopeMixin.manager_read_scope).
+        if not user.employee_id:
+            return False
+        return user.employee.reports.filter(deleted_at__isnull=True).exists()
 
     def get_avatar(self, user):
         return user.avatar_url

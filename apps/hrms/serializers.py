@@ -273,6 +273,23 @@ class EmployeeSerializer(BaseModelSerializer):
             "role": user.role.name if user.role_id else None,
         }
 
+    #: Pay on the employee record. Only payroll managers see colleagues' pay;
+    #: everyone still sees their own (`/hrms/employees/me/`).
+    PAY_FIELDS = ("standard_salary", "salaryStructureId")
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        if user is None or getattr(user, "employee_id", None) == instance.pk:
+            return data
+        from apps.core.permissions import has_permission
+
+        if not has_permission(user, ("generate_payroll", "approve_payroll", "edit_salary_structure")):
+            for field in self.PAY_FIELDS:
+                data.pop(field, None)
+        return data
+
     def to_internal_value(self, data):
         if isinstance(data, dict):
             data = data.copy()
@@ -283,6 +300,18 @@ class EmployeeSerializer(BaseModelSerializer):
         return super().to_internal_value(data)
 
     def validate(self, attrs):
+        # Setting someone's pay is a payroll action, not a staff-record edit.
+        pay_keys = {"standard_salary", "salary_structure"} & set(attrs)
+        user = getattr(self.context.get("request"), "user", None)
+        if pay_keys and user is not None:
+            from apps.core.exceptions import PermissionDenied
+            from apps.core.permissions import has_permission
+
+            if not has_permission(user, ("generate_payroll", "approve_payroll", "edit_salary_structure")):
+                raise PermissionDenied(
+                    "Only payroll managers can change salary details.", code="generate_payroll"
+                )
+
         if not attrs.get("joining_date") and not self.instance:
             attrs["joining_date"] = timezone.now().date()
 
@@ -553,12 +582,16 @@ class LeaveRequestSerializer(BaseModelSerializer):
         source="delegate_employee", model="hrms.Employee",
         required=False, allow_null=True,
     )
+    # Who covers the work, by name — the handover tables show it.
+    delegate = serializers.CharField(
+        source="delegate_employee.name", read_only=True, default=""
+    )
 
     class Meta:
         model = LeaveRequest
         fields = [
             "id", "employeeId", "employeeName", "employeeCode", "type",
-            "leaveTypeId", "fromDate", "toDate", "days", "reason", "delegateId",
+            "leaveTypeId", "fromDate", "toDate", "days", "reason", "delegateId", "delegate",
             "delegate_confirmed_at", "status", "approver", "decided_at",
             "remark", "created_at", "updated_at",
         ]
