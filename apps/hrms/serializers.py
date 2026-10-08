@@ -663,6 +663,11 @@ class LeaveEncashmentSerializer(BaseModelSerializer):
 # Payroll (api.md §11.4)
 # ---------------------------------------------------------------------------
 class SalaryStructureSerializer(BaseModelSerializer):
+    # The API name for the model's ``overtime_monthly_cap_hours``.
+    max_overtime_hours_month = serializers.DecimalField(
+        source="overtime_monthly_cap_hours", max_digits=6, decimal_places=2, required=False
+    )
+
     class Meta:
         model = SalaryStructure
         fields = [

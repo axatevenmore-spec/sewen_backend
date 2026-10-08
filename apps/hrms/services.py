@@ -855,10 +855,20 @@ def approve_leave(leave_request, *, user=None, remark=None):
         created_by=user if getattr(user, "is_authenticated", False) else None,
     )
 
-    if leave_request.employee.status == "Active" and D(leave_request.days) >= 1:
+    # Notifications go to logins: the employee's linked user, if they have one.
+    # (This used to pass the employee id, which is not a user -- the insert
+    # failed its foreign key at commit, so approving any leave errored.)
+    from apps.accounts.models import User
+
+    recipient_ids = list(
+        User.objects.filter(
+            employee_id=leave_request.employee_id, deleted_at__isnull=True
+        ).values_list("id", flat=True)
+    )
+    if recipient_ids and leave_request.employee.status == "Active" and D(leave_request.days) >= 1:
         notify(
             client=leave_request.client_id,
-            recipients=[leave_request.employee.id],
+            recipients=recipient_ids,
             type="hrms.leave_approved",
             category="hrms",
             title="Your leave was approved",
@@ -1052,7 +1062,7 @@ def process_payroll(*, client, period_month, employee_ids=None, user=None):
         ).aggregate(tot=Sum("overtime_hours"))["tot"] or Decimal("0.00")
 
         structure = employee.salary_structure
-        max_ot = structure.max_overtime_hours_month if structure and structure.max_overtime_hours_month else None
+        max_ot = structure.overtime_monthly_cap_hours if structure and structure.overtime_monthly_cap_hours else None
         capped_ot = min(ot_sum, Decimal(str(max_ot))) if max_ot is not None else ot_sum
         multiplier = Decimal(str(structure.overtime_rate_multiplier)) if structure and structure.overtime_rate_multiplier else Decimal("1.5")
         hourly_rate = (employee.standard_salary / (total_days * Decimal("8.0"))) if total_days else Decimal("0.00")

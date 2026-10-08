@@ -655,7 +655,8 @@ def _post_invoice_stock(invoice, lines, *, user=None):
 
         stock.assert_not_qc_blocked(invoice.client_id, line.item_id, line.item_name)
         stock.assert_sufficient_stock(
-            invoice.client_id, line.item, line.qty, location_id, line.item_name
+            invoice.client_id, line.item, line.qty, location_id, line.item_name,
+            own_reserved=_own_reservation(line),
         )
 
         serials = stock.serials_for_lines(
@@ -679,6 +680,18 @@ def _post_invoice_stock(invoice, lines, *, user=None):
         )
         if resolved:
             stock.set_serial_status(resolved, "sold", movement=movement)
+
+
+def _own_reservation(line):
+    """What the order line this document line fulfils still reserves -- stock
+    set aside for exactly this dispatch (see ``assert_sufficient_stock``)."""
+    if not getattr(line, "sales_order_line_id", None):
+        return ZERO
+    order_line = line.sales_order_line
+    if order_line.sales_order.stage in NON_RESERVING_STAGES or order_line.sales_order.deleted_at:
+        return ZERO
+    open_qty = D(order_line.qty) - D(order_line.dispatched_qty)
+    return max(min(D(line.qty), open_qty), ZERO)
 
 
 def _already_dispatched(sales_order_line_id):
@@ -797,7 +810,8 @@ def dispatch_challan(challan, *, user=None):
 
         stock.assert_not_qc_blocked(challan.client_id, line.item_id, line.item_name)
         stock.assert_sufficient_stock(
-            challan.client_id, line.item, line.qty, location_id, line.item_name
+            challan.client_id, line.item, line.qty, location_id, line.item_name,
+            own_reserved=_own_reservation(line),
         )
 
         serial_numbers = serial_map.get(line.id, [])

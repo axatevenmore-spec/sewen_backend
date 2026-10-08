@@ -547,6 +547,8 @@ class SalaryStructure(TenantModel, LegacyIdMixin):
     hra_pct = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
     components = models.JSONField(default=list, blank=True)
     overtime_monthly_cap_hours = models.DecimalField(max_digits=6, decimal_places=2, default=30)
+    #: Overtime pay = hours x hourly rate x this (payroll assumed 1.5x).
+    overtime_rate_multiplier = models.DecimalField(max_digits=4, decimal_places=2, default=1.5)
     overtime_saturation_threshold = models.DecimalField(max_digits=6, decimal_places=2, default=25)
     require_overtime_approval = models.BooleanField(default=True)
     is_active = models.BooleanField(default=True)

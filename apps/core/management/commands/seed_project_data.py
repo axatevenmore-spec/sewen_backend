@@ -857,8 +857,12 @@ class Command(BaseCommand):
 
         for item, loc, qty, w_qty, cost, note in movements_data:
             if not StockMovement.objects.filter(client=client, item=item, notes=note).exists():
-                StockMovement.objects.create(
-                    client=client,
+                # Through the inventory service, so the stock balances (what
+                # "available" is read from) move with the ledger.
+                from apps.inventory.services import post_movement
+
+                post_movement(
+                    client_id=client.id,
                     item=item,
                     location=loc,
                     type="ADJUSTMENT",

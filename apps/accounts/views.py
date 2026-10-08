@@ -238,6 +238,67 @@ class LoginView(APIView):
             raise
 
 
+class TestAccountsView(APIView):
+    """``GET /auth/test-accounts/`` -- the login page's test-account picker.
+
+    Off (404) unless ``settings.TEST_LOGIN_PICKER`` -- development only by
+    default. Lists only tenants built by ``seed_test_tenant`` (slug ends in
+    ``-test`` and carries the ``test_tenant`` flag), with the password that
+    command set; real tenants never appear here.
+    """
+
+    authentication_classes = []
+    permission_classes = [AllowPublic]
+
+    ROLE_ORDER = {"AD": 0, "PM": 1, "HR": 2, "SM": 3, "SE": 4, "AC": 5, "PU": 6, "ST": 7, "EM": 8, "CU": 9}
+
+    def get(self, request):
+        if not getattr(settings, "TEST_LOGIN_PICKER", False):
+            raise NotFound("Not available.")
+        from apps.core.models import Setting
+        from apps.core.tenancy import tenant_context
+
+        tenants = []
+        for client in Client.objects.filter(slug__endswith="-test").order_by("slug"):
+            with tenant_context(client.id, push_to_db=False):
+                flags = dict(
+                    Setting.objects.filter(
+                        client=client, key__in=["test_tenant", "test_tenant_password"]
+                    ).values_list("key", "value")
+                )
+                if not flags.get("test_tenant"):
+                    continue
+                users = (
+                    User.objects.filter(client=client, deleted_at__isnull=True, status="Active")
+                    .select_related("role", "employee__designation")
+                )
+                accounts = sorted(
+                    (
+                        {
+                            "email": u.email,
+                            "name": u.name,
+                            "role": u.role.name if u.role_id else "",
+                            "roleCode": u.role.code if u.role_id else "",
+                            "designation": (
+                                u.employee.designation.name
+                                if u.employee_id and u.employee.designation_id else ""
+                            ),
+                        }
+                        for u in users
+                    ),
+                    key=lambda a: (self.ROLE_ORDER.get(a["roleCode"], 50), a["email"]),
+                )
+            tenants.append(
+                {
+                    "slug": client.slug,
+                    "name": client.name,
+                    "password": flags.get("test_tenant_password"),
+                    "accounts": accounts,
+                }
+            )
+        return Response({"tenants": tenants})
+
+
 def _device_label(request):
     agent = request.META.get("HTTP_USER_AGENT", "")
     for needle, label in (

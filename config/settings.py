@@ -38,6 +38,12 @@ def env_list(key, default=""):
 DEBUG = env_bool("DJANGO_DEBUG", False)
 DJANGO_ENV = (env("DJANGO_ENV") or ("development" if DEBUG else "production")).strip().lower()
 
+# The login page's "Test accounts" picker (``GET /auth/test-accounts/``): lists
+# the logins of tenants built by ``seed_test_tenant`` -- with their password --
+# so a tester can sign in as any role in one click. Development only unless the
+# environment turns it on; never enable it on a public deployment.
+TEST_LOGIN_PICKER = env_bool("TEST_LOGIN_PICKER", DJANGO_ENV == "development")
+
 # Signs every JWT, password-reset token and file link. A key from the repo
 # would let anyone mint a token for any user in any tenant, so outside local
 # development there is no fallback -- the process refuses to start.

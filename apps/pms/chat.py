@@ -153,6 +153,8 @@ class ChatScope:
             getattr(user, "is_superuser", False)
             or project.project_manager_id == user.id
             or has_permission(user, OVERSIGHT_PERMISSION)
+            # Administrators see every chat a PM does, on every project.
+            or has_permission(user, "menu_admin")
         )
         self.my_teams = {dept for dept, roster in self.rosters.items() if user.id in roster}
         self.is_participant = self.is_oversight or bool(self.my_teams) or user.id in self.extra

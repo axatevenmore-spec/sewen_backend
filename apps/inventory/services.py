@@ -350,11 +350,17 @@ def annotate_items_with_stock(client_id, items):
 # ---------------------------------------------------------------------------
 # Guards used by the document services
 # ---------------------------------------------------------------------------
-def assert_sufficient_stock(client_id, item, quantity, location_id=None, label=None):
+def assert_sufficient_stock(client_id, item, quantity, location_id=None, label=None, own_reserved=ZERO):
     """422 INSUFFICIENT_STOCK when a dispatch would go negative.
 
     api-integration.md §5.5 shows 422 messages verbatim to the user, so the
     message names the item and the number the user can act on.
+
+    ``own_reserved`` is what the document being posted already holds in
+    reservations -- a challan or invoice fulfilling an order line. That stock
+    is set aside *for* this dispatch, so it counts as available to it;
+    without this an order could only be dispatched with twice its quantity
+    on hand.
     """
     from apps.masters.models import Item
 
@@ -365,6 +371,7 @@ def assert_sufficient_stock(client_id, item, quantity, location_id=None, label=N
         return  # Service items hold no stock (api.md §4.2).
 
     stock = calculate_item_stock(client_id, item_obj, location_id)
+    stock["available"] = stock["available"] + max(D(own_reserved or ZERO), ZERO)
     if D(quantity) > stock["available"]:
         raise BusinessRuleViolation(
             f"Not enough stock for {label or item_obj.name}. "

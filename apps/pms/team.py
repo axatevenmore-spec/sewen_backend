@@ -24,6 +24,14 @@ from .models import Project, ProjectMember, ProjectStage, Task
 
 #: Who may staff a project besides its own PM (the catalogue's ids).
 MANAGE_PERMISSIONS = ("assign_members", "assign_stage")
+#: Administrators oversee every project's chats, whether or not they are on
+#: its team (``menu_admin`` is the Administration section, admins only).
+ADMIN_PERMISSION = "menu_admin"
+
+
+def oversees_all_projects(user):
+    """Administrator / super admin: every project's chats, like its PM."""
+    return bool(getattr(user, "is_superuser", False) or has_permission(user, ADMIN_PERMISSION))
 
 
 def can_manage(user, project):
@@ -274,10 +282,10 @@ def participant_project_ids(user):
 def my_chats(user):
     """``GET /pms/my-chats/`` -- every project I can chat on, with what the
     messenger needs (stages for its stage tags) and my unread count."""
-    projects = (
-        Project.objects.filter(pk__in=participant_project_ids(user), deleted_at__isnull=True)
-        .order_by("-updated_at")
-    )
+    projects = Project.objects.filter(client_id=user.client_id, deleted_at__isnull=True)
+    if not oversees_all_projects(user):
+        projects = projects.filter(pk__in=participant_project_ids(user))
+    projects = projects.order_by("-updated_at")
     rows = []
     for project in projects:
         scope = chat.ChatScope(project, user)
