@@ -42,9 +42,17 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument("--tenant", default="sweven", help="Tenant slug (default: sweven).")
+        parser.add_argument(
+            "--email-domain", default="sweven.com",
+            help="Domain for the seeded logins. Another tenant needs its own: login "
+                 "refuses an address that exists in two tenants.",
+        )
+        parser.add_argument("--password", default="Sweven@123", help="Password for every seeded login.")
 
     def handle(self, *args, **options):
         slug = options["tenant"]
+        self.email_domain = options.get("email_domain") or "sweven.com"
+        self.password = options.get("password") or "Sweven@123"
         client = Client.objects.filter(slug=slug).first()
         if not client:
             client = Client.objects.create(
@@ -777,7 +785,10 @@ class Command(BaseCommand):
 
         users = {}
         for uspec in users_specs:
-            email = uspec["email"].lower()
+            # Keyed by the spec address (the rest of the seeder looks users up
+            # by it); the login itself is on ``--email-domain``.
+            spec_email = uspec["email"].lower()
+            email = f"{spec_email.split('@')[0]}@{self.email_domain}".lower()
             role = roles.get(uspec.get("role_code"))
             party = uspec.get("party")
             emp_code = uspec.get("emp_code")
@@ -800,9 +811,9 @@ class Command(BaseCommand):
             user.role = role
             user.party = party
             user.status = "Active"
-            user.set_password("Sweven@123")
+            user.set_password(self.password)
             user.save()
-            users[email] = user
+            users[spec_email] = user
 
             # Create & Link HRMS Employee if this is a staff user
             if emp_code:

@@ -3,6 +3,7 @@ from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from . import views
+from .chat_views import MyProjectChatsView
 
 router = DefaultRouter(trailing_slash=True)
 router.register("departments", views.DepartmentViewSet, basename="pms-departments")
@@ -19,6 +20,7 @@ urlpatterns = [
     path("settings/", views.PmsSettingsView.as_view(), name="pms-settings"),
     path("my-tasks/", views.MyTasksView.as_view(), name="pms-my-tasks"),
     path("my-projects/", views.MyProjectsView.as_view(), name="pms-my-projects"),
+    path("my-chats/", MyProjectChatsView.as_view(), name="pms-my-chats"),
     path("tasks/", views.AllTasksView.as_view(), name="pms-tasks"),
     path("nav-badges/", views.NavBadgesView.as_view(), name="pms-nav-badges"),
     path("activity/", views.PmsActivityView.as_view(), name="pms-activity"),

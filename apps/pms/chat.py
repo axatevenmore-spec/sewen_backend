@@ -5,10 +5,12 @@ Three kinds of conversation hang off a project: one ``Project`` chat, one
 ``Team`` chat per PMS department on the project's stages, and ``Direct`` chats
 between two project members.
 
-Nothing here keeps a second roster. A team is the department a stage belongs
-to, and its members are whoever the stage and its tasks are assigned to right
-now, plus the project manager -- so re-staffing a stage changes the team chat
-with no sync step. The rest reuses what PMS already has: ``core.File`` for
+A team is the department a stage belongs to, and its members are whoever the
+stage and its tasks are assigned to right now, plus the project manager -- so
+re-staffing a stage changes the team chat with no sync step. People who work on
+the project without owning a stage or task are added to its team list
+(``ProjectMember``): they join the Project chat, and their team's chat when the
+PM put them in one. The rest reuses what PMS already has: ``core.File`` for
 attachments (the store the design proofs use), ``notify`` for mentions and new
 messages, ``record_audit`` for the project activity trail.
 
@@ -32,7 +34,14 @@ from apps.core.realtime import emit, project_room, user_room
 from apps.core.serializers import ISODateTimeField
 
 from . import services
-from .models import Conversation, ConversationMember, Message, MessageAttachment, Task
+from .models import (
+    Conversation,
+    ConversationMember,
+    Message,
+    MessageAttachment,
+    ProjectMember,
+    Task,
+)
 
 #: Anyone holding this can already staff any team, so seeing every team's chat
 #: grants nothing new. It is the "admin" gate the PMS catalogue already has.
@@ -85,7 +94,9 @@ class ChatScope:
     - **Oversight** (superuser, the project's PM, or ``assign_stage``): Project
       chat and every team chat.
     - **Team member** (assigned a stage, or a task on a stage, of that team's
-      department): Project chat and that team's chat.
+      department, or added to the project's team list in that team): Project
+      chat and that team's chat.
+    - **Project member** (on the team list without a team): Project chat.
     - **Direct** chats: only the two people in them.
     """
 
@@ -123,6 +134,19 @@ class ChatScope:
                     task.assigned_user_id, task.assigned_user
                 )
 
+        #: user id -> User: on the team list without a team (Project chat only).
+        self.extra = {}
+        members = ProjectMember.objects.filter(
+            project=project, deleted_at__isnull=True
+        ).select_related("user")
+        for member in members:
+            if not _is_live_user(member.user):
+                continue
+            if member.department_id in self.rosters:
+                self.rosters[member.department_id].setdefault(member.user_id, member.user)
+            else:
+                self.extra.setdefault(member.user_id, member.user)
+
         manager = project.project_manager if project.project_manager_id else None
         self.manager = manager if _is_live_user(manager) else None
         self.is_oversight = bool(
@@ -131,13 +155,13 @@ class ChatScope:
             or has_permission(user, OVERSIGHT_PERMISSION)
         )
         self.my_teams = {dept for dept, roster in self.rosters.items() if user.id in roster}
-        self.is_participant = self.is_oversight or bool(self.my_teams)
+        self.is_participant = self.is_oversight or bool(self.my_teams) or user.id in self.extra
 
     # -- who is in what -----------------------------------------------------
     def project_members(self):
         """Everyone on the project: the PM and every team's roster."""
         teams_of = {}
-        people = {}
+        people = dict(self.extra)
         for dept_id, roster in self.rosters.items():
             for user_id, person in roster.items():
                 people[user_id] = person

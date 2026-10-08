@@ -938,7 +938,8 @@ class TeamRosterView(APIView):
     """``GET /crm/team-roster/`` -- replaces the hardcoded ``CRM_TEAM_MEMBERS``."""
 
     permission_classes = [HasModulePermission]
-    required_permissions = ["view_task"]
+    # CRM assigns tasks from it; PMS assigns stages and hands them off.
+    required_permissions = [("view_task", "view_pms")]
 
     def get(self, request):
         return Response({"roster": services.team_roster(request.client_id)})

@@ -295,7 +295,7 @@ def hard_blockers(blockers):
 
 
 @transaction.atomic
-def handoff_stage(stage, *, user=None, force=False, comments=None):
+def handoff_stage(stage, *, user=None, force=False, comments=None, recipient_id=None):
     """``POST .../handoff/`` -- runs exactly the gate above, then advances."""
     stage = ProjectStage.objects.select_for_update().get(pk=stage.pk)
     blockers = handoff_blockers(stage)
@@ -328,6 +328,20 @@ def handoff_stage(stage, *, user=None, force=False, comments=None):
     )
 
     project = stage.project
+    if next_stage is not None and recipient_id:
+        from apps.accounts.models import User
+
+        recipient = User.objects.filter(
+            pk=recipient_id, client_id=stage.client_id, deleted_at__isnull=True
+        ).first()
+        if recipient is None:
+            raise ValidationFailed(
+                "The receiving employee was not found.",
+                field_errors={"recipientId": ["Unknown user."]},
+            )
+        if next_stage.assigned_user_id != recipient.pk:
+            next_stage.assigned_user = recipient
+            next_stage.save(update_fields=["assigned_user", "updated_at"])
     if next_stage is not None:
         project.current_stage = next_stage
         project.current_department = next_stage.department

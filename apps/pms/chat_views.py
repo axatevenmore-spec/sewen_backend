@@ -8,6 +8,10 @@
     DELETE /pms/projects/{id}/conversations/{cid}/messages/{mid}/    delete own
     POST   /pms/projects/{id}/conversations/{cid}/read/              mark read
     GET    /pms/projects/{id}/messages/search/?q=                    search
+    GET    /pms/projects/{id}/team/                                  the team
+    POST   /pms/projects/{id}/team/                                  add a member
+    DELETE /pms/projects/{id}/team/{memberId}/                       remove one
+    GET    /pms/my-chats/                                            my projects
 
 Attachments are uploaded first through the ordinary ``/files/`` flow, and the
 committed file ids are sent as ``attachmentIds`` on the message -- the same
@@ -16,10 +20,12 @@ shape stage documents use.
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
 from apps.core.pagination import envelope
+from apps.core.permissions import HasModulePermission
 
-from . import chat
+from . import chat, team
 from .serializers import (
     EditMessageSerializer,
     MessageSerializer,
@@ -27,14 +33,19 @@ from .serializers import (
     StartConversationSerializer,
 )
 
-#: Every chat action needs only ``view_pms`` at the route; which conversations
-#: the caller can reach is decided per project by ``chat.ChatScope``.
+#: No permission at the route: anyone working on the project chats on it,
+#: PMS access or not (a welder added to the team has no ``view_pms``). Which
+#: project and which conversations the caller can reach is decided per project
+#: by ``chat.ChatScope`` -- outsiders get a 404.
 CHAT_PERMISSIONS = {
-    "conversations": ["view_pms"],
-    "conversation_messages": ["view_pms"],
-    "conversation_message_detail": ["view_pms"],
-    "conversation_read": ["view_pms"],
-    "search_messages": ["view_pms"],
+    "conversations": [],
+    "conversation_messages": [],
+    "conversation_message_detail": [],
+    "conversation_read": [],
+    "search_messages": [],
+    # Team list: read by its members, changed by the PM (checked in ``team``).
+    "team": [],
+    "team_member": [],
 }
 
 
@@ -43,7 +54,31 @@ class ProjectChatMixin:
 
     def _chat_scope(self):
         project = self.get_object()
-        return chat.ChatScope(project, self.request.user)
+        scope = chat.ChatScope(project, self.request.user)
+        team.require_view(self.request.user, project, scope)
+        return scope
+
+    @action(detail=True, methods=["get", "post"], url_path="team")
+    def team(self, request, pk=None):
+        project = self.get_object()
+        if request.method == "POST":
+            team.require_manage(request.user, project)
+            team.add_member(
+                project,
+                request.user,
+                request.data.get("userId"),
+                request.data.get("departmentId") or None,
+            )
+        else:
+            team.require_view(request.user, project)
+        return Response(team.team_payload(project, request.user))
+
+    @action(detail=True, methods=["delete"], url_path=r"team/(?P<member_id>[^/.]+)")
+    def team_member(self, request, pk=None, member_id=None):
+        project = self.get_object()
+        team.require_manage(request.user, project)
+        team.remove_member(project, request.user, member_id)
+        return Response(team.team_payload(project, request.user))
 
     def _message_data(self, messages, many=False):
         return MessageSerializer(
@@ -127,3 +162,14 @@ class ProjectChatMixin:
             scope, request.query_params.get("q"), request.query_params.get("conversationId")
         )
         return Response(envelope(self._message_data(rows, many=True)))
+
+
+class MyProjectChatsView(APIView):
+    """``GET /pms/my-chats/`` -- the projects I work on, for the Project Chats
+    page every employee has (no PMS access needed)."""
+
+    permission_classes = [HasModulePermission]
+    required_permissions = []
+
+    def get(self, request):
+        return Response(envelope(team.my_chats(request.user)))

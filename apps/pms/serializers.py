@@ -463,6 +463,10 @@ class StageStatusSerializer(BaseSerializer):
 class HandoffSerializer(BaseSerializer):
     force = serializers.BooleanField(required=False, default=False)
     comments = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    # The handoff dialog's "Handover notes" -- same thing as ``comments``.
+    notes = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    # Who receives the next stage (a user id); empty keeps its assignee.
+    recipientId = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
 
 class RequestApprovalSerializer(BaseSerializer):
@@ -1016,13 +1020,17 @@ class TimesheetEntrySerializer(BaseModelSerializer):
     projectCode = serializers.CharField(source="project.code", read_only=True)
     taskId = TenantPrimaryKeyRelatedField(source="task", model="pms.Task", required=False, allow_null=True)
     taskName = serializers.CharField(source="task.task_name", read_only=True)
+    # The week this entry belongs to: its status is the entry's approval state.
+    timesheetNumber = serializers.CharField(source="timesheet.timesheet_number", read_only=True, default=None)
+    timesheetStatus = serializers.CharField(source="timesheet.status", read_only=True, default="Draft")
 
     class Meta:
         model = TimesheetEntry
         fields = [
-            "id", "timesheetId", "userId", "userName", "projectId", "projectName",
-            "projectCode", "taskId", "taskName", "date", "start_time", "end_time",
-            "duration_hours", "is_billable", "is_running", "description", "created_at",
+            "id", "timesheetId", "timesheetNumber", "timesheetStatus", "userId", "userName",
+            "projectId", "projectName", "projectCode", "taskId", "taskName", "date",
+            "start_time", "end_time", "duration_hours", "hourly_rate", "is_billable",
+            "is_running", "description", "created_at",
         ]
         read_only_fields = ["created_at"]
 
