@@ -27,6 +27,10 @@ from .models import (
     ProofShare,
     StageConfig,
     Task,
+    ProjectBug,
+    DelegatedTask,
+    Timesheet,
+    TimesheetEntry,
 )
 
 
@@ -459,6 +463,10 @@ class StageStatusSerializer(BaseSerializer):
 class HandoffSerializer(BaseSerializer):
     force = serializers.BooleanField(required=False, default=False)
     comments = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    # The handoff dialog's "Handover notes" -- same thing as ``comments``.
+    notes = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    # Who receives the next stage (a user id); empty keeps its assignee.
+    recipientId = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
 
 class RequestApprovalSerializer(BaseSerializer):
@@ -959,3 +967,87 @@ class CustomerProjectTrackingSerializer(BaseModelSerializer):
         if stages is None:
             stages = list(project.stages.filter(deleted_at__isnull=True).select_related("department", "stage_config").order_by("sequence"))
         return CustomerProjectStageSerializer(stages, many=True, context=self.context).data
+
+
+# ---------------------------------------------------------------------------
+# Bugs, Delegated Tasks, Timesheets (Dev Spec §2.6)
+# ---------------------------------------------------------------------------
+class ProjectBugSerializer(BaseModelSerializer):
+    projectId = TenantPrimaryKeyRelatedField(source="project", model="pms.Project")
+    projectCode = serializers.CharField(source="project.code", read_only=True)
+    projectName = serializers.CharField(source="project.name", read_only=True)
+    taskId = TenantPrimaryKeyRelatedField(source="task", model="pms.Task", required=False, allow_null=True)
+    taskName = serializers.CharField(source="task.task_name", read_only=True)
+    assignedToId = TenantPrimaryKeyRelatedField(source="assigned_to", model="accounts.User", required=False, allow_null=True)
+    assignedToName = serializers.CharField(source="assigned_to.name", read_only=True)
+    reportedByName = serializers.CharField(source="reported_by.name", read_only=True)
+
+    class Meta:
+        model = ProjectBug
+        fields = [
+            "id", "bug_number", "projectId", "projectCode", "projectName",
+            "taskId", "taskName", "title", "severity", "status",
+            "steps_to_reproduce", "expected_result", "actual_result", "screenshots",
+            "assignedToId", "assignedToName", "reported_by", "reportedByName",
+            "resolution_notes", "created_at", "updated_at",
+        ]
+        read_only_fields = ["bug_number", "reported_by", "created_at", "updated_at"]
+
+
+class DelegatedTaskSerializer(BaseModelSerializer):
+    delegatedById = TenantPrimaryKeyRelatedField(source="delegated_by", model="accounts.User", required=False, allow_null=True)
+    delegatedByName = serializers.CharField(source="delegated_by.name", read_only=True)
+    assignedToId = TenantPrimaryKeyRelatedField(source="assigned_to", model="accounts.User")
+    assignedToName = serializers.CharField(source="assigned_to.name", read_only=True)
+
+    class Meta:
+        model = DelegatedTask
+        fields = [
+            "id", "task_number", "title", "description", "delegatedById",
+            "delegatedByName", "assignedToId", "assignedToName", "priority",
+            "due_date", "status", "rejection_reason", "completion_notes",
+            "completed_at", "created_at", "updated_at",
+        ]
+        read_only_fields = ["task_number", "delegated_by", "created_at", "updated_at"]
+
+
+class TimesheetEntrySerializer(BaseModelSerializer):
+    timesheetId = TenantPrimaryKeyRelatedField(source="timesheet", model="pms.Timesheet", required=False, allow_null=True)
+    userId = TenantPrimaryKeyRelatedField(source="user", model="accounts.User", required=False, allow_null=True)
+    userName = serializers.CharField(source="user.name", read_only=True)
+    projectId = TenantPrimaryKeyRelatedField(source="project", model="pms.Project", required=False, allow_null=True)
+    projectName = serializers.CharField(source="project.name", read_only=True)
+    projectCode = serializers.CharField(source="project.code", read_only=True)
+    taskId = TenantPrimaryKeyRelatedField(source="task", model="pms.Task", required=False, allow_null=True)
+    taskName = serializers.CharField(source="task.task_name", read_only=True)
+    # The week this entry belongs to: its status is the entry's approval state.
+    timesheetNumber = serializers.CharField(source="timesheet.timesheet_number", read_only=True, default=None)
+    timesheetStatus = serializers.CharField(source="timesheet.status", read_only=True, default="Draft")
+
+    class Meta:
+        model = TimesheetEntry
+        fields = [
+            "id", "timesheetId", "timesheetNumber", "timesheetStatus", "userId", "userName",
+            "projectId", "projectName", "projectCode", "taskId", "taskName", "date",
+            "start_time", "end_time", "duration_hours", "hourly_rate", "is_billable",
+            "is_running", "description", "created_at",
+        ]
+        read_only_fields = ["created_at"]
+
+
+class TimesheetSerializer(BaseModelSerializer):
+    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
+    approvedByName = serializers.CharField(source="approved_by.name", read_only=True)
+    entries = TimesheetEntrySerializer(many=True, read_only=True)
+
+    class Meta:
+        model = Timesheet
+        fields = [
+            "id", "timesheet_number", "employeeId", "employeeName", "employeeCode",
+            "week_start", "week_end", "total_hours", "status", "approved_by",
+            "approvedByName", "rejection_reason", "entries", "created_at", "updated_at",
+        ]
+        read_only_fields = ["timesheet_number", "approved_by", "created_at", "updated_at"]
+

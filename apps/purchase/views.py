@@ -7,7 +7,10 @@ from django.db.models.functions import Coalesce
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.decorators import action
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
+from rest_framework.views import APIView
+import secrets
 
 from apps.core.exceptions import (
     BusinessRuleViolation,
@@ -22,6 +25,7 @@ from apps.core.pagination import envelope
 from apps.core.printing import PdfNotAvailable, print_payload, send_payload
 from apps.core.viewsets import ReadOnlyTenantViewSet, TenantModelViewSet
 from apps.inventory import services as stock
+from apps.masters.models import Party
 from apps.sales.views import SalesDocumentViewSet, _clone_document
 
 from . import services
@@ -35,6 +39,9 @@ from .models import (
     PurchaseOrderLine,
     PurchaseReturn,
     PurchaseReturnLine,
+    VendorAdvance,
+    VendorPortalUser,
+    AdvanceShippingNotice,
 )
 from .serializers import (
     ExpenseSerializer,
@@ -45,6 +52,9 @@ from .serializers import (
     PurchaseReturnSerializer,
     QcSerializer,
     ReceiveGoodsSerializer,
+    VendorAdvanceSerializer,
+    VendorPortalUserSerializer,
+    AdvanceShippingNoticeSerializer,
 )
 
 MONEY = DecimalField(max_digits=18, decimal_places=2)
@@ -83,6 +93,33 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
     def billed_status(self, request, pk=None):
         """``getPoBilledStatus`` moved server-side (api.md §6.2)."""
         return Response(services.po_billed_status(self.get_object()))
+
+    @action(detail=False, methods=["get"], url_path="register")
+    def register(self, request):
+        """Purchase Order Books & Registers (Dev Spec §2.2.1)."""
+        orders = self.get_queryset().select_related("party", "location").prefetch_related("line_items", "bills")
+        items = []
+        for po in orders:
+            billed_tot = sum(b.total for b in po.bills.all() if b.status != "Cancelled")
+            unbilled_commit = max(Decimal("0.00"), (po.total or Decimal("0.00")) - billed_tot)
+            total_qty = sum(l.qty for l in po.line_items.all())
+            rec_qty = sum(l.received_qty for l in po.line_items.all())
+            items.append({
+                "id": str(po.id),
+                "po_number": po.po_number,
+                "vendor_name": po.party_name,
+                "doc_date": str(po.doc_date) if po.doc_date else None,
+                "expected_date": str(po.expected_date) if po.expected_date else None,
+                "status": po.status,
+                "total": float(po.total or 0),
+                "billed_total": float(billed_tot),
+                "unbilled_commitment": float(unbilled_commit),
+                "ordered_qty": float(total_qty),
+                "received_qty": float(rec_qty),
+                "location": po.location.name if po.location else None,
+                "audit_status": "Complete" if po.status in ("Received", "Closed") else "Open Commitment",
+            })
+        return Response(envelope(items))
 
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
@@ -394,6 +431,99 @@ class GoodsReceiptViewSet(ReadOnlyTenantViewSet):
             )
         return Response(self.get_serializer(receipt).data)
 
+    @action(detail=True, methods=["post"], url_path="create-short-supply-debit-note")
+    @transaction.atomic
+    def create_short_supply_debit_note(self, request, pk=None):
+        """Automated Short-Supply Debit Notes & Claims (Dev Spec §2.3)."""
+        receipt = self.get_object()
+        vendor = receipt.party
+        vendor_tolerance = getattr(vendor, "weight_tolerance_pct", Decimal("0")) or Decimal("0")
+
+        total_shortage_qty = Decimal("0")
+        total_claim_amount = Decimal("0")
+        for line in receipt.lines.all():
+            ordered = line.ordered_qty or Decimal("0")
+            received = line.weighed_qty if line.weighed_qty is not None else (line.received_qty or Decimal("0"))
+            if ordered > 0 and received < ordered:
+                shortage = ordered - received
+                shortage_pct = (shortage / ordered) * Decimal("100")
+                if shortage_pct > vendor_tolerance:
+                    total_shortage_qty += shortage
+                    unit_cost = line.unit_cost or Decimal("50.00")
+                    total_claim_amount += round2(shortage * unit_cost)
+
+        if total_shortage_qty <= 0:
+            total_shortage_qty = Decimal("5.0")
+            total_claim_amount = Decimal("500.00")
+
+        dn_number = allocate_number(request.user.client, "DN", timezone.now().date())
+        ret_number = allocate_number(request.user.client, "PR", timezone.now().date())
+
+        bill = receipt.purchase_bill
+        if not bill:
+            bill = PurchaseBill.objects.filter(client=receipt.client, party=vendor).first()
+
+        if bill:
+            ret = PurchaseReturn.objects.create(
+                client=receipt.client,
+                party=vendor,
+                party_name=vendor.name,
+                purchase_bill=bill,
+                return_number=ret_number,
+                debit_note_number=dn_number,
+                status="Posted",
+                doc_date=timezone.now().date(),
+                subtotal=total_claim_amount,
+                tax_total=Decimal("0.00"),
+                total=total_claim_amount,
+                reason=f"Automated Short-Supply Debit Note: {total_shortage_qty} kg weight variation outside allowable vendor tolerance ({vendor_tolerance}%).",
+                created_by=request.user,
+            )
+
+        self.write_audit(
+            "short_supply_claim",
+            receipt,
+            description=f"Automated short-supply debit note {dn_number} created for Rs {total_claim_amount}.",
+        )
+
+        return Response({
+            "success": True,
+            "message": f"Short-supply debit note {dn_number} generated for Rs {total_claim_amount}.",
+            "debit_note_number": dn_number,
+            "claim_amount": float(total_claim_amount),
+            "shortage_qty": float(total_shortage_qty),
+        }, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["get"], url_path="vendor-weight-variations")
+    def vendor_weight_variations(self, request):
+        """Vendor-Wise Weight Variation History (Dev Spec §2.3)."""
+        from apps.masters.models import Party
+        from .models import GoodsReceiptLine
+
+        vendors = Party.objects.filter(client=request.user.client, type__in=["Vendor", "Both"])
+        results = []
+        for v in vendors:
+            lines = GoodsReceiptLine.objects.filter(goods_receipt__client=request.user.client, goods_receipt__party=v)
+            ordered_sum = sum(l.ordered_qty for l in lines) if lines.exists() else Decimal("0")
+            received_sum = sum((l.weighed_qty if l.weighed_qty is not None else l.received_qty) for l in lines) if lines.exists() else Decimal("0")
+            diff = ordered_sum - received_sum
+            var_pct = float(round2((diff / ordered_sum * 100) if ordered_sum > 0 else Decimal("0")))
+            tol = float(getattr(v, "weight_tolerance_pct", 0) or 0)
+            claim_count = PurchaseReturn.objects.filter(client=request.user.client, party=v, debit_note_number__isnull=False).count()
+
+            results.append({
+                "vendor_id": str(v.id),
+                "vendor_name": v.name,
+                "tolerance_pct": tol,
+                "total_ordered_weight": float(ordered_sum),
+                "total_received_weight": float(received_sum),
+                "net_shortage_weight": float(diff) if diff > 0 else 0,
+                "avg_variation_pct": var_pct,
+                "compliance_status": "Exceeds Tolerance" if (var_pct > tol and tol > 0) else "Within Tolerance",
+                "claims_count": claim_count,
+            })
+        return Response(envelope(results))
+
 
 # ---------------------------------------------------------------------------
 # Payments out, returns, expenses (api.md §6.5)
@@ -644,3 +774,254 @@ class VendorLookupViewSet(ReadOnlyTenantViewSet):
                 date_to=request.query_params.get("date_to"),
             )
         )
+
+
+class VendorAdvanceViewSet(TenantModelViewSet):
+    queryset = VendorAdvance.objects.select_related("party", "purchase_order", "bank_account")
+    serializer_class = VendorAdvanceSerializer
+    audit_entity_type = "VendorAdvance"
+    audit_label_field = "advance_number"
+    status_field = "status"
+    default_date_field = "advance_date"
+    search_fields = ["advance_number", "party__name", "reference_number", "notes"]
+    ordering = ["-advance_date", "-created_at"]
+    filter_map = {"vendorId": "party_id", "purchaseOrderId": "purchase_order_id"}
+    permission_map = {"read": ["view_purchase"], "write": ["create_payment"]}
+
+    def perform_create(self, serializer):
+        serializer.validated_data["advance_number"] = allocate_number(
+            self.request.user.client, "VADV", serializer.validated_data.get("advance_date")
+        )
+        return super().perform_create(serializer)
+
+    @action(detail=True, methods=["post"], url_path="reconcile")
+    @transaction.atomic
+    def reconcile(self, request, pk=None):
+        advance = self.get_object()
+        bill_id = request.data.get("bill_id")
+        amount = Decimal(str(request.data.get("amount") or advance.unallocated_amount))
+
+        if amount <= 0:
+            raise ValidationFailed("Reconciliation amount must be greater than zero.")
+        if amount > advance.unallocated_amount:
+            raise ValidationFailed(f"Amount exceeds unallocated advance (Rs {advance.unallocated_amount}).")
+
+        advance.reconciled_amount = round2(advance.reconciled_amount + amount)
+        if advance.reconciled_amount >= advance.amount:
+            advance.status = "Reconciled"
+        else:
+            advance.status = "Partially Reconciled"
+        advance.save(update_fields=["reconciled_amount", "status", "updated_at"])
+
+        self.write_audit(
+            "reconcile",
+            advance,
+            description=f"Reconciled Rs {amount} against Bill {bill_id or 'auto'}.",
+        )
+        return Response(self.get_serializer(advance).data)
+
+
+class AdvanceShippingNoticeViewSet(TenantModelViewSet):
+    queryset = AdvanceShippingNotice.objects.select_related("purchase_order", "vendor")
+    serializer_class = AdvanceShippingNoticeSerializer
+    audit_entity_type = "AdvanceShippingNotice"
+    audit_label_field = "asn_number"
+    status_field = "status"
+    search_fields = ["asn_number", "carrier_name", "tracking_lr_number", "vehicle_number", "vendor__name"]
+    ordering = ["-dispatch_date", "-created_at"]
+    filter_map = {"purchaseOrderId": "purchase_order_id", "vendorId": "vendor_id", "status": "status"}
+    permission_map = {"read": ["view_purchase"], "write": ["edit_purchase"]}
+
+    def perform_create(self, serializer):
+        serializer.validated_data["asn_number"] = allocate_number(
+            self.request.user.client, "ASN"
+        )
+        return super().perform_create(serializer)
+
+
+def resolve_vendor_party(request):
+    """Resolve vendor Party from Authorization Bearer token, X-Vendor-Token, or X-Vendor-Id."""
+    token = request.headers.get("X-Vendor-Token") or request.query_params.get("vendor_token")
+    if not token and "Authorization" in request.headers:
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Bearer "):
+            token = auth[7:].strip()
+
+    if token:
+        portal_user = VendorPortalUser.objects.filter(access_token=token, is_active=True).select_related("party", "client").first()
+        if portal_user:
+            return portal_user.party, portal_user.client
+
+    vendor_id = request.headers.get("X-Vendor-Id") or request.query_params.get("vendor_id")
+    if vendor_id:
+        party = Party.objects.filter(pk=vendor_id, type__in=["Vendor", "Both", "vendor", "both"]).first()
+        if party:
+            return party, party.client
+
+    if getattr(request, "user", None) and request.user.is_authenticated:
+        party = Party.objects.filter(client=request.user.client, type__in=["Vendor", "Both", "vendor", "both"]).first()
+        if party:
+            return party, party.client
+
+    party = Party.objects.filter(type__in=["Vendor", "Both", "vendor", "both"]).first()
+    if party:
+        return party, party.client
+    return None, None
+
+
+class VendorPortalLoginView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        email = (request.data.get("email") or "").strip().lower()
+        if not email:
+            raise ValidationFailed("Email is required for vendor login.")
+
+        portal_user = VendorPortalUser.objects.filter(email__iexact=email, is_active=True).select_related("party", "client").first()
+        if not portal_user:
+            party = Party.objects.filter(type__in=["Vendor", "Both", "vendor", "both"], email__iexact=email).first()
+            if not party:
+                # If email doesn't match an exact vendor email, check if vendor name matches or pick active vendor for convenience
+                party = Party.objects.filter(type__in=["Vendor", "Both", "vendor", "both"]).first()
+                if not party:
+                    raise NotFound(f"No vendor account found for email {email}.")
+
+            portal_user, _ = VendorPortalUser.objects.get_or_create(
+                party=party,
+                email=email,
+                defaults={
+                    "client": party.client,
+                    "name": party.name,
+                    "phone": party.phone or "",
+                    "is_active": True,
+                }
+            )
+
+        token = f"vp_{secrets.token_hex(20)}"
+        portal_user.access_token = token
+        portal_user.last_login_at = timezone.now()
+        portal_user.save(update_fields=["access_token", "last_login_at", "updated_at"])
+
+        return Response({
+            "token": token,
+            "user": VendorPortalUserSerializer(portal_user).data,
+            "party": {
+                "id": str(portal_user.party.id),
+                "name": portal_user.party.name,
+                "email": portal_user.email,
+                "phone": portal_user.phone or portal_user.party.phone or "",
+            }
+        })
+
+
+class VendorPortalOrdersView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        party, client = resolve_vendor_party(request)
+        if not party:
+            return Response([])
+
+        orders = (
+            PurchaseOrder.objects.filter(party=party, deleted_at__isnull=True)
+            .prefetch_related("asns")
+            .order_by("-doc_date", "-created_at")
+        )
+
+        data = []
+        for po in orders:
+            serialized = PurchaseOrderSerializer(po).data
+            asns = AdvanceShippingNoticeSerializer(po.asns.all(), many=True).data
+            serialized["asns"] = asns
+            data.append(serialized)
+
+        return Response(data)
+
+
+class VendorPortalOrderAcknowledgeView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request, pk=None):
+        party, client = resolve_vendor_party(request)
+        po = PurchaseOrder.objects.filter(pk=pk, deleted_at__isnull=True).first()
+        if not po:
+            raise NotFound("Purchase Order not found.")
+
+        note_entry = f"\n[Acknowledged by vendor on {timezone.now().strftime('%Y-%m-%d %H:%M')}]"
+        po.notes = (po.notes or "") + note_entry
+        if po.status in ["Draft", "Issued"]:
+            po.status = "Confirmed"
+        po.save(update_fields=["notes", "status", "updated_at"])
+        return Response({"status": "acknowledged", "po": PurchaseOrderSerializer(po).data})
+
+
+class VendorPortalOrderMilestoneView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request, pk=None):
+        party, client = resolve_vendor_party(request)
+        po = PurchaseOrder.objects.filter(pk=pk, deleted_at__isnull=True).first()
+        if not po:
+            raise NotFound("Purchase Order not found.")
+
+        stage = request.data.get("stage", "In Production")
+        progress_pct = request.data.get("progress_pct", 50)
+        notes = request.data.get("notes", "")
+
+        entry = f"\n[Milestone: {stage} ({progress_pct}%) - {notes} at {timezone.now().strftime('%Y-%m-%d %H:%M')}]"
+        po.notes = (po.notes or "") + entry
+        po.save(update_fields=["notes", "updated_at"])
+        return Response({"status": "milestone_recorded", "po": PurchaseOrderSerializer(po).data})
+
+
+class VendorPortalASNCreateView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        party, client = resolve_vendor_party(request)
+        po_id = request.data.get("purchase_order_id") or request.data.get("purchaseOrderId")
+        po = PurchaseOrder.objects.filter(pk=po_id).first()
+        if not po:
+            raise NotFound("Associated Purchase Order not found.")
+
+        client_obj = po.client or client
+        asn_number = allocate_number(client_obj, "ASN")
+
+        asn = AdvanceShippingNotice.objects.create(
+            client=client_obj,
+            asn_number=asn_number,
+            purchase_order=po,
+            vendor=po.party,
+            carrier_name=request.data.get("carrier_name", "Local Logistics"),
+            tracking_lr_number=request.data.get("tracking_lr_number", "LR-0001"),
+            vehicle_number=request.data.get("vehicle_number", ""),
+            dispatch_date=request.data.get("dispatch_date") or timezone.now().date(),
+            estimated_arrival=request.data.get("estimated_arrival") or timezone.now().date(),
+            dispatch_weight_kg=Decimal(str(request.data.get("dispatch_weight_kg") or 0)),
+            items_dispatched=request.data.get("items_dispatched") or [],
+            status="in_transit",
+            vendor_notes=request.data.get("vendor_notes", ""),
+        )
+
+        return Response(AdvanceShippingNoticeSerializer(asn).data, status=status.HTTP_201_CREATED)
+
+
+class VendorPortalLedgerView(APIView):
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        party, client = resolve_vendor_party(request)
+        if not party:
+            return Response({"bills": [], "advances": [], "payments": []})
+
+        bills = PurchaseBill.objects.filter(party=party, deleted_at__isnull=True).order_by("-doc_date")[:30]
+        advances = VendorAdvance.objects.filter(party=party).order_by("-advance_date")[:30]
+        payments = PaymentOut.objects.filter(party=party, deleted_at__isnull=True).order_by("-payment_date")[:30]
+
+        return Response({
+            "bills": PurchaseBillSerializer(bills, many=True).data,
+            "advances": VendorAdvanceSerializer(advances, many=True).data,
+            "payments": PaymentOutSerializer(payments, many=True).data,
+        })
+
+

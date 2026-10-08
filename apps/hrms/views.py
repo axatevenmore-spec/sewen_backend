@@ -70,12 +70,21 @@ from .models import (
     SalaryAdvance,
     SalaryStructure,
     ScreeningQuestion,
+    ScreeningAnswer,
     Team,
     Termination,
     Trainer,
     Training,
     TrainingParticipant,
     WorkingDay,
+    EmployeeTransfer,
+    EmployeePromotion,
+    EmployeeWarning,
+    EmployeeAward,
+    TravelRequest,
+    Announcement,
+    MeetingRoom,
+    CompanyMeeting,
 )
 from .serializers import (
     AppraisalCycleSerializer,
@@ -119,13 +128,22 @@ from .serializers import (
     ResignationSerializer,
     SalaryAdvanceSerializer,
     SalaryStructureSerializer,
-    # ScreeningQuestionSerializer,  # Hidden: out of scope
+    ScreeningQuestionSerializer,
+    ScreeningAnswerSerializer,
     TeamSerializer,
     TerminationSerializer,
     TrainerSerializer,
     TrainingParticipantSerializer,
     TrainingSerializer,
     WorkingDaySerializer,
+    EmployeeTransferSerializer,
+    EmployeePromotionSerializer,
+    EmployeeWarningSerializer,
+    EmployeeAwardSerializer,
+    TravelRequestSerializer,
+    AnnouncementSerializer,
+    MeetingRoomSerializer,
+    CompanyMeetingSerializer,
 )
 
 
@@ -134,6 +152,53 @@ from .serializers import (
 #: locked HR Manager -- who approves but does not apply -- out of the queue.
 LEAVE_READERS = ("apply_leave", "approve_leave")
 PAY_READERS = ("view_own_payslip", "generate_payroll", "approve_payroll")
+#: Company-wide pay -- every payslip, the salary templates. HR admin, super
+#: admin and any executive role granted one of these.
+PAY_MANAGERS = ("generate_payroll", "approve_payroll", "edit_salary_structure")
+
+def _as_date(value):
+    """``YYYY-MM-DD`` (or a date) to a date; anything else to None."""
+    if not value:
+        return None
+    if hasattr(value, "year"):
+        return value
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _as_moment(value, day):
+    """An ISO datetime, or ``HH:MM`` on ``day``, as an aware datetime."""
+    if not value:
+        return None
+    from django.utils.dateparse import parse_datetime
+
+    text = str(value).strip()
+    moment = parse_datetime(text) if "T" in text or " " in text else None
+    if moment is None:
+        try:
+            moment = datetime.combine(day, datetime.strptime(text[:5], "%H:%M").time())
+        except ValueError:
+            raise ValidationFailed(
+                f"'{text}' is not a time.", field_errors={"checkIn": ["Use HH:MM."]}
+            )
+    return timezone.make_aware(moment) if timezone.is_naive(moment) else moment
+
+
+def reporting_chain_ids(client_id, manager_id):
+    """Ids of every employee below ``manager_id`` (direct and indirect reports)."""
+    found, frontier = set(), {manager_id}
+    while frontier:
+        below = set(
+            Employee.objects.filter(
+                client_id=client_id, manager_id__in=frontier, deleted_at__isnull=True
+            ).values_list("id", flat=True)
+        ) - found - {manager_id}
+        found |= below
+        frontier = below
+    return found
+
 
 class OwnEmployeeScopeMixin:
     """Record-level scope for self-service HR data.
@@ -146,6 +211,13 @@ class OwnEmployeeScopeMixin:
     """
 
     team_scope_permissions = ()
+    #: When True, a reporting manager without the team permission may also
+    #: *read* the rows of everyone below them in the reporting chain. Writes
+    #: stay limited to their own rows.
+    manager_read_scope = False
+    #: A field naming an employee who may also *read* the row -- the colleague
+    #: a leave hands work over to sees it in "Assigned to me".
+    delegate_read_field = None
 
     def has_team_scope(self):
         return has_permission(self.request.user, tuple(self.team_scope_permissions))
@@ -155,7 +227,17 @@ class OwnEmployeeScopeMixin:
         if self.has_team_scope():
             return queryset
         employee_id = getattr(self.request.user, "employee_id", None)
-        return queryset.filter(employee_id=employee_id) if employee_id else queryset.none()
+        if not employee_id:
+            return queryset.none()
+        if self.request.method not in ("GET", "HEAD", "OPTIONS"):
+            return queryset.filter(employee_id=employee_id)
+        visible = [employee_id]
+        if self.manager_read_scope:
+            visible += reporting_chain_ids(self.request.client_id, employee_id)
+        scope = Q(employee_id__in=visible)
+        if self.delegate_read_field:
+            scope |= Q(**{self.delegate_read_field: employee_id})
+        return queryset.filter(scope)
 
     def check_own_employee(self, employee):
         if self.has_team_scope():
@@ -232,7 +314,58 @@ class EmployeeViewSet(TenantModelViewSet):
         "managerId": "manager_id",
         "employmentType": "employment_type",
     }
-    permission_map = {"read": ["view_staff"], "write": ["edit_staff"], "create": ["create_staff"]}
+    permission_map = {
+        "read": ["view_staff"],
+        "write": ["edit_staff"],
+        "create": ["create_staff"],
+        # Anyone who applies for leave picks a colleague to hand work over to.
+        "colleagues": [LEAVE_READERS],
+        # Every signed-in employee may read their own record.
+        "me": [],
+    }
+
+    @action(detail=False, methods=["get"])
+    def me(self, request):
+        """``GET /hrms/employees/me/`` -- the caller's own employee record.
+
+        Self-service: no permission beyond being signed in, and only ever the
+        record linked to this login, so it cannot be pointed at anyone else.
+        """
+        employee_id = getattr(request.user, "employee_id", None)
+        employee = (
+            self.get_queryset().filter(pk=employee_id).first()
+            if employee_id else None
+        )
+        if employee is None:
+            raise NotFound(
+                "Your login is not linked to an employee record. Ask HR to link it.",
+                code="NO_EMPLOYEE",
+            )
+        return Response(self.get_serializer(employee).data)
+
+    @action(detail=False, methods=["get"])
+    def colleagues(self, request):
+        """``GET /hrms/employees/colleagues/`` -- names only, for the delegate picker.
+
+        Self-service cannot read the staff directory (`view_staff`), so this
+        hands out just enough to choose who covers your work: no contact,
+        pay or personal fields.
+        """
+        rows = (
+            Employee.objects.filter(client_id=request.client_id, deleted_at__isnull=True)
+            .exclude(status__in=["Resigned", "Terminated"])
+            .select_related("department", "designation")
+            .order_by("name")
+        )
+        return Response(envelope([
+            {
+                "id": str(e.id),
+                "name": e.name,
+                "department": e.department.name if e.department_id else "",
+                "designation": e.designation.name if e.designation_id else "",
+            }
+            for e in rows
+        ]))
 
     def get_aggregates(self, queryset):
         return queryset.aggregate(
@@ -572,18 +705,30 @@ class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
         "date": "work_date",
     }
     permission_map = {
-        "read": ["view_team_attendance"],
-        "write": ["mark_attendance"],
+        # Everyone who marks attendance reads their own rows (the mixin scopes
+        # them); `view_team_attendance` reads the whole register.
+        "read": [("view_team_attendance", "mark_attendance")],
+        # Editing the register by hand is HR's. An employee's own attendance
+        # comes from Punch In / Punch Out, and corrections go through
+        # regularization.
+        "write": ["mark_attendance", "view_team_attendance"],
         # Marking a whole day for many people is a team action.
         "bulk": ["mark_attendance", "view_team_attendance"],
+        # Tenant-wide figures and the edit trail.
+        "summary": ["view_team_attendance"],
+        "audit": ["view_team_attendance"],
         "today": [],
         "punch": [],
         "correct_punch": ["regularize_attendance", "mark_attendance"],
         "punches": [],
         "punch_timeline": [],
     }
-    # Without it, `mark_attendance` covers the caller's own row only.
     team_scope_permissions = ("view_team_attendance",)
+
+    def _own_or_team(self, employee):
+        """Someone else's attendance needs the team permission."""
+        if employee is not None and not self.has_team_scope():
+            self.check_own_employee(employee)
 
     def get_aggregates(self, queryset):
         return queryset.aggregate(
@@ -664,12 +809,13 @@ class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
                 ).first()
             if employee is None:
                 continue
+            day = _as_date(record.get("date")) or work_date
             services.mark_attendance(
                 client=request.user.client,
                 employee=employee,
-                work_date=record.get("date") or work_date,
-                check_in=record.get("checkIn"),
-                check_out=record.get("checkOut"),
+                work_date=day,
+                check_in=_as_moment(record.get("checkIn"), day),
+                check_out=_as_moment(record.get("checkOut"), day),
                 status=record.get("status"),
                 remark=record.get("remark"),
                 source="bulk",
@@ -699,6 +845,13 @@ class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
 
     @action(detail=False, methods=["get"], url_path=r"individual/(?P<employee_id>[^/.]+)")
     def individual(self, request, employee_id=None):
+        if not self.has_team_scope():
+            target = self._resolve_employee(request, employee_id) if employee_id else None
+            if target is None:
+                raise PermissionDenied(
+                    "You can only view your own attendance.", code="view_team_attendance"
+                )
+            self.check_own_employee(target)
         rows = Attendance.objects.filter(
             client_id=request.client_id, employee_id=employee_id, deleted_at__isnull=True
         ).order_by("work_date")
@@ -770,6 +923,8 @@ class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
         """``GET /hrms/attendance/today/`` -- punch state for current employee today."""
         employee_id = request.query_params.get("employeeId")
         employee = self._resolve_employee(request, employee_id)
+        if employee_id:
+            self._own_or_team(employee)
         if not employee:
             return Response({
                 "has_employee": False,
@@ -902,6 +1057,8 @@ class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
         employee_id = request.query_params.get("employeeId")
         date_str = request.query_params.get("date") or request.query_params.get("work_date")
         employee = self._resolve_employee(request, employee_id)
+        if employee_id:
+            self._own_or_team(employee)
         if not employee:
             return Response([])
 
@@ -1019,6 +1176,8 @@ class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
     search_fields = ["employee__name", "reason"]
     filter_map = {"employeeId": "employee_id", "type": "leave_type__name", "leaveTypeId": "leave_type_id"}
     team_scope_permissions = ("approve_leave",)
+    manager_read_scope = True
+    delegate_read_field = "delegate_employee_id"
     permission_map = {"read": [LEAVE_READERS], "create": ["apply_leave"], "write": ["approve_leave"]}
 
     def get_aggregates(self, queryset):
@@ -1084,6 +1243,73 @@ class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
         row.save(update_fields=["delegate_confirmed_at", "status", "updated_at"])
         return Response(self.get_serializer(row).data)
 
+    @action(detail=False, methods=["post"], url_path="calculate-days")
+    def calculate_days(self, request):
+        """Calculates days preview with sandwich-leave detection (Spec §2.5.2)."""
+        import datetime
+        from datetime import timedelta
+        from .models import Holiday, LeaveType
+
+        from_date_str = request.data.get("fromDate") or request.data.get("from_date")
+        to_date_str = request.data.get("toDate") or request.data.get("to_date")
+        leave_type_id = request.data.get("leaveTypeId") or request.data.get("leave_type_id")
+
+        if not from_date_str or not to_date_str:
+            return Response({"error": "fromDate and toDate are required"}, status=400)
+
+        start = datetime.date.fromisoformat(str(from_date_str)[:10])
+        end = datetime.date.fromisoformat(str(to_date_str)[:10])
+        if end < start:
+            return Response({"error": "toDate must be on or after fromDate"}, status=400)
+
+        leave_type = LeaveType.objects.filter(id=leave_type_id, client_id=request.client_id).first() if leave_type_id else None
+        enforce_sandwich = bool(leave_type and leave_type.enforce_sandwich_rule)
+
+        holidays = set(Holiday.objects.filter(
+            client_id=request.client_id,
+            date__gte=start,
+            date__lte=end
+        ).values_list("date", flat=True))
+
+        total_calendar_days = (end - start).days + 1
+        day_breakdown = []
+        working_days = 0
+        sandwich_days = 0
+
+        curr = start
+        while curr <= end:
+            is_weekend = curr.weekday() in (5, 6)
+            is_holiday = curr in holidays
+            is_off = is_weekend or is_holiday
+            if not is_off:
+                working_days += 1
+                counted = True
+            else:
+                counted = enforce_sandwich
+                if enforce_sandwich:
+                    sandwich_days += 1
+
+            day_breakdown.append({
+                "date": curr.isoformat(),
+                "day_of_week": curr.strftime("%A"),
+                "is_weekend": is_weekend,
+                "is_holiday": is_holiday,
+                "is_counted": counted
+            })
+            curr += timedelta(days=1)
+
+        counted_days = total_calendar_days if enforce_sandwich else working_days
+
+        return Response({
+            "enforce_sandwich_rule": enforce_sandwich,
+            "total_calendar_days": total_calendar_days,
+            "working_days": working_days,
+            "sandwich_penalty_days": sandwich_days if enforce_sandwich else 0,
+            "chargeable_days": counted_days,
+            "day_breakdown": day_breakdown
+        })
+
+
 
 class LeaveBalanceViewSet(OwnEmployeeScopeMixin, ReadOnlyTenantViewSet):
     queryset = LeaveBalance.objects.select_related("employee", "leave_type")
@@ -1092,6 +1318,7 @@ class LeaveBalanceViewSet(OwnEmployeeScopeMixin, ReadOnlyTenantViewSet):
     filter_map = {"employeeId": "employee_id", "leaveTypeId": "leave_type_id", "year": "period_year"}
     ordering = ["employee__name"]
     team_scope_permissions = ("approve_leave",)
+    manager_read_scope = True
     permission_map = {"read": [LEAVE_READERS]}
 
 
@@ -1104,6 +1331,7 @@ class CompOffViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
     ordering = ["-worked_date"]
     filter_map = {"employeeId": "employee_id", "used": "used"}
     team_scope_permissions = ("approve_leave",)
+    manager_read_scope = True
     permission_map = {"read": [LEAVE_READERS], "write": ["approve_leave"]}
 
 
@@ -1115,6 +1343,7 @@ class LeaveEncashmentViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
     ordering = ["-created_at"]
     filter_map = {"employeeId": "employee_id"}
     team_scope_permissions = ("approve_leave",)
+    manager_read_scope = True
     permission_map = {"read": [LEAVE_READERS], "write": ["approve_leave"]}
 
 
@@ -1256,7 +1485,8 @@ class SalaryStructureViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = None
     ordering = ["name"]
-    permission_map = {"read": [PAY_READERS], "write": ["edit_salary_structure"]}
+    # The pay templates are company data, not the employee's own slip.
+    permission_map = {"read": [PAY_MANAGERS], "write": ["edit_salary_structure"]}
 
 
 class SalaryAdvanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
@@ -1346,6 +1576,31 @@ class InterviewViewSet(TenantModelViewSet):
     ordering = ["scheduled_at"]
     filter_map = {"applicationId": "application_id"}
     permission_map = {"read": ["view_staff"], "write": ["create_staff"]}
+
+    @action(detail=True, methods=["post"], url_path="generate-zoom-meeting")
+    def generate_zoom_meeting(self, request, pk=None):
+        """Generates or attaches a Zoom meeting link to the interview (Spec §2.5.5)."""
+        import random
+        interview = self.get_object()
+        meeting_id = f"{random.randint(100, 999)} {random.randint(1000, 9999)} {random.randint(1000, 9999)}"
+        passcode = "".join(random.choices("0123456789abcdef", k=6))
+        zoom_link = f"https://zoom.us/j/{meeting_id.replace(' ', '')}?pwd={passcode}"
+
+        interview.location = zoom_link
+        note_text = f"Zoom Meeting ID: {meeting_id} | Passcode: {passcode} | Link: {zoom_link}"
+        if interview.notes:
+            interview.notes = f"{interview.notes}\n{note_text}"
+        else:
+            interview.notes = note_text
+        interview.save(update_fields=["location", "notes", "updated_at"])
+
+        return Response({
+            "zoom_link": zoom_link,
+            "meeting_id": meeting_id,
+            "passcode": passcode,
+            "interview": self.get_serializer(interview).data
+        })
+
 
 
 class OfferViewSet(TenantModelViewSet):
@@ -2265,3 +2520,211 @@ class HrmsSettingsView(APIView):
             defaults={"value": request.data, "updated_by": request.user},
         )
         return Response(row.value)
+
+
+# ---------------------------------------------------------------------------
+# Upgradation Scope: Transfers, Promotions, Warnings, Awards, Travel, Announcements
+# ---------------------------------------------------------------------------
+class EmployeeTransferViewSet(TenantModelViewSet):
+    queryset = EmployeeTransfer.objects.select_related("employee", "from_department", "to_department", "from_location", "to_location")
+    serializer_class = EmployeeTransferSerializer
+    audit_entity_type = "EmployeeTransfer"
+    audit_label_field = "transfer_number"
+    status_field = "status"
+    search_fields = ["transfer_number", "employee__name", "reason"]
+    ordering = ["-effective_date", "-created_at"]
+    filter_map = {"employeeId": "employee_id", "status": "status"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def perform_create(self, serializer):
+        serializer.validated_data["transfer_number"] = allocate_number(self.request.user.client, "TRF")
+        return super().perform_create(serializer)
+
+
+class EmployeePromotionViewSet(TenantModelViewSet):
+    queryset = EmployeePromotion.objects.select_related("employee", "from_designation", "to_designation")
+    serializer_class = EmployeePromotionSerializer
+    audit_entity_type = "EmployeePromotion"
+    audit_label_field = "promotion_number"
+    status_field = "status"
+    search_fields = ["promotion_number", "employee__name", "justification"]
+    ordering = ["-effective_date", "-created_at"]
+    filter_map = {"employeeId": "employee_id", "status": "status"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def perform_create(self, serializer):
+        serializer.validated_data["promotion_number"] = allocate_number(self.request.user.client, "PRM")
+        return super().perform_create(serializer)
+
+
+class EmployeeWarningViewSet(TenantModelViewSet):
+    queryset = EmployeeWarning.objects.select_related("employee")
+    serializer_class = EmployeeWarningSerializer
+    audit_entity_type = "EmployeeWarning"
+    audit_label_field = "warning_number"
+    status_field = "status"
+    search_fields = ["warning_number", "employee__name", "subject", "description"]
+    ordering = ["-issue_date", "-created_at"]
+    filter_map = {"employeeId": "employee_id", "status": "status", "severity": "severity"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def perform_create(self, serializer):
+        serializer.validated_data["warning_number"] = allocate_number(self.request.user.client, "WRN")
+        return super().perform_create(serializer)
+
+
+class EmployeeAwardViewSet(TenantModelViewSet):
+    queryset = EmployeeAward.objects.select_related("employee")
+    serializer_class = EmployeeAwardSerializer
+    audit_entity_type = "EmployeeAward"
+    audit_label_field = "award_number"
+    status_field = None
+    search_fields = ["award_number", "employee__name", "award_name", "category"]
+    ordering = ["-award_date", "-created_at"]
+    filter_map = {"employeeId": "employee_id", "category": "category"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def perform_create(self, serializer):
+        serializer.validated_data["award_number"] = allocate_number(self.request.user.client, "AWD")
+        return super().perform_create(serializer)
+
+
+class TravelRequestViewSet(TenantModelViewSet):
+    queryset = TravelRequest.objects.select_related("employee")
+    serializer_class = TravelRequestSerializer
+    audit_entity_type = "TravelRequest"
+    audit_label_field = "travel_number"
+    status_field = "status"
+    search_fields = ["travel_number", "employee__name", "destination", "purpose"]
+    ordering = ["-start_date", "-created_at"]
+    filter_map = {"employeeId": "employee_id", "status": "status"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def perform_create(self, serializer):
+        serializer.validated_data["travel_number"] = allocate_number(self.request.user.client, "TRV")
+        return super().perform_create(serializer)
+
+
+class AnnouncementViewSet(TenantModelViewSet):
+    queryset = Announcement.objects.select_related("target_department")
+    serializer_class = AnnouncementSerializer
+    audit_entity_type = "Announcement"
+    audit_label_field = "title"
+    status_field = None
+    search_fields = ["title", "content", "author_name"]
+    ordering = ["-is_pinned", "-publish_date", "-created_at"]
+    filter_map = {"targetDepartmentId": "target_department_id", "priority": "priority"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+
+class ScreeningQuestionViewSet(TenantModelViewSet):
+    queryset = ScreeningQuestion.objects.select_related("job")
+    serializer_class = ScreeningQuestionSerializer
+    audit_entity_type = "ScreeningQuestion"
+    status_field = None
+    ordering = ["sort_order", "created_at"]
+    filter_map = {"jobId": "job_id", "isActive": "is_active"}
+    permission_map = {"read": ["view_staff"], "write": ["create_staff"]}
+
+
+class ScreeningAnswerViewSet(TenantModelViewSet):
+    queryset = ScreeningAnswer.objects.select_related("application", "question")
+    serializer_class = ScreeningAnswerSerializer
+    audit_entity_type = "ScreeningAnswer"
+    status_field = None
+    ordering = ["created_at"]
+    filter_map = {"applicationId": "application_id", "questionId": "question_id"}
+    permission_map = {"read": ["view_staff"], "write": ["create_staff"]}
+
+
+class MeetingRoomViewSet(TenantModelViewSet):
+    queryset = MeetingRoom.objects.all()
+    serializer_class = MeetingRoomSerializer
+    audit_entity_type = "MeetingRoom"
+    audit_label_field = "name"
+    status_field = None
+    search_fields = ["name", "code", "location"]
+    ordering = ["name"]
+    filter_map = {"isActive": "is_active"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+
+class CompanyMeetingViewSet(TenantModelViewSet):
+    queryset = CompanyMeeting.objects.select_related("room", "host_user").prefetch_related("attendees")
+    serializer_class = CompanyMeetingSerializer
+    audit_entity_type = "CompanyMeeting"
+    audit_label_field = "title"
+    status_field = "status"
+    search_fields = ["title", "agenda", "description"]
+    ordering = ["start_time"]
+    filter_map = {"roomId": "room_id", "status": "status", "hostUserId": "host_user_id"}
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def perform_create(self, serializer):
+        data = serializer.validated_data
+        room = data.get("room")
+        start_time = data.get("start_time")
+        end_time = data.get("end_time")
+
+        if room and start_time and end_time:
+            conflicts = CompanyMeeting.objects.filter(
+                client=self.request.user.client,
+                room=room,
+                status__in=["scheduled", "in_progress"],
+                start_time__lt=end_time,
+                end_time__gt=start_time,
+            )
+            if conflicts.exists():
+                raise ValidationFailed("Selected conference room is already booked for this time slot.")
+
+        if not data.get("host_user"):
+            serializer.validated_data["host_user"] = self.request.user
+
+        video_provider = data.get("video_provider")
+        join_url = data.get("join_url")
+        if not join_url and video_provider in ["zoom", "google_meet"]:
+            import uuid
+            code = uuid.uuid4().hex[:10]
+            if video_provider == "google_meet":
+                serializer.validated_data["join_url"] = f"https://meet.google.com/{code[:3]}-{code[3:7]}-{code[7:10]}"
+            else:
+                serializer.validated_data["join_url"] = f"https://zoom.us/j/{uuid.uuid4().int % 10000000000}"
+
+        return super().perform_create(serializer)
+
+    def perform_update(self, serializer):
+        data = serializer.validated_data
+        instance = serializer.instance
+        room = data.get("room", instance.room)
+        start_time = data.get("start_time", instance.start_time)
+        end_time = data.get("end_time", instance.end_time)
+
+        if room and start_time and end_time:
+            conflicts = CompanyMeeting.objects.filter(
+                client=self.request.user.client,
+                room=room,
+                status__in=["scheduled", "in_progress"],
+                start_time__lt=end_time,
+                end_time__gt=start_time,
+            ).exclude(pk=instance.pk)
+            if conflicts.exists():
+                raise ValidationFailed("Selected conference room is already booked for this time slot.")
+
+        return super().perform_update(serializer)
+
+    @action(detail=True, methods=["post"], url_path="mom")
+    def save_mom(self, request, pk=None):
+        meeting = self.get_object()
+        mom_text = request.data.get("minutes_of_meeting", "")
+        action_items = request.data.get("action_items", [])
+        status_val = request.data.get("status") or "completed"
+
+        meeting.minutes_of_meeting = mom_text
+        meeting.action_items = action_items
+        meeting.status = status_val
+        meeting.save(update_fields=["minutes_of_meeting", "action_items", "status", "updated_at"])
+
+        self.write_audit("save_mom", meeting, description=f"Updated MoM and action items for meeting {meeting.title}.")
+        return Response(self.get_serializer(meeting).data)
+
+

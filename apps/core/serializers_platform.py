@@ -2,7 +2,17 @@
 from rest_framework import serializers
 
 from .files import public_url
-from .models import AuditLog, ExportJob, File, Notification, Setting, SupportTicket
+from .models import (
+    AuditLog,
+    CustomFieldDefinition,
+    ExportJob,
+    File,
+    Notification,
+    Setting,
+    SupportTicket,
+    WebhookDelivery,
+    WebhookEndpoint,
+)
 from .serializers import BaseModelSerializer, BaseSerializer
 
 
@@ -91,3 +101,37 @@ class ExportJobSerializer(BaseModelSerializer):
 
     def get_downloadUrl(self, job):
         return public_url(job.file, self.context.get("request")) if job.file_id else None
+
+
+class CustomFieldDefinitionSerializer(BaseModelSerializer):
+    class Meta:
+        model = CustomFieldDefinition
+        fields = [
+            "id", "entity_type", "field_name", "field_label", "field_type",
+            "options", "is_required", "default_value", "sort_order",
+            "is_active", "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+
+
+class WebhookDeliverySerializer(BaseModelSerializer):
+    class Meta:
+        model = WebhookDelivery
+        fields = [
+            "id", "event_name", "payload", "response_status", "response_body",
+            "status", "error", "attempted_at",
+        ]
+        read_only_fields = ["attempted_at"]
+
+
+class WebhookEndpointSerializer(BaseModelSerializer):
+    deliveries = WebhookDeliverySerializer(many=True, read_only=True)
+
+    class Meta:
+        model = WebhookEndpoint
+        fields = [
+            "id", "name", "target_url", "secret_key", "events", "is_active",
+            "description", "deliveries", "created_at", "updated_at",
+        ]
+        read_only_fields = ["created_at", "updated_at"]
+

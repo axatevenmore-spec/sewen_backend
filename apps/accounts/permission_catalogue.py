@@ -364,7 +364,7 @@ DEFAULT_ROLES = [
         "EM",
         "Employee",
         "Self-service access only.",
-        ["apply_leave", "view_own_payslip", "mark_attendance", "view_task"],
+        ["apply_leave", "view_own_payslip", "mark_attendance", "view_pms"],
     ),
     (
         "CU",

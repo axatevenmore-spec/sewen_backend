@@ -10,8 +10,12 @@ from apps.core.serializers import (
 from apps.masters.models import Item, Location
 
 from .models import (
+    DemoUnit,
     FaultyPart,
-    QualityStandard,
+    # QualityInspection,  # Hidden: QC out of scope
+    # QualityStandard,  # Hidden: QC out of scope
+    ReworkOrder,
+    ScrapLog,
     ServiceUsage,
     StockAudit,
     StockAuditLine,
@@ -282,20 +286,22 @@ class StockAuditSerializer(BaseModelSerializer):
         read_only_fields = ["audit_number", "posted_at", "created_at", "updated_at"]
 
 
-class QualityStandardSerializer(BaseModelSerializer):
-    category = serializers.CharField(source="category.name", read_only=True)
-    categoryId = TenantPrimaryKeyRelatedField(
-        source="category", model="masters.ItemCategory", required=False, allow_null=True
-    )
-    checks = serializers.JSONField(source="checklist", required=False)
-    active = serializers.BooleanField(source="is_active", required=False)
+# Hidden: QC out of scope
+# class QualityStandardSerializer(BaseModelSerializer):
+#     category = serializers.CharField(source="category.name", read_only=True)
+#     categoryId = TenantPrimaryKeyRelatedField(
+#         source="category", model="masters.ItemCategory", required=False, allow_null=True
+#     )
+#     checks = serializers.JSONField(source="checklist", required=False)
+#     active = serializers.BooleanField(source="is_active", required=False)
+#
+#     class Meta:
+#         model = QualityStandard
+#         fields = [
+#             "id", "name", "category", "categoryId", "checks", "tolerance_pct",
+#             "active", "created_at", "updated_at",
+#         ]
 
-    class Meta:
-        model = QualityStandard
-        fields = [
-            "id", "name", "category", "categoryId", "checks", "tolerance_pct",
-            "active", "created_at", "updated_at",
-        ]
 
 
 
@@ -311,3 +317,89 @@ class ValuationRowSerializer(BaseSerializer):
     )
     value = serializers.DecimalField(max_digits=18, decimal_places=2, coerce_to_string=False)
     ageingBucket = serializers.CharField(allow_null=True)
+
+
+class DemoUnitSerializer(BaseModelSerializer):
+    itemId = TenantPrimaryKeyRelatedField(source="item", model="masters.Item")
+    itemName = serializers.CharField(source="item.name", read_only=True)
+    itemSku = serializers.CharField(source="item.sku", read_only=True)
+    serialNumber = serializers.CharField(source="serial.serial_number", read_only=True, allow_null=True)
+    serialId = TenantPrimaryKeyRelatedField(source="serial", model="masters.ItemSerial", required=False, allow_null=True)
+    prospectPartyId = TenantPrimaryKeyRelatedField(source="prospect_party", model="masters.Party", required=False, allow_null=True)
+
+    class Meta:
+        model = DemoUnit
+        fields = [
+            "id", "demo_number", "itemId", "itemName", "itemSku", "serialId", "serialNumber",
+            "prospect_name", "prospectPartyId", "contact_phone", "contact_email",
+            "dispatch_date", "expected_return_date", "actual_return_date",
+            "status", "inspection_notes", "condition_on_return", "sale_invoice_ref",
+            "notes", "created_at", "updated_at",
+        ]
+        read_only_fields = ["demo_number", "created_at", "updated_at"]
+
+
+class ReworkOrderSerializer(BaseModelSerializer):
+    itemId = TenantPrimaryKeyRelatedField(source="item", model="masters.Item")
+    itemName = serializers.CharField(source="item.name", read_only=True)
+    itemSku = serializers.CharField(source="item.sku", read_only=True)
+    goodsReceiptId = TenantPrimaryKeyRelatedField(source="goods_receipt", model="purchase.GoodsReceipt", required=False, allow_null=True)
+    grnNumber = serializers.CharField(source="goods_receipt.grn_number", read_only=True, allow_null=True)
+
+    class Meta:
+        model = ReworkOrder
+        fields = [
+            "id", "rework_number", "itemId", "itemName", "itemSku", "goodsReceiptId", "grnNumber",
+            "quantity", "defect_reason", "root_cause", "rework_labor_hours", "rework_cost",
+            "scrap_qty", "scrap_rate_pct", "status", "assigned_technician", "notes",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["rework_number", "created_at", "updated_at"]
+
+
+class ScrapLogSerializer(BaseModelSerializer):
+    itemId = TenantPrimaryKeyRelatedField(source="item", model="masters.Item")
+    itemName = serializers.CharField(source="item.name", read_only=True)
+    reworkOrderId = TenantPrimaryKeyRelatedField(source="rework_order", model="inventory.ReworkOrder", required=False, allow_null=True)
+    reworkNumber = serializers.CharField(source="rework_order.rework_number", read_only=True, allow_null=True)
+
+    class Meta:
+        model = ScrapLog
+        fields = [
+            "id", "scrap_number", "itemId", "itemName", "quantity", "scrap_reason",
+            "estimated_loss", "reworkOrderId", "reworkNumber", "logged_at",
+        ]
+        read_only_fields = ["scrap_number", "logged_at"]
+
+
+# Hidden: QC out of scope
+# class QualityInspectionSerializer(BaseModelSerializer):
+#     goodsReceiptId = TenantPrimaryKeyRelatedField(
+#         source="goods_receipt", model="purchase.GoodsReceipt", required=False, allow_null=True
+#     )
+#     grnNumber = serializers.CharField(source="goods_receipt.grn_number", read_only=True, allow_null=True)
+#     itemId = TenantPrimaryKeyRelatedField(source="item", model="masters.Item")
+#     itemName = serializers.CharField(source="item.name", read_only=True)
+#     itemSku = serializers.CharField(source="item.sku", read_only=True)
+#     inspectorId = TenantPrimaryKeyRelatedField(
+#         source="inspector", model="accounts.User", required=False, allow_null=True
+#     )
+#     inspectorName = serializers.CharField(source="inspector.get_full_name", read_only=True)
+#     reworkOrderId = TenantPrimaryKeyRelatedField(
+#         source="rework_order", model="inventory.ReworkOrder", required=False, allow_null=True
+#     )
+#     reworkNumber = serializers.CharField(source="rework_order.rework_number", read_only=True, allow_null=True)
+#
+#     class Meta:
+#         model = QualityInspection
+#         fields = [
+#             "id", "inspection_number", "goodsReceiptId", "grnNumber",
+#             "itemId", "itemName", "itemSku", "batch_lot_number",
+#             "sample_size", "received_qty", "accepted_qty", "rejected_qty",
+#             "status", "checklist_results", "inspectorId", "inspectorName",
+#             "inspector_notes", "inspected_at", "reworkOrderId", "reworkNumber",
+#             "created_at", "updated_at",
+#         ]
+#         read_only_fields = ["inspection_number", "created_at", "updated_at"]
+
+

@@ -283,6 +283,186 @@ class EstimateViewSet(ApprovalLinkActions, SalesDocumentViewSet):
             status=status.HTTP_201_CREATED,
         )
 
+    @action(detail=True, methods=["post"], url_path="convert-to-challan")
+    @transaction.atomic
+    def convert_to_challan(self, request, pk=None):
+        estimate = self.get_object()
+        if estimate.status == "Converted":
+            raise Conflict(
+                "This estimate has already been converted.", code=Codes.ALREADY_DONE
+            )
+
+        challan = _clone_document(
+            estimate,
+            DeliveryChallan,
+            {"status": "Draft"},
+            number_field="challan_number",
+            series="DC",
+            line_model_name="DeliveryChallanLine",
+            line_fk="delivery_challan",
+        )
+
+        estimate.status = "Converted"
+        estimate.converted_challan = challan
+        estimate.save(update_fields=["status", "converted_challan", "updated_at"])
+        self.write_audit(
+            "convert", estimate, description=f"Converted to Delivery Challan {challan.challan_number}"
+        )
+        return Response(
+            DeliveryChallanSerializer(challan, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=False, methods=["post"], url_path="import-excel")
+    @transaction.atomic
+    def import_excel(self, request):
+        import csv
+        import io
+        from datetime import date
+        from apps.masters.models import Party, Item
+
+        client = request.user.client
+        rows_data = []
+
+        if "file" in request.FILES:
+            uploaded = request.FILES["file"]
+            fname = uploaded.name.lower()
+            if fname.endswith(".csv"):
+                content = uploaded.read().decode("utf-8-sig", errors="ignore")
+                reader = csv.DictReader(io.StringIO(content))
+                for r in reader:
+                    rows_data.append(r)
+            elif fname.endswith((".xlsx", ".xls")):
+                import openpyxl
+                wb = openpyxl.load_workbook(uploaded, data_only=True)
+                ws = wb.active
+                headers = [str(cell.value).strip() if cell.value is not None else "" for cell in ws[1]]
+                for row_cells in ws.iter_rows(min_row=2, values_only=True):
+                    if not any(row_cells):
+                        continue
+                    row_dict = {}
+                    for h, val in zip(headers, row_cells):
+                        if h:
+                            row_dict[h] = val
+                    rows_data.append(row_dict)
+        elif isinstance(request.data.get("rows"), list):
+            rows_data = request.data["rows"]
+        elif isinstance(request.data, list):
+            rows_data = request.data
+
+        if not rows_data:
+            raise ValidationFailed("No data rows found in spreadsheet or request body.")
+
+        created_estimates = []
+        for idx, row in enumerate(rows_data, start=1):
+            party_name = (
+                row.get("Customer")
+                or row.get("Party")
+                or row.get("Customer Name")
+                or row.get("party_name")
+                or row.get("customer_name")
+                or f"Legacy Customer {idx}"
+            )
+            party = Party.objects.filter(client=client, name__iexact=str(party_name).strip()).first()
+            if not party:
+                party = Party.objects.filter(client=client, type__in=["Customer", "Both"]).first()
+            if not party:
+                party = Party.objects.create(
+                    client=client,
+                    name=str(party_name).strip(),
+                    code=f"CUST-HIST-{idx}",
+                    type="Customer",
+                    created_by=request.user,
+                )
+
+            raw_date = row.get("Date") or row.get("doc_date") or row.get("Estimate Date")
+            doc_date_val = timezone.now().date()
+            if raw_date:
+                try:
+                    if isinstance(raw_date, date):
+                        doc_date_val = raw_date
+                    else:
+                        doc_date_val = date.fromisoformat(str(raw_date)[:10])
+                except Exception:
+                    pass
+
+            est_number = (
+                row.get("Estimate Number")
+                or row.get("Number")
+                or row.get("estimate_number")
+                or allocate_number(client, "EST", doc_date_val)
+            )
+
+            notes = str(row.get("Notes") or row.get("notes") or "Historical Estimate Import")
+            item_desc = str(
+                row.get("Item")
+                or row.get("Description")
+                or row.get("item_name")
+                or row.get("description")
+                or "Equipment / Fabrication Estimate"
+            )
+            try:
+                qty = Decimal(str(row.get("Qty") or row.get("quantity") or row.get("qty") or "1"))
+            except Exception:
+                qty = Decimal("1")
+            try:
+                rate = Decimal(str(row.get("Rate") or row.get("rate") or row.get("amount") or row.get("Total") or "0"))
+            except Exception:
+                rate = Decimal("0")
+            try:
+                tax_pct = Decimal(str(row.get("Tax %") or row.get("tax_pct") or "18"))
+            except Exception:
+                tax_pct = Decimal("18")
+
+            subtotal = round2(qty * rate)
+            tax_amt = round2(subtotal * (tax_pct / Decimal("100")))
+            total = subtotal + tax_amt
+
+            matched_item = Item.objects.filter(client=client, name__iexact=item_desc).first()
+
+            est = Estimate.objects.create(
+                client=client,
+                party=party,
+                party_name=party.name,
+                party_gstin=party.gstin or "",
+                estimate_number=est_number,
+                doc_date=doc_date_val,
+                status="Draft",
+                subtotal=subtotal,
+                tax_total=tax_amt,
+                total=total,
+                notes=notes,
+                created_by=request.user,
+            )
+
+            from .models import EstimateLine
+            EstimateLine.objects.create(
+                client=client,
+                estimate=est,
+                line_no=1,
+                item=matched_item,
+                description=item_desc,
+                qty=qty,
+                rate=rate,
+                tax_rate=tax_pct,
+                tax_amount=tax_amt,
+                amount=total,
+            )
+            created_estimates.append(est)
+
+        return Response(
+            {
+                "success": True,
+                "imported_count": len(created_estimates),
+                "message": f"Successfully imported {len(created_estimates)} historical estimates.",
+                "estimates": [
+                    {"id": str(e.id), "number": e.estimate_number, "customer": e.party_name, "total": float(e.total)}
+                    for e in created_estimates[:10]
+                ],
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
 
 def _clone_document(source, target_model, overrides, *, number_field, series,
                     line_model_name, line_fk, line_filter=None, line_overrides=None):

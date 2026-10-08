@@ -54,6 +54,9 @@ def line_serializer_for(line_model, table_name, extra_fields=(), extra_read_only
     would resolve to the name being defined, not the argument.
     """
 
+    _model_fields = {f.name for f in line_model._meta.get_fields()}
+    _metal_fields = [f for f in METAL_LINE_FIELDS if f in _model_fields]
+
     class _LineSerializer(DocumentLineSerializer):
         line_table_name = table_name
 
@@ -80,9 +83,8 @@ def line_serializer_for(line_model, table_name, extra_fields=(), extra_read_only
         class Meta(DocumentLineSerializer.Meta):
             model = line_model
             # Replaced (metal-industry sales): every sales line also carries
-            # the optional kind / material / specification / unit weight.
-            # fields = DocumentLineSerializer.Meta.fields + list(extra_fields)
-            fields = DocumentLineSerializer.Meta.fields + METAL_LINE_FIELDS + list(extra_fields)
+            # the optional kind / material / specification / unit weight if supported by the model.
+            fields = DocumentLineSerializer.Meta.fields + _metal_fields + list(extra_fields)
             read_only_fields = DocumentLineSerializer.Meta.read_only_fields + list(
                 extra_read_only
             )
@@ -122,8 +124,8 @@ class EstimateSerializer(DocumentSerializer):
 
     class Meta:
         model = Estimate
-        fields = HEADER_FIELDS + ["estimate_number", "status", "valid_until", "crm_lead"]
-        read_only_fields = READ_ONLY_HEADER_FIELDS + ["estimate_number"]
+        fields = HEADER_FIELDS + ["estimate_number", "status", "valid_until", "crm_lead", "converted_challan"]
+        read_only_fields = READ_ONLY_HEADER_FIELDS + ["estimate_number", "converted_challan"]
 
 
 # ---------------------------------------------------------------------------

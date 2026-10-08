@@ -39,18 +39,29 @@ router.register(
 )
 router.register("payroll", views.PayslipViewSet, basename="hrms-payroll")
 
+router.register("transfers", views.EmployeeTransferViewSet, basename="hrms-transfers")
+router.register("promotions", views.EmployeePromotionViewSet, basename="hrms-promotions")
+router.register("warnings", views.EmployeeWarningViewSet, basename="hrms-warnings")
+router.register("awards", views.EmployeeAwardViewSet, basename="hrms-awards")
+router.register("travel-requests", views.TravelRequestViewSet, basename="hrms-travel-requests")
+router.register("announcements", views.AnnouncementViewSet, basename="hrms-announcements")
+
 router.register("jobs", views.JobViewSet, basename="hrms-jobs")
 router.register("candidates", views.CandidateViewSet, basename="hrms-candidates")
 router.register("applications", views.ApplicationViewSet, basename="hrms-applications")
 router.register("interviews", views.InterviewViewSet, basename="hrms-interviews")
 router.register("offers", views.OfferViewSet, basename="hrms-offers")
 router.register("onboarding", views.OnboardingViewSet, basename="hrms-onboarding")
-# Hidden: Screening Questions out of scope (Sweven spec)
-# router.register(
-#     "recruitment/questions",
-#     views.ScreeningQuestionViewSet,
-#     basename="hrms-screening-questions",
-# )
+router.register(
+    "recruitment/questions",
+    views.ScreeningQuestionViewSet,
+    basename="hrms-screening-questions",
+)
+router.register(
+    "recruitment/answers",
+    views.ScreeningAnswerViewSet,
+    basename="hrms-screening-answers",
+)
 
 router.register(
     "performance/cycles", views.AppraisalCycleViewSet, basename="hrms-appraisal-cycles"
@@ -92,6 +103,8 @@ router.register(
 router.register("terminations", views.TerminationViewSet, basename="hrms-terminations")
 router.register("resignations", views.ResignationViewSet, basename="hrms-resignations")
 router.register("complaints", views.ComplaintViewSet, basename="hrms-complaints")
+router.register("meeting-rooms", views.MeetingRoomViewSet, basename="hrms-meeting-rooms")
+router.register("meetings", views.CompanyMeetingViewSet, basename="hrms-meetings")
 
 urlpatterns = [
     path("org-chart/", views.OrgChartView.as_view(), name="hrms-org-chart"),

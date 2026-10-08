@@ -443,3 +443,163 @@ class StockBalance(TenantModel):
         if self.inward_qty and self.inward_qty > 0:
             return self.inward_value / self.inward_qty
         return None
+
+
+# ---------------------------------------------------------------------------
+# Demo Units (Dev Spec §2.2)
+# ---------------------------------------------------------------------------
+class DemoUnit(TenantModel, LegacyIdMixin):
+    STATUSES = [
+        ("On Trial", "On Trial"),
+        ("Overdue", "Overdue"),
+        ("Returned - Inspected", "Returned - Inspected"),
+        ("Converted to Sale", "Converted to Sale"),
+        ("Cancelled", "Cancelled"),
+    ]
+
+    demo_number = models.TextField()
+    item = models.ForeignKey(
+        "masters.Item", on_delete=models.PROTECT, related_name="demo_units"
+    )
+    serial = models.ForeignKey(
+        "masters.ItemSerial", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    prospect_name = models.TextField()
+    prospect_party = models.ForeignKey(
+        "masters.Party", null=True, blank=True, on_delete=models.SET_NULL, related_name="demo_units"
+    )
+    contact_phone = models.TextField(null=True, blank=True)
+    contact_email = models.EmailField(null=True, blank=True)
+    dispatch_date = models.DateField()
+    expected_return_date = models.DateField()
+    actual_return_date = models.DateField(null=True, blank=True)
+    status = models.TextField(choices=STATUSES, default="On Trial")
+    inspection_notes = models.TextField(null=True, blank=True)
+    condition_on_return = models.TextField(null=True, blank=True)
+    sale_invoice_ref = models.TextField(null=True, blank=True)
+    notes = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "inventory_demo_units"
+        ordering = ["-dispatch_date", "-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "demo_number"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_demo_units_number",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.demo_number} ({self.prospect_name})"
+
+
+# ---------------------------------------------------------------------------
+# QC Rework Tracking & Scrap (Dev Spec §2.4)
+# ---------------------------------------------------------------------------
+class ReworkOrder(TenantModel, LegacyIdMixin):
+    STATUSES = [
+        ("Pending", "Pending"),
+        ("In Rework", "In Rework"),
+        ("Re-inspected", "Re-inspected"),
+        ("Scrapped", "Scrapped"),
+        ("Completed", "Completed"),
+    ]
+
+    rework_number = models.TextField()
+    item = models.ForeignKey(
+        "masters.Item", on_delete=models.PROTECT, related_name="rework_orders"
+    )
+    goods_receipt = models.ForeignKey(
+        "purchase.GoodsReceipt", null=True, blank=True, on_delete=models.SET_NULL, related_name="rework_orders"
+    )
+    quantity = models.DecimalField(max_digits=18, decimal_places=4, default=1)
+    defect_reason = models.TextField()
+    root_cause = models.TextField(null=True, blank=True)
+    rework_labor_hours = models.DecimalField(max_digits=8, decimal_places=2, default=0)
+    rework_cost = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    scrap_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    scrap_rate_pct = models.DecimalField(max_digits=6, decimal_places=2, default=0)
+    status = models.TextField(choices=STATUSES, default="Pending")
+    assigned_technician = models.TextField(null=True, blank=True)
+    notes = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "qc_rework_orders"
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "rework_number"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_rework_orders_number",
+            )
+        ]
+
+    def __str__(self):
+        return self.rework_number
+
+
+class ScrapLog(TenantModel):
+    scrap_number = models.TextField()
+    item = models.ForeignKey("masters.Item", on_delete=models.PROTECT, related_name="+")
+    quantity = models.DecimalField(max_digits=18, decimal_places=4)
+    scrap_reason = models.TextField()
+    estimated_loss = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    rework_order = models.ForeignKey(
+        ReworkOrder, null=True, blank=True, on_delete=models.SET_NULL, related_name="scrap_logs"
+    )
+    logged_at = models.DateTimeField(auto_now_add=True)
+    logged_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+
+    class Meta:
+        db_table = "qc_scrap_logs"
+        ordering = ["-logged_at"]
+
+    def __str__(self):
+        return f"{self.scrap_number} - {self.item}"
+
+
+class QualityInspection(TenantModel, LegacyIdMixin):
+    """Standalone Quality Control inspection desk model (Dev Spec §2.2)."""
+    STATUSES = [
+        ("pending", "Pending Inspection"),
+        ("passed", "Passed & Released"),
+        ("rework", "Under Rework"),
+        ("rejected", "Rejected"),
+    ]
+
+    inspection_number = models.TextField(unique=True)
+    goods_receipt = models.ForeignKey(
+        "purchase.GoodsReceipt",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="qc_inspections",
+    )
+    item = models.ForeignKey("masters.Item", on_delete=models.PROTECT, related_name="qc_inspections")
+    batch_lot_number = models.TextField(blank=True, default="")
+    sample_size = models.DecimalField(max_digits=18, decimal_places=4, default=1)
+    received_qty = models.DecimalField(max_digits=18, decimal_places=4)
+    accepted_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    rejected_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    status = models.CharField(max_length=20, choices=STATUSES, default="pending")
+    checklist_results = models.JSONField(default=list, blank=True)
+    inspector = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="qc_inspections"
+    )
+    inspector_notes = models.TextField(blank=True, default="")
+    inspected_at = models.DateTimeField(null=True, blank=True)
+    rework_order = models.ForeignKey(
+        ReworkOrder, null=True, blank=True, on_delete=models.SET_NULL, related_name="qc_inspections"
+    )
+
+    class Meta:
+        db_table = "quality_inspections"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.inspection_number} ({self.item}) - {self.status}"
+
+

@@ -191,6 +191,48 @@ class Project(TenantModel, LegacyIdMixin):
     def __str__(self):
         return self.code
 
+    @property
+    def name(self):
+        """What a project is called on screen: the product, else the customer,
+        else its code. There is no stored name column; several views and
+        serializers read ``project.name``."""
+        return self.product_name or self.customer_name or self.code
+
+
+class ProjectMember(TenantModel):
+    """Someone working on a project without owning a stage or a task.
+
+    The project's people are otherwise derived (the PM, stage and task
+    assignees); this is the explicit "who else is on it" list the PM keeps. A
+    member is in the Project chat, and in their team's chat when ``department``
+    is one of the project's stage departments (see ``chat.ChatScope``).
+    """
+
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="members")
+    user = models.ForeignKey(
+        "accounts.User", on_delete=models.CASCADE, related_name="pms_memberships"
+    )
+    department = models.ForeignKey(
+        Department, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    added_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+
+    class Meta:
+        db_table = "pms_project_members"
+        ordering = ["created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["project", "user"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_pms_project_member",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.project_id} {self.user_id}"
+
 
 class ProjectStage(TenantModel, LegacyIdMixin):
     """Stage configs are **copied, not referenced**, for the fields that matter.
@@ -664,3 +706,147 @@ class MessageAttachment(TenantModel):
     class Meta:
         db_table = "pms_message_attachments"
         ordering = ["created_at"]
+
+
+# ---------------------------------------------------------------------------
+# Bug & Defect Tracking (Dev Spec §2.6.1)
+# ---------------------------------------------------------------------------
+class ProjectBug(TenantModel, LegacyIdMixin):
+    SEVERITIES = [
+        ("Low", "Low"),
+        ("Medium", "Medium"),
+        ("High", "High"),
+        ("Critical", "Critical"),
+    ]
+    STATUSES = [
+        ("Reported", "Reported"),
+        ("Triaged", "Triaged"),
+        ("In Progress", "In Progress"),
+        ("Resolved", "Resolved"),
+        ("Verified", "Verified"),
+        ("Closed", "Closed"),
+    ]
+
+    bug_number = models.TextField()
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name="bugs")
+    task = models.ForeignKey(
+        Task, null=True, blank=True, on_delete=models.SET_NULL, related_name="bugs"
+    )
+    title = models.TextField()
+    severity = models.TextField(choices=SEVERITIES, default="Medium")
+    status = models.TextField(choices=STATUSES, default="Reported")
+    steps_to_reproduce = models.TextField(null=True, blank=True)
+    expected_result = models.TextField(null=True, blank=True)
+    actual_result = models.TextField(null=True, blank=True)
+    screenshots = models.JSONField(default=list, blank=True)
+    assigned_to = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="assigned_bugs"
+    )
+    reported_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    resolution_notes = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pms_bugs"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.bug_number}: {self.title}"
+
+
+# ---------------------------------------------------------------------------
+# General Person-to-Person Task Delegation (Dev Spec §2.6.1)
+# ---------------------------------------------------------------------------
+class DelegatedTask(TenantModel, LegacyIdMixin):
+    STATUSES = [
+        ("Pending", "Pending"),
+        ("Accepted", "Accepted"),
+        ("In Progress", "In Progress"),
+        ("Completed", "Completed"),
+        ("Rejected", "Rejected"),
+    ]
+
+    task_number = models.TextField()
+    title = models.TextField()
+    description = models.TextField(null=True, blank=True)
+    delegated_by = models.ForeignKey(
+        "accounts.User", on_delete=models.CASCADE, related_name="delegated_tasks_out"
+    )
+    assigned_to = models.ForeignKey(
+        "accounts.User", on_delete=models.CASCADE, related_name="delegated_tasks_in"
+    )
+    priority = models.TextField(choices=PRIORITIES, default="Medium")
+    due_date = models.DateField(null=True, blank=True)
+    status = models.TextField(choices=STATUSES, default="Pending")
+    rejection_reason = models.TextField(null=True, blank=True)
+    completion_notes = models.TextField(null=True, blank=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pms_delegated_tasks"
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.task_number}: {self.title}"
+
+
+# ---------------------------------------------------------------------------
+# Timesheets & Live Time Tracking (Dev Spec §2.6.2)
+# ---------------------------------------------------------------------------
+class Timesheet(TenantModel, LegacyIdMixin):
+    STATUSES = [
+        ("Draft", "Draft"),
+        ("Submitted", "Submitted"),
+        ("Approved", "Approved"),
+        ("Rejected", "Rejected"),
+    ]
+
+    timesheet_number = models.TextField()
+    employee = models.ForeignKey(
+        "hrms.Employee", on_delete=models.CASCADE, related_name="timesheets"
+    )
+    week_start = models.DateField()
+    week_end = models.DateField()
+    total_hours = models.DecimalField(max_digits=8, decimal_places=2, default=0)
+    status = models.TextField(choices=STATUSES, default="Draft")
+    approved_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    rejection_reason = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pms_timesheets"
+        ordering = ["-week_start", "-created_at"]
+
+    def __str__(self):
+        return f"{self.timesheet_number} ({self.week_start})"
+
+
+class TimesheetEntry(TenantModel):
+    timesheet = models.ForeignKey(
+        Timesheet, null=True, blank=True, on_delete=models.CASCADE, related_name="entries"
+    )
+    user = models.ForeignKey(
+        "accounts.User", on_delete=models.CASCADE, related_name="timesheet_entries"
+    )
+    project = models.ForeignKey(
+        Project, null=True, blank=True, on_delete=models.SET_NULL, related_name="timesheet_entries"
+    )
+    task = models.ForeignKey(
+        Task, null=True, blank=True, on_delete=models.SET_NULL, related_name="timesheet_entries"
+    )
+    date = models.DateField()
+    start_time = models.DateTimeField(null=True, blank=True)
+    end_time = models.DateTimeField(null=True, blank=True)
+    duration_hours = models.DecimalField(max_digits=6, decimal_places=2, default=0)
+    #: Labour rate for this work (Rs/hr), as logged; costs the project's labour.
+    hourly_rate = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    is_billable = models.BooleanField(default=True)
+    is_running = models.BooleanField(default=False)
+    description = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "pms_timesheet_entries"
+        ordering = ["-date", "-created_at"]
+

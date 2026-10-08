@@ -124,16 +124,20 @@ class BankTransferSerializer(BaseModelSerializer):
 
 
 class BudgetSerializer(BaseModelSerializer):
-    accountId = TenantPrimaryKeyRelatedField(source="account", queryset=Account.objects.all())
+    accountId = TenantPrimaryKeyRelatedField(source="account", queryset=Account.objects.all(), required=False, allow_null=True)
     accountName = serializers.CharField(source="account.name", read_only=True)
     actual = serializers.SerializerMethodField()
     variance = serializers.SerializerMethodField()
+    percent_consumed = serializers.SerializerMethodField()
+    is_alert = serializers.SerializerMethodField()
 
     class Meta:
         model = Budget
         fields = [
-            "id", "accountId", "accountName", "period_start", "period_end",
-            "amount", "actual", "variance", "notes", "created_at", "updated_at",
+            "id", "accountId", "accountName", "department_name", "category",
+            "period_start", "period_end", "amount", "actual", "variance",
+            "alert_threshold_pct", "percent_consumed", "is_alert", "notes",
+            "created_at", "updated_at",
         ]
 
     def get_actual(self, budget):
@@ -144,6 +148,20 @@ class BudgetSerializer(BaseModelSerializer):
         if actual is None:
             return None
         return budget.amount - actual
+
+    def get_percent_consumed(self, budget):
+        actual = getattr(budget, "actual_amount", None)
+        if actual is None or not budget.amount:
+            return 0.0
+        return round(float(actual) / float(budget.amount) * 100, 2)
+
+    def get_is_alert(self, budget):
+        actual = getattr(budget, "actual_amount", None)
+        if actual is None or not budget.amount or not budget.alert_threshold_pct:
+            return False
+        pct = (float(actual) / float(budget.amount)) * 100
+        return pct >= float(budget.alert_threshold_pct)
+
 
 
 class ExpenseCategorySerializer(BaseModelSerializer):

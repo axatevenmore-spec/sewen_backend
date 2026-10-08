@@ -11,6 +11,8 @@ router.register("clients", views.ClientViewSet, basename="admin-clients")
 
 auth_urlpatterns = [
     path("login/", views.LoginView.as_view(), name="auth-login"),
+    # Development-only test-account picker (settings.TEST_LOGIN_PICKER).
+    path("test-accounts/", views.TestAccountsView.as_view(), name="auth-test-accounts"),
     path("refresh/", views.RefreshView.as_view(), name="auth-refresh"),
     path("logout/", views.LogoutView.as_view(), name="auth-logout"),
     path("me/", views.MeView.as_view(), name="auth-me"),
@@ -20,6 +22,7 @@ auth_urlpatterns = [
     path("reset-password/", views.ResetPasswordView.as_view(), name="auth-reset-password"),
     path("sessions/", views.SessionListView.as_view(), name="auth-sessions"),
     path("sessions/<uuid:pk>/", views.SessionDetailView.as_view(), name="auth-session-detail"),
+    path("impersonate-customer/", views.ImpersonateCustomerView.as_view(), name="auth-impersonate-customer"),
 ]
 
 admin_urlpatterns = [

@@ -268,22 +268,105 @@ class BudgetViewSet(TenantModelViewSet):
     default_date_field = "period_start"
     ordering = ["-period_start"]
 
+    def _compute_actual(self, budget, client_id):
+        if not budget.account:
+            budget.actual_amount = Decimal("0.00")
+            return
+        rows = JournalLine.objects.filter(
+            client_id=client_id,
+            account=budget.account,
+            deleted_at__isnull=True,
+            journal_entry__entry_date__gte=budget.period_start,
+            journal_entry__entry_date__lte=budget.period_end,
+        ).exclude(journal_entry__status="Reversed").aggregate(
+            debit=Coalesce(Sum("debit"), Value(Decimal("0.00")), output_field=MONEY),
+            credit=Coalesce(Sum("credit"), Value(Decimal("0.00")), output_field=MONEY),
+        )
+        budget.actual_amount = round2(rows["debit"] - rows["credit"])
+
     def list(self, request, *args, **kwargs):
         queryset = self.filter_queryset(self.get_queryset())
         page = self.paginate_queryset(queryset)
-        for budget in page:
-            rows = JournalLine.objects.filter(
-                client_id=request.client_id,
-                account=budget.account,
-                deleted_at__isnull=True,
-                journal_entry__entry_date__gte=budget.period_start,
-                journal_entry__entry_date__lte=budget.period_end,
-            ).exclude(journal_entry__status="Reversed").aggregate(
-                debit=Coalesce(Sum("debit"), Value(Decimal("0.00")), output_field=MONEY),
-                credit=Coalesce(Sum("credit"), Value(Decimal("0.00")), output_field=MONEY),
-            )
-            budget.actual_amount = round2(rows["debit"] - rows["credit"])
-        return self.get_paginated_response(self.get_serializer(page, many=True).data)
+        target = page if page is not None else queryset
+        for budget in target:
+            self._compute_actual(budget, request.client_id)
+        if page is not None:
+            return self.get_paginated_response(self.get_serializer(page, many=True).data)
+        return Response(self.get_serializer(target, many=True).data)
+
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        self._compute_actual(instance, request.client_id)
+        return Response(self.get_serializer(instance).data)
+
+    @action(detail=False, methods=["get"])
+    def variance_summary(self, request):
+        """Aggregate variance report grouped by department and category."""
+        budgets = list(self.filter_queryset(self.get_queryset()))
+        dept_data = {}
+        category_data = {}
+        alerts = []
+        total_budget = Decimal("0.00")
+        total_actual = Decimal("0.00")
+
+        for b in budgets:
+            self._compute_actual(b, request.client_id)
+            actual = b.actual_amount or Decimal("0.00")
+            total_budget += b.amount
+            total_actual += actual
+            pct = round(float(actual) / float(b.amount) * 100, 2) if b.amount else 0.0
+
+            dept = b.department_name or "General"
+            if dept not in dept_data:
+                dept_data[dept] = {"budget": Decimal("0.00"), "actual": Decimal("0.00")}
+            dept_data[dept]["budget"] += b.amount
+            dept_data[dept]["actual"] += actual
+
+            cat = b.category or "Uncategorized"
+            if cat not in category_data:
+                category_data[cat] = {"budget": Decimal("0.00"), "actual": Decimal("0.00")}
+            category_data[cat]["budget"] += b.amount
+            category_data[cat]["actual"] += actual
+
+            if b.alert_threshold_pct and pct >= float(b.alert_threshold_pct):
+                alerts.append({
+                    "id": b.id,
+                    "department": b.department_name,
+                    "category": b.category,
+                    "account": b.account.name if b.account else None,
+                    "budget": float(b.amount),
+                    "actual": float(actual),
+                    "percent_consumed": pct,
+                    "threshold": float(b.alert_threshold_pct),
+                })
+
+        return Response({
+            "total_budget": round2(total_budget),
+            "total_actual": round2(total_actual),
+            "total_variance": round2(total_budget - total_actual),
+            "by_department": [
+                {
+                    "department": k,
+                    "budget": round2(v["budget"]),
+                    "actual": round2(v["actual"]),
+                    "variance": round2(v["budget"] - v["actual"]),
+                    "percent_consumed": round(float(v["actual"]) / float(v["budget"]) * 100, 2) if v["budget"] else 0.0
+                }
+                for k, v in dept_data.items()
+            ],
+            "by_category": [
+                {
+                    "category": k,
+                    "budget": round2(v["budget"]),
+                    "actual": round2(v["actual"]),
+                    "variance": round2(v["budget"] - v["actual"]),
+                    "percent_consumed": round(float(v["actual"]) / float(v["budget"]) * 100, 2) if v["budget"] else 0.0
+                }
+                for k, v in category_data.items()
+            ],
+            "alerts": alerts,
+        })
+
 
 
 class ExpenseCategoryViewSet(TenantModelViewSet):

@@ -416,6 +416,7 @@ class LeaveType(TenantModel, LegacyIdMixin):
     )
     is_encashable = models.BooleanField(default=False)
     is_paid = models.BooleanField(default=True)
+    enforce_sandwich_rule = models.BooleanField(default=False)
 
     class Meta:
         db_table = "hrms_leave_types"
@@ -545,6 +546,11 @@ class SalaryStructure(TenantModel, LegacyIdMixin):
     basic_pct = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
     hra_pct = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
     components = models.JSONField(default=list, blank=True)
+    overtime_monthly_cap_hours = models.DecimalField(max_digits=6, decimal_places=2, default=30)
+    #: Overtime pay = hours x hourly rate x this (payroll assumed 1.5x).
+    overtime_rate_multiplier = models.DecimalField(max_digits=4, decimal_places=2, default=1.5)
+    overtime_saturation_threshold = models.DecimalField(max_digits=6, decimal_places=2, default=25)
+    require_overtime_approval = models.BooleanField(default=True)
     is_active = models.BooleanField(default=True)
 
     class Meta:
@@ -1409,3 +1415,234 @@ class Complaint(TenantModel):
     class Meta:
         db_table = "hrms_complaints"
         ordering = ["-created_at"]
+
+
+# ---------------------------------------------------------------------------
+# Transfers, Promotions & Warnings (Dev Spec §2.5.1)
+# ---------------------------------------------------------------------------
+class EmployeeTransfer(TenantModel, LegacyIdMixin):
+    STATUSES = [
+        ("Pending", "Pending"),
+        ("Approved", "Approved"),
+        ("Rejected", "Rejected"),
+        ("Completed", "Completed"),
+    ]
+
+    transfer_number = models.TextField()
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="transfers")
+    from_department = models.ForeignKey(Department, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    to_department = models.ForeignKey(Department, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    from_location = models.ForeignKey(Location, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    to_location = models.ForeignKey(Location, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    effective_date = models.DateField()
+    reason = models.TextField(null=True, blank=True)
+    status = models.TextField(choices=STATUSES, default="Pending")
+
+    class Meta:
+        db_table = "hrms_employee_transfers"
+        ordering = ["-effective_date", "-created_at"]
+
+
+class EmployeePromotion(TenantModel, LegacyIdMixin):
+    STATUSES = [
+        ("Pending", "Pending"),
+        ("Approved", "Approved"),
+        ("Rejected", "Rejected"),
+        ("Effective", "Effective"),
+    ]
+
+    promotion_number = models.TextField()
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="promotions")
+    from_designation = models.ForeignKey(Designation, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    to_designation = models.ForeignKey(Designation, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    previous_salary = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    new_salary = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    effective_date = models.DateField()
+    justification = models.TextField(null=True, blank=True)
+    status = models.TextField(choices=STATUSES, default="Pending")
+
+    class Meta:
+        db_table = "hrms_employee_promotions"
+        ordering = ["-effective_date", "-created_at"]
+
+
+class EmployeeWarning(TenantModel, LegacyIdMixin):
+    SEVERITIES = [
+        ("Verbal", "Verbal"),
+        ("First Written", "First Written"),
+        ("Final Written", "Final Written"),
+        ("Suspension", "Suspension"),
+    ]
+    STATUSES = [
+        ("Draft", "Draft"),
+        ("Issued", "Issued"),
+        ("Acknowledged", "Acknowledged"),
+        ("Appealed", "Appealed"),
+        ("Closed", "Closed"),
+    ]
+
+    warning_number = models.TextField()
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="warnings")
+    issue_date = models.DateField()
+    severity = models.TextField(choices=SEVERITIES, default="First Written")
+    incident_date = models.DateField(null=True, blank=True)
+    subject = models.TextField()
+    description = models.TextField()
+    corrective_action = models.TextField(null=True, blank=True)
+    status = models.TextField(choices=STATUSES, default="Issued")
+    employee_explanation = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "hrms_employee_warnings"
+        ordering = ["-issue_date", "-created_at"]
+
+
+# ---------------------------------------------------------------------------
+# Employee Awards & Recognitions (Dev Spec §2.5.4)
+# ---------------------------------------------------------------------------
+class EmployeeAward(TenantModel, LegacyIdMixin):
+    award_number = models.TextField()
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="awards")
+    award_name = models.TextField()
+    category = models.TextField(default="Excellence")  # Star Performer, Innovation, Customer Hero, Leadership
+    award_date = models.DateField()
+    gift_amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    citation = models.TextField(null=True, blank=True)
+    badge_icon = models.TextField(default="Trophy")
+
+    class Meta:
+        db_table = "hrms_employee_awards"
+        ordering = ["-award_date", "-created_at"]
+
+    def __str__(self):
+        return f"{self.award_name} - {self.employee}"
+
+
+# ---------------------------------------------------------------------------
+# Travel Requisitions & Expense Advances (Dev Spec §2.5.6)
+# ---------------------------------------------------------------------------
+class TravelRequest(TenantModel, LegacyIdMixin):
+    STATUSES = [
+        ("Submitted", "Submitted"),
+        ("Approved", "Approved"),
+        ("Disbursed", "Disbursed"),
+        ("Settled", "Settled"),
+        ("Rejected", "Rejected"),
+        ("Cancelled", "Cancelled"),
+    ]
+
+    travel_number = models.TextField()
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="travel_requests")
+    purpose = models.TextField()
+    destination = models.TextField()
+    start_date = models.DateField()
+    end_date = models.DateField()
+    advance_requested = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    advance_disbursed = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    actual_expenses = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    settlement_notes = models.TextField(null=True, blank=True)
+    status = models.TextField(choices=STATUSES, default="Submitted")
+
+    class Meta:
+        db_table = "hrms_travel_requests"
+        ordering = ["-start_date", "-created_at"]
+
+    def __str__(self):
+        return f"{self.travel_number} - {self.destination}"
+
+
+# ---------------------------------------------------------------------------
+# Company Announcements & Notice Board (Dev Spec §2.5.6)
+# ---------------------------------------------------------------------------
+class Announcement(TenantModel, LegacyIdMixin):
+    PRIORITIES = [
+        ("Low", "Low"),
+        ("Medium", "Medium"),
+        ("High", "High"),
+        ("Urgent", "Urgent"),
+    ]
+
+    title = models.TextField()
+    content = models.TextField()
+    priority = models.TextField(choices=PRIORITIES, default="Medium")
+    target_department = models.ForeignKey(
+        Department, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    is_pinned = models.BooleanField(default=False)
+    publish_date = models.DateField()
+    expiry_date = models.DateField(null=True, blank=True)
+    author_name = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "hrms_announcements"
+        ordering = ["-is_pinned", "-publish_date", "-created_at"]
+
+    def __str__(self):
+        return self.title
+
+
+# ---------------------------------------------------------------------------
+# Universal Meetings & Conference Room Booking (Dev Spec §2.5)
+# ---------------------------------------------------------------------------
+class MeetingRoom(TenantModel, LegacyIdMixin):
+    name = models.TextField()
+    code = models.TextField()
+    capacity = models.PositiveIntegerField(default=6)
+    location = models.TextField(blank=True, default="")
+    amenities = models.JSONField(default=list, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "hrms_meeting_rooms"
+        ordering = ["name"]
+
+    def __str__(self):
+        return f"{self.name} ({self.code})"
+
+
+class CompanyMeeting(TenantModel, LegacyIdMixin):
+    MEETING_TYPES = [
+        ("in_person", "In Person"),
+        ("virtual", "Virtual"),
+        ("hybrid", "Hybrid"),
+    ]
+    VIDEO_PROVIDERS = [
+        ("none", "None"),
+        ("zoom", "Zoom"),
+        ("google_meet", "Google Meet"),
+    ]
+    STATUSES = [
+        ("scheduled", "Scheduled"),
+        ("in_progress", "In Progress"),
+        ("completed", "Completed"),
+        ("cancelled", "Cancelled"),
+    ]
+
+    title = models.TextField()
+    description = models.TextField(blank=True, default="")
+    room = models.ForeignKey(
+        MeetingRoom, null=True, blank=True, on_delete=models.SET_NULL, related_name="meetings"
+    )
+    meeting_type = models.CharField(max_length=20, choices=MEETING_TYPES, default="hybrid")
+    start_time = models.DateTimeField()
+    end_time = models.DateTimeField()
+    video_provider = models.CharField(max_length=20, choices=VIDEO_PROVIDERS, default="none")
+    join_url = models.TextField(blank=True, default="")
+    host_user = models.ForeignKey(
+        "accounts.User", on_delete=models.CASCADE, related_name="hosted_meetings"
+    )
+    attendees = models.ManyToManyField("accounts.User", related_name="attended_meetings", blank=True)
+    external_attendees = models.JSONField(default=list, blank=True)
+    agenda = models.TextField(blank=True, default="")
+    minutes_of_meeting = models.TextField(blank=True, default="")
+    action_items = models.JSONField(default=list, blank=True)
+    status = models.CharField(max_length=20, choices=STATUSES, default="scheduled")
+
+    class Meta:
+        db_table = "hrms_company_meetings"
+        ordering = ["start_time"]
+
+    def __str__(self):
+        return f"{self.title}"
+
+

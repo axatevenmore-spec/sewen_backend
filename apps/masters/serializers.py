@@ -68,6 +68,7 @@ class PartySerializer(BaseModelSerializer):
             "bank_account_number", "ifsc_code", "bank_name", "account_holder_name",
             "opening_balance", "balance",
             "billing_address", "shipping_address", "contacts", "status",
+            "weight_tolerance_pct",
             "created_at", "updated_at",
         ]
         read_only_fields = ["balance", "created_at", "updated_at"]

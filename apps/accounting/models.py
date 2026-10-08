@@ -167,9 +167,14 @@ class JournalLine(TenantModel):
 
 class Budget(TenantModel):
     account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name="budgets")
+    department_name = models.TextField(null=True, blank=True)
+    category = models.ForeignKey(
+        "ExpenseCategory", null=True, blank=True, on_delete=models.SET_NULL, related_name="budgets"
+    )
     period_start = models.DateField()
     period_end = models.DateField()
     amount = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    alert_threshold_pct = models.DecimalField(max_digits=5, decimal_places=2, default=80)
     notes = models.TextField(null=True, blank=True)
 
     class Meta:

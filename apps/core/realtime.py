@@ -179,6 +179,18 @@ def _project_in_tenant(project_id, client_id):
         ).exists()
 
 
+def _works_on_project(project_id, client_id, user_id):
+    from apps.accounts.models import User
+    from apps.core.tenancy import tenant_context
+    from apps.pms.team import participant_project_ids
+
+    with tenant_context(client_id):
+        user = User.objects.filter(pk=user_id, client_id=client_id).first()
+        if user is None:
+            return False
+        return any(str(pid) == str(project_id) for pid in participant_project_ids(user))
+
+
 @sio.event
 async def connect(sid, environ, auth):
     token = (auth or {}).get("token") if isinstance(auth, dict) else None
@@ -227,9 +239,13 @@ async def disconnect(sid, *args):
 async def pms_watch(sid, data):
     identity = await sio.get_session(sid)
     project_id = str((data or {}).get("projectId") or "")
-    if not identity.get("can_view_pms"):
-        return {"ok": False}
     if not await _db(_project_in_tenant, project_id, identity["client_id"]):
+        return {"ok": False}
+    # PMS users watch any project; anyone else only one they work on (its
+    # team list, a stage or a task) -- that is who chats on it.
+    if not identity.get("can_view_pms") and not await _db(
+        _works_on_project, project_id, identity["client_id"], identity["user_id"]
+    ):
         return {"ok": False}
     await sio.enter_room(sid, project_room(project_id))
     return {"ok": True}

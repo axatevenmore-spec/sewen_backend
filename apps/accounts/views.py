@@ -238,6 +238,67 @@ class LoginView(APIView):
             raise
 
 
+class TestAccountsView(APIView):
+    """``GET /auth/test-accounts/`` -- the login page's test-account picker.
+
+    Off (404) unless ``settings.TEST_LOGIN_PICKER`` -- development only by
+    default. Lists only tenants built by ``seed_test_tenant`` (slug ends in
+    ``-test`` and carries the ``test_tenant`` flag), with the password that
+    command set; real tenants never appear here.
+    """
+
+    authentication_classes = []
+    permission_classes = [AllowPublic]
+
+    ROLE_ORDER = {"AD": 0, "PM": 1, "HR": 2, "SM": 3, "SE": 4, "AC": 5, "PU": 6, "ST": 7, "EM": 8, "CU": 9}
+
+    def get(self, request):
+        if not getattr(settings, "TEST_LOGIN_PICKER", False):
+            raise NotFound("Not available.")
+        from apps.core.models import Setting
+        from apps.core.tenancy import tenant_context
+
+        tenants = []
+        for client in Client.objects.filter(slug__endswith="-test").order_by("slug"):
+            with tenant_context(client.id, push_to_db=False):
+                flags = dict(
+                    Setting.objects.filter(
+                        client=client, key__in=["test_tenant", "test_tenant_password"]
+                    ).values_list("key", "value")
+                )
+                if not flags.get("test_tenant"):
+                    continue
+                users = (
+                    User.objects.filter(client=client, deleted_at__isnull=True, status="Active")
+                    .select_related("role", "employee__designation")
+                )
+                accounts = sorted(
+                    (
+                        {
+                            "email": u.email,
+                            "name": u.name,
+                            "role": u.role.name if u.role_id else "",
+                            "roleCode": u.role.code if u.role_id else "",
+                            "designation": (
+                                u.employee.designation.name
+                                if u.employee_id and u.employee.designation_id else ""
+                            ),
+                        }
+                        for u in users
+                    ),
+                    key=lambda a: (self.ROLE_ORDER.get(a["roleCode"], 50), a["email"]),
+                )
+            tenants.append(
+                {
+                    "slug": client.slug,
+                    "name": client.name,
+                    "password": flags.get("test_tenant_password"),
+                    "accounts": accounts,
+                }
+            )
+        return Response({"tenants": tenants})
+
+
 def _device_label(request):
     agent = request.META.get("HTTP_USER_AGENT", "")
     for needle, label in (
@@ -350,6 +411,71 @@ class ChangePasswordView(APIView):
             ip=request_ip(request),
         )
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+class ImpersonateCustomerView(APIView):
+    """Secure client impersonation for staff override mode (Dev Spec §2.1.2)."""
+
+    def post(self, request):
+        from apps.masters.models import Party
+        from apps.core.exceptions import PermissionDenied, NotFound
+
+        user = request.user
+        role_code = getattr(getattr(user, "role", None), "code", "")
+        if not (user.is_superuser or role_code in ("AD", "PM", "SA", "OM") or getattr(user, "is_staff", False)):
+            raise PermissionDenied("Only administrative staff can impersonate customer accounts.")
+
+        customer_id = request.data.get("customerId") or request.data.get("customer_id")
+        reason = request.data.get("reason", "Audited customer portal inspection")
+        if not customer_id:
+            raise ValidationFailed("customerId is required.")
+
+        party = Party.objects.filter(pk=customer_id, client_id=request.client_id, deleted_at__isnull=True).first()
+        if not party:
+            raise NotFound("Customer party not found.")
+
+        # Find or create a portal contact user for this customer party
+        portal_user = User.objects.filter(
+            client_id=request.client_id,
+            email=party.email,
+            deleted_at__isnull=True
+        ).first() if party.email else None
+
+        if not portal_user:
+            portal_user = User.objects.create(
+                client=request.user.client,
+                email=party.email or f"customer_{str(party.id)[:8]}@portal.local",
+                name=party.name,
+                phone=party.phone or "",
+                is_active=True,
+            )
+            portal_user.set_unusable_password()
+            portal_user.save()
+
+        # Audit log the impersonation
+        record_audit(
+            client=request.client_id,
+            actor=request.user,
+            action="impersonate_customer",
+            entity_type="Party",
+            entity_id=party.id,
+            entity_label=party.name,
+            description=f"Staff {request.user.email} initiated customer impersonation for '{party.name}'. Reason: {reason}",
+            ip=request_ip(request),
+        )
+
+        tokens = build_tokens(portal_user)
+        me_data = _me_payload(portal_user, request)
+        me_data["impersonating"] = {
+            "is_impersonating": True,
+            "party_id": str(party.id),
+            "party_name": party.name,
+            "staff_email": request.user.email,
+            "staff_name": request.user.name,
+            "reason": reason,
+        }
+
+        return Response({**tokens, **me_data})
 
 
 class ForgotPasswordView(APIView):

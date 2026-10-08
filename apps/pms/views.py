@@ -23,12 +23,17 @@ from apps.core.exceptions import (
 )
 from apps.core.numbering import allocate_number
 from apps.core.pagination import envelope
-from apps.core.permissions import HasModulePermission
+from apps.core.permissions import HasModulePermission, has_permission
 from apps.core.realtime import announce_project_change
 from apps.core.viewsets import TenantModelViewSet
 
 from . import chat, services
 from .chat_views import CHAT_PERMISSIONS, ProjectChatMixin
+
+#: Who runs projects: approves timesheets, manages defects.
+PMS_MANAGERS = ("create_pms_project", "assign_stage")
+from django.db.models import Count, Q, Sum
+from apps.core.money import round2, ZERO
 from .models import (
     CLOSED_STAGE_STATUSES,
     Approval,
@@ -41,6 +46,10 @@ from .models import (
     ProofShare,
     StageConfig,
     Task,
+    ProjectBug,
+    DelegatedTask,
+    Timesheet,
+    TimesheetEntry,
 )
 from .serializers import (
     ApplyTemplateSerializer,
@@ -72,6 +81,10 @@ from .serializers import (
     StagePercentagesSerializer,
     StageStatusSerializer,
     TaskSerializer,
+    ProjectBugSerializer,
+    DelegatedTaskSerializer,
+    TimesheetSerializer,
+    TimesheetEntrySerializer,
 )
 
 
@@ -399,23 +412,27 @@ def apply_stage_template(project, config_ids, *, stage_weights=None, user=None):
             else:
                 weight = Decimal(str(equal_pct))
 
-        created.append(
-            ProjectStage.objects.create(
-                client_id=project.client_id,
-                project=project,
-                stage_config=config,
-                name=config.name,
-                sequence=start_sequence + offset,
-                department=config.department,
-                planned_duration=config.default_duration,
-                duration_unit=config.duration_unit,
-                required_approval=config.required_approval,
-                required_document=config.required_document,
-                weight_pct=weight,
-                status="Not Started",
-                created_by=user if getattr(user, "is_authenticated", False) else None,
-            )
+        stage_assignee = services.resolve_stage_assignee(
+            project.client_id, config.name, config.department, project.project_manager
         )
+        stage_obj = ProjectStage.objects.create(
+            client_id=project.client_id,
+            project=project,
+            stage_config=config,
+            name=config.name,
+            sequence=start_sequence + offset,
+            department=config.department,
+            assigned_user=stage_assignee,
+            planned_duration=config.default_duration,
+            duration_unit=config.duration_unit,
+            required_approval=config.required_approval,
+            required_document=config.required_document,
+            weight_pct=weight,
+            status="Not Started",
+            created_by=user if getattr(user, "is_authenticated", False) else None,
+        )
+        created.append(stage_obj)
+        services.populate_default_stage_tasks(stage_obj, project.client_id, user=user)
 
     if project.current_stage_id is None and created:
         project.current_stage = created[0]
@@ -465,6 +482,8 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
         "customer_tracking": [("view_pms", "view_projects")],
         # Anyone who can see the project can take part in its proof review.
         "document_comments": ["view_pms"],
+        "stage_tasks": [("view_pms", "create_pms_project")],
+        "stage_task_detail": [("view_pms", "create_pms_project")],
         **CHAT_PERMISSIONS,
     }
     #: The UI uses ``code`` in URLs, so both a uuid and a code resolve.
@@ -787,6 +806,99 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
         ctx = _customer_tracking_context(project, request=request)
         return Response(CustomerProjectTrackingSerializer(project, context=ctx).data)
 
+    @action(detail=True, methods=["get"], url_path="profitability")
+    def profitability(self, request, pk=None):
+        """Live project profitability report (Dev Spec §2.6.3)."""
+        from apps.purchase.models import PurchaseBill, Expense
+        from apps.sales.models import SalesInvoice
+        from .models import TimesheetEntry
+
+        project = self.get_object()
+
+        # 1. Revenue
+        revenue = Decimal("0.00")
+        if project.sales_order and project.sales_order.total_amount:
+            revenue = project.sales_order.total_amount
+        else:
+            invoiced = SalesInvoice.objects.filter(
+                client_id=request.client_id,
+                sales_order=project.sales_order,
+                deleted_at__isnull=True
+            ).exclude(status="Cancelled").aggregate(tot=Sum("grand_total"))["tot"]
+            if invoiced:
+                revenue = invoiced
+
+        # 2. Direct Vendor Bills (Materials)
+        bills = list(PurchaseBill.objects.filter(
+            client_id=request.client_id,
+            project=project,
+            deleted_at__isnull=True
+        ).exclude(status="Cancelled").select_related("party"))
+        material_cost = sum([b.grand_total for b in bills if b.grand_total], Decimal("0.00"))
+
+        # 3. Direct Expenses (Cash / Travel / Subcontracting)
+        expenses = list(Expense.objects.filter(
+            client_id=request.client_id,
+            project=project,
+            deleted_at__isnull=True
+        ).exclude(status="Rejected").select_related("category"))
+        expense_cost = sum([e.amount for e in expenses if e.amount], Decimal("0.00"))
+
+        # 4. Labor Cost (Timesheets)
+        entries = TimesheetEntry.objects.filter(
+            client_id=request.client_id,
+            project=project,
+            deleted_at__isnull=True
+        ).select_related("user")
+        total_hours = Decimal("0.00")
+        labor_cost = Decimal("0.00")
+        for ent in entries:
+            hrs = ent.duration_hours or Decimal("0.00")
+            total_hours += hrs
+            hourly_rate = ent.hourly_rate or Decimal("500.00")
+            labor_cost += (hrs * hourly_rate)
+
+        total_costs = round2(material_cost + expense_cost + labor_cost)
+        gross_profit = round2(revenue - total_costs)
+        margin_pct = round(float(gross_profit) / float(revenue) * 100, 2) if revenue else 0.0
+
+        return Response({
+            "project_id": str(project.id),
+            "project_code": project.code,
+            "project_name": project.name,
+            "revenue": round2(revenue),
+            "material_cost": round2(material_cost),
+            "expense_cost": round2(expense_cost),
+            "labor_cost": round2(labor_cost),
+            "total_hours_logged": round2(total_hours),
+            "total_costs": total_costs,
+            "gross_profit": gross_profit,
+            "margin_pct": margin_pct,
+            "bills": [
+                {
+                    "id": b.id,
+                    "bill_number": b.bill_number,
+                    "vendor_name": b.party.name if b.party else None,
+                    "amount": float(b.grand_total or 0),
+                    "status": b.status,
+                    "date": b.bill_date,
+                }
+                for b in bills[:50]
+            ],
+            "expenses": [
+                {
+                    "id": e.id,
+                    "expense_number": e.expense_number,
+                    "category": e.category.name if e.category else None,
+                    "amount": float(e.amount or 0),
+                    "status": e.status,
+                    "date": e.date,
+                }
+                for e in expenses[:50]
+            ],
+        })
+
+
     # -- stages ------------------------------------------------------------
     def _get_stage(self, project, stage_id):
         stage = project.stages.filter(pk=stage_id, deleted_at__isnull=True).first()
@@ -1063,11 +1175,13 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
         serializer = HandoffSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
 
+        data = serializer.validated_data
         result = services.handoff_stage(
             stage,
             user=request.user,
-            force=serializer.validated_data["force"],
-            comments=serializer.validated_data.get("comments"),
+            force=data["force"],
+            comments=data.get("comments") or data.get("notes"),
+            recipient_id=data.get("recipientId") or None,
         )
         project.refresh_from_db()
         return Response(
@@ -1649,7 +1763,7 @@ def apply_document_decision(*, document, decision, comments=None, revision_reaso
 # ---------------------------------------------------------------------------
 class MyTasksView(APIView):
     permission_classes = [HasModulePermission]
-    required_permissions = ["view_pms"]
+    required_permissions = [("view_pms", "view_task")]
 
     def get(self, request):
         queryset = Task.objects.filter(
@@ -1969,11 +2083,26 @@ def check_customer_tracking_permission(user, project=None):
     - Other internal roles without view_pms or view_projects:
       - PermissionDenied('You do not have permission to view customer project tracking.', code='NO_TRACKING_PERMISSION').
     """
-    if getattr(user, "is_superuser", False):
-        return True
-
     role_code = getattr(getattr(user, "role", None), "code", "")
     role_name = str(getattr(getattr(user, "role", None), "name", "")).lower()
+
+    is_customer = (
+        getattr(user, "is_customer", False)
+        or role_code == "CU"
+        or "customer" in role_name
+    )
+    if is_customer:
+        if project is not None:
+            allowed_parties = user.get_customer_party_ids() if hasattr(user, "get_customer_party_ids") else set()
+            if not project.party_id or project.party_id not in allowed_parties:
+                raise PermissionDenied(
+                    "You do not have permission to view this customer project.",
+                    code="CUSTOMER_PROJECT_DENIED",
+                )
+        return True
+
+    if getattr(user, "is_superuser", False):
+        return True
 
     if role_code in ("AD", "PM") or "admin" in role_name or "project manager" in role_name:
         return True
@@ -1983,13 +2112,7 @@ def check_customer_tracking_permission(user, project=None):
     if "view_pms" in granted:
         return True
 
-    is_customer = (
-        getattr(user, "is_customer", False)
-        or role_code == "CU"
-        or "customer" in role_name
-        or "view_projects" in granted
-    )
-    if is_customer:
+    if "view_projects" in granted:
         if project is not None:
             allowed_parties = user.get_customer_party_ids() if hasattr(user, "get_customer_party_ids") else set()
             if not project.party_id or project.party_id not in allowed_parties:
@@ -2068,12 +2191,21 @@ class CustomerTrackingView(APIView):
         from apps.core.permissions import granted_permissions
         granted = granted_permissions(user)
 
+        is_customer = (
+            getattr(user, "is_customer", False)
+            or role_code == "CU"
+            or "customer" in role_name
+        )
+
         is_staff_manager = (
-            getattr(user, "is_superuser", False)
-            or role_code in ("AD", "PM")
-            or "admin" in role_name
-            or "project manager" in role_name
-            or "view_pms" in granted
+            not is_customer
+            and (
+                getattr(user, "is_superuser", False)
+                or role_code in ("AD", "PM")
+                or "admin" in role_name
+                or "project manager" in role_name
+                or "view_pms" in granted
+            )
         )
 
         qs = Project.objects.filter(client_id=client_id, deleted_at__isnull=True).select_related(
@@ -2085,3 +2217,374 @@ class CustomerTrackingView(APIView):
             qs = qs.filter(party_id__in=customer_party_ids)
 
         return Response(envelope(CustomerProjectTrackingListSerializer(qs, many=True).data))
+
+
+# ---------------------------------------------------------------------------
+# Cross-Project Calendar Schedule (Dev Spec §2.6.2)
+# ---------------------------------------------------------------------------
+class CrossProjectCalendarScheduleView(APIView):
+    """``GET /pms/calendar-schedule/`` -- all active project deadlines & tasks."""
+
+    permission_classes = [HasModulePermission]
+    required_permissions = ["view_pms"]
+
+    def get(self, request):
+        client_id = request.client_id
+        tasks = Task.objects.filter(
+            project__client_id=client_id,
+            deleted_at__isnull=True,
+            project__deleted_at__isnull=True,
+        ).select_related("project", "assigned_user", "stage")
+
+        stages = ProjectStage.objects.filter(
+            project__client_id=client_id,
+            deleted_at__isnull=True,
+            project__deleted_at__isnull=True,
+        ).select_related("project")
+
+        events = []
+        for t in tasks:
+            events.append({
+                "id": f"task-{t.id}",
+                "taskId": str(t.id),
+                "title": t.task_name,
+                "projectId": str(t.project_id),
+                "projectCode": t.project.code if t.project else "",
+                "projectName": t.project.name if t.project else "",
+                "start": t.start_date.isoformat() if t.start_date else None,
+                "end": t.due_date.isoformat() if t.due_date else None,
+                "type": "task",
+                "status": t.status,
+                "priority": t.priority,
+                "completionPct": t.completion_pct,
+                "assignedUser": t.assigned_user.name if t.assigned_user else None,
+            })
+
+        for s in stages:
+            events.append({
+                "id": f"stage-{s.id}",
+                "stageId": str(s.id),
+                "title": f"Stage: {s.name}",
+                "projectId": str(s.project_id),
+                "projectCode": s.project.code if s.project else "",
+                "projectName": s.project.name if s.project else "",
+                "start": s.actual_start_datetime.isoformat() if s.actual_start_datetime else (s.created_at.isoformat() if s.created_at else None),
+                "end": s.expected_completion_datetime.isoformat() if s.expected_completion_datetime else None,
+                "type": "stage",
+                "status": s.status,
+                "completionPct": s.completion_pct,
+            })
+
+        return Response({"events": events, "count": len(events)})
+
+
+# ---------------------------------------------------------------------------
+# Bugs & Defects (Dev Spec §2.6.1)
+# ---------------------------------------------------------------------------
+class ProjectBugViewSet(TenantModelViewSet):
+    queryset = ProjectBug.objects.select_related("project", "task", "assigned_to", "reported_by")
+    serializer_class = ProjectBugSerializer
+    audit_entity_type = "ProjectBug"
+    audit_label_field = "bug_number"
+    status_field = "status"
+    search_fields = ["bug_number", "title", "project__code", "project__product_name", "project__customer_name"]
+    ordering = ["-created_at"]
+    filter_map = {"projectId": "project_id", "severity": "severity", "status": "status", "assignedToId": "assigned_to_id"}
+    # Anyone on PMS reports a defect; managing them is a project manager's.
+    # (`manage_pms_tasks` was never a catalogue permission, so nobody could.)
+    permission_map = {"read": ["view_pms"], "create": ["view_pms"], "write": [PMS_MANAGERS]}
+
+    def perform_create(self, serializer):
+        serializer.validated_data["bug_number"] = allocate_number(self.request.user.client, "BUG")
+        serializer.validated_data["reported_by"] = self.request.user
+        return super().perform_create(serializer)
+
+
+# ---------------------------------------------------------------------------
+# Delegated Tasks (Dev Spec §2.6.1)
+# ---------------------------------------------------------------------------
+class DelegatedTaskViewSet(TenantModelViewSet):
+    queryset = DelegatedTask.objects.select_related("delegated_by", "assigned_to")
+    serializer_class = DelegatedTaskSerializer
+    audit_entity_type = "DelegatedTask"
+    audit_label_field = "task_number"
+    status_field = "status"
+    search_fields = ["task_number", "title", "description"]
+    ordering = ["-created_at"]
+    filter_map = {"status": "status", "priority": "priority"}
+    permission_map = {"read": ["view_pms"], "write": ["view_pms"]}
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        tab = self.request.query_params.get("tab")
+        if tab == "delegated_by_me":
+            qs = qs.filter(delegated_by=self.request.user)
+        elif tab == "assigned_to_me":
+            qs = qs.filter(assigned_to=self.request.user)
+        return qs
+
+    def perform_create(self, serializer):
+        serializer.validated_data["task_number"] = allocate_number(self.request.user.client, "DEL")
+        serializer.validated_data["delegated_by"] = self.request.user
+        return super().perform_create(serializer)
+
+    @action(detail=True, methods=["post"])
+    def accept(self, request, pk=None):
+        task = self.get_object()
+        task.status = "Accepted"
+        task.save(update_fields=["status", "updated_at"])
+        return Response(self.get_serializer(task).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        task = self.get_object()
+        task.status = "Rejected"
+        task.rejection_reason = request.data.get("reason", "")
+        task.save(update_fields=["status", "rejection_reason", "updated_at"])
+        return Response(self.get_serializer(task).data)
+
+    @action(detail=True, methods=["post"])
+    def complete(self, request, pk=None):
+        task = self.get_object()
+        task.status = "Completed"
+        task.completion_notes = request.data.get("notes", "")
+        task.completed_at = timezone.now()
+        task.save(update_fields=["status", "completion_notes", "completed_at", "updated_at"])
+        return Response(self.get_serializer(task).data)
+
+
+# ---------------------------------------------------------------------------
+# Timesheets & Timers (Dev Spec §2.6.2)
+# ---------------------------------------------------------------------------
+def is_pms_manager(user):
+    return has_permission(user, PMS_MANAGERS)
+
+
+def week_timesheet(user, day):
+    """The signed-in user's timesheet for the week of ``day`` (Mon-Sun), made
+    on first use. Hours can only be added while it is still open."""
+    employee_id = getattr(user, "employee_id", None)
+    if not employee_id:
+        raise ValidationFailed(
+            "Your login is not linked to an employee record, so hours cannot be logged. Ask HR to link it.",
+            code="NO_EMPLOYEE",
+        )
+    week_start = day - timedelta(days=day.weekday())
+    sheet = Timesheet.objects.filter(
+        client_id=user.client_id, employee_id=employee_id,
+        week_start=week_start, deleted_at__isnull=True,
+    ).first()
+    if sheet is None:
+        sheet = Timesheet.objects.create(
+            client_id=user.client_id,
+            employee_id=employee_id,
+            timesheet_number=allocate_number(user.client, "TSH"),
+            week_start=week_start,
+            week_end=week_start + timedelta(days=6),
+        )
+    elif sheet.status not in ("Draft", "Rejected"):
+        raise ValidationFailed(
+            f"Your timesheet for the week of {week_start:%d-%m-%Y} is already {sheet.status.lower()}.",
+            code="TIMESHEET_CLOSED",
+        )
+    return sheet
+
+
+def recount_timesheet(sheet):
+    if sheet is None:
+        return
+    sheet.total_hours = sheet.entries.filter(deleted_at__isnull=True).aggregate(
+        tot=Sum("duration_hours")
+    )["tot"] or Decimal("0.00")
+    sheet.save(update_fields=["total_hours", "updated_at"])
+
+
+class TimesheetViewSet(TenantModelViewSet):
+    queryset = Timesheet.objects.select_related("employee", "approved_by").prefetch_related("entries")
+    serializer_class = TimesheetSerializer
+    audit_entity_type = "Timesheet"
+    audit_label_field = "timesheet_number"
+    status_field = "status"
+    search_fields = ["timesheet_number", "employee__name"]
+    ordering = ["-week_start", "-created_at"]
+    filter_map = {"employeeId": "employee_id", "status": "status"}
+    # Your own week you keep and submit; approving is a project manager's.
+    # (`manage_pms_tasks` was never a catalogue permission, so nobody could
+    # log time at all.)
+    permission_map = {
+        "read": ["view_pms"],
+        "write": ["view_pms"],
+        "approve": [PMS_MANAGERS],
+        "reject": [PMS_MANAGERS],
+    }
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if is_pms_manager(self.request.user):
+            return qs
+        return qs.filter(employee_id=getattr(self.request.user, "employee_id", None))
+
+    def perform_create(self, serializer):
+        serializer.validated_data["timesheet_number"] = allocate_number(self.request.user.client, "TSH")
+        return super().perform_create(serializer)
+
+    @action(detail=True, methods=["post"])
+    def submit(self, request, pk=None):
+        ts = self.get_object()
+        ts.status = "Submitted"
+        # recalculate total hours from entries
+        total = ts.entries.filter(deleted_at__isnull=True).aggregate(tot=Sum("duration_hours"))["tot"] or Decimal("0.00")
+        ts.total_hours = total
+        ts.save(update_fields=["status", "total_hours", "updated_at"])
+        return Response(self.get_serializer(ts).data)
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        ts = self.get_object()
+        ts.status = "Approved"
+        ts.approved_by = request.user
+        ts.save(update_fields=["status", "approved_by", "updated_at"])
+        return Response(self.get_serializer(ts).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        ts = self.get_object()
+        ts.status = "Rejected"
+        ts.rejection_reason = request.data.get("reason", "")
+        ts.save(update_fields=["status", "rejection_reason", "updated_at"])
+        return Response(self.get_serializer(ts).data)
+
+
+class TimesheetEntryViewSet(TenantModelViewSet):
+    queryset = TimesheetEntry.objects.select_related("user", "project", "task", "timesheet")
+    serializer_class = TimesheetEntrySerializer
+    audit_entity_type = "TimesheetEntry"
+    status_field = None
+    ordering = ["-date", "-created_at"]
+    filter_map = {"projectId": "project_id", "taskId": "task_id", "timesheetId": "timesheet_id", "userId": "user_id"}
+    permission_map = {"read": ["view_pms"], "write": ["view_pms"]}
+
+    def get_queryset(self):
+        qs = super().get_queryset().select_related("timesheet")
+        if is_pms_manager(self.request.user):
+            return qs
+        return qs.filter(user=self.request.user)
+
+    def perform_create(self, serializer):
+        # Your own hours only: the user is never taken from the payload.
+        serializer.validated_data["user"] = self.request.user
+        return super().perform_create(serializer)
+
+    @action(detail=False, methods=["post"])
+    @transaction.atomic
+    def log(self, request):
+        """``POST /pms/timesheet-entries/log/`` -- log worked hours by hand.
+
+        ``{ projectId, taskId?, taskName?, hours, hourlyRate?, date, description? }``
+        The entry joins the caller's timesheet for that week.
+        """
+        from datetime import datetime as _dt
+
+        data = request.data
+        try:
+            hours = Decimal(str(data.get("hours")))
+        except Exception:
+            hours = Decimal("0")
+        if hours <= 0 or hours > 24:
+            raise ValidationFailed("Hours must be between 0 and 24.", field_errors={"hours": ["Between 0 and 24."]})
+        try:
+            day = _dt.strptime(str(data.get("date"))[:10], "%Y-%m-%d").date()
+        except ValueError:
+            raise ValidationFailed("Pick the work date.", field_errors={"date": ["Expected YYYY-MM-DD."]})
+        project_id = data.get("projectId")
+        if not project_id or not Project.objects.filter(
+            pk=project_id, client_id=request.client_id, deleted_at__isnull=True
+        ).exists():
+            raise ValidationFailed("Pick a project.", field_errors={"projectId": ["Required."]})
+        rate = data.get("hourlyRate")
+        try:
+            rate = Decimal(str(rate)) if rate not in (None, "") else None
+        except Exception:
+            raise ValidationFailed("Labour rate must be a number.", field_errors={"hourlyRate": ["Number."]})
+        task_name = (data.get("taskName") or "").strip()
+        summary = (data.get("description") or "").strip()
+
+        sheet = week_timesheet(request.user, day)
+        entry = TimesheetEntry.objects.create(
+            client_id=request.client_id,
+            timesheet=sheet,
+            user=request.user,
+            project_id=project_id,
+            task_id=data.get("taskId") or None,
+            date=day,
+            duration_hours=hours,
+            hourly_rate=rate,
+            is_billable=bool(data.get("isBillable", True)),
+            description=" - ".join(part for part in (task_name, summary) if part) or None,
+        )
+        recount_timesheet(sheet)
+        return Response(self.get_serializer(entry).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=False, methods=["post"], url_path="start-timer")
+    def start_timer(self, request):
+        """Starts a live timer for a task/project."""
+        # Stop any existing running timer for this user
+        now = timezone.now()
+        running = TimesheetEntry.objects.filter(
+            client_id=request.client_id,
+            user=request.user,
+            is_running=True,
+            deleted_at__isnull=True,
+        )
+        for r in running:
+            delta = now - r.start_time if r.start_time else timedelta(seconds=0)
+            hours = Decimal(str(round(delta.total_seconds() / 3600, 2)))
+            r.duration_hours = hours
+            r.end_time = now
+            r.is_running = False
+            r.save(update_fields=["duration_hours", "end_time", "is_running", "updated_at"])
+
+        entry = TimesheetEntry.objects.create(
+            client_id=request.client_id,
+            timesheet=week_timesheet(request.user, timezone.localdate()),
+            user=request.user,
+            project_id=request.data.get("projectId") or request.data.get("project_id"),
+            task_id=request.data.get("taskId") or request.data.get("task_id"),
+            date=timezone.localdate(),
+            start_time=now,
+            is_running=True,
+            is_billable=request.data.get("isBillable", True),
+            description=request.data.get("description", "Working..."),
+        )
+        return Response(self.get_serializer(entry).data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post"], url_path="stop-timer")
+    def stop_timer(self, request, pk=None):
+        """Stops the specified live timer and finalizes duration."""
+        entry = self.get_object()
+        if not entry.is_running:
+            return Response(self.get_serializer(entry).data)
+
+        now = timezone.now()
+        delta = now - entry.start_time if entry.start_time else timedelta(seconds=0)
+        hours = Decimal(str(round(delta.total_seconds() / 3600, 2)))
+        entry.duration_hours = max(Decimal("0.01"), hours)
+        entry.end_time = now
+        entry.is_running = False
+        entry.save(update_fields=["duration_hours", "end_time", "is_running", "updated_at"])
+        recount_timesheet(entry.timesheet)
+        return Response(self.get_serializer(entry).data)
+
+    @action(detail=False, methods=["get"], url_path="active-timer")
+    def active_timer(self, request):
+        """Retrieves currently running timer for the authenticated user."""
+        entry = TimesheetEntry.objects.filter(
+            client_id=request.client_id,
+            user=request.user,
+            is_running=True,
+            deleted_at__isnull=True,
+        ).first()
+        if not entry:
+            return Response({"active": False, "timer": None})
+        return Response({"active": True, "timer": self.get_serializer(entry).data})
+
