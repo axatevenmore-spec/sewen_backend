@@ -178,6 +178,8 @@ def assert_credit_limit(party, additional_amount, *, user=None, override=False):
 
     Checked against the derived balance plus open unbilled orders (db.md §4.1).
     """
+    if party is None:
+        return
     limit = party.credit_limit
     if limit is None or D(limit) <= ZERO:
         return

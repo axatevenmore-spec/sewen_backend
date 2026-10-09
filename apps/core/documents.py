@@ -21,8 +21,14 @@ class DocumentHeader(TenantModel, LegacyIdMixin):
     """db.md §3.1 -- the columns every sales/purchase document carries."""
 
     party = models.ForeignKey(
-        "masters.Party", on_delete=models.PROTECT, related_name="+"
+        "masters.Party", null=True, blank=True, on_delete=models.PROTECT, related_name="+"
     )
+    # -- one-time / any-party support ----------------------------------------
+    is_one_time_party = models.BooleanField(default=False)
+    party_type = models.TextField(null=True, blank=True)
+    party_phone = models.TextField(null=True, blank=True)
+    party_email = models.EmailField(null=True, blank=True)
+
     # -- frozen at post time -------------------------------------------------
     party_name = models.TextField(null=True, blank=True)
     party_gstin = models.TextField(null=True, blank=True)
@@ -91,15 +97,24 @@ class DocumentHeader(TenantModel, LegacyIdMixin):
         change a posted document.
         """
         party = party or self.party
-        if party is None:
-            return
-        self.party_name = party.name
-        self.party_gstin = party.gstin
-        self.place_of_supply = party.place_of_supply
-        if not self.billing_address:
-            self.billing_address = party.billing_address or {}
-        if not self.shipping_address:
-            self.shipping_address = party.shipping_address or self.billing_address or {}
+        if party is not None:
+            self.party_name = self.party_name or party.name
+            self.party_gstin = self.party_gstin or party.gstin
+            self.place_of_supply = self.place_of_supply or party.place_of_supply
+            if not self.party_phone:
+                self.party_phone = party.phone
+            if not self.party_email:
+                self.party_email = party.email
+            if not self.party_type:
+                self.party_type = party.type
+            if not self.billing_address:
+                self.billing_address = party.billing_address or {}
+            if not self.shipping_address:
+                self.shipping_address = party.shipping_address or self.billing_address or {}
+        else:
+            self.is_one_time_party = True
+            if not self.shipping_address and self.billing_address:
+                self.shipping_address = self.billing_address
 
 
 class DocumentLine(TenantModel):

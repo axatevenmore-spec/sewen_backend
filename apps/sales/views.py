@@ -476,7 +476,8 @@ def _clone_document(source, target_model, overrides, *, number_field, series,
     from apps.core.money import round2
 
     copied_fields = [
-        "client_id", "party_id", "party_name", "party_gstin", "billing_address",
+        "client_id", "party_id", "is_one_time_party", "party_type", "party_name",
+        "party_phone", "party_email", "party_gstin", "billing_address",
         "shipping_address", "place_of_supply", "notes", "terms",
         "freight_charges", "other_charges", "discount_override",
     ]

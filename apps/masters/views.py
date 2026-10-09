@@ -399,6 +399,43 @@ class ItemViewSet(TenantModelViewSet):
                 )
         return instance
 
+    @action(detail=False, methods=["post"], url_path="calculate-weight")
+    def calculate_weight(self, request):
+        from .metal_calc import calculate_sheet_weight, calculate_tube_weight
+
+        data = request.data
+        calc_type = str(data.get("type") or "sheet").lower()
+        pieces = data.get("pieces", 1)
+
+        if calc_type in ("sheet", "plate"):
+            result = calculate_sheet_weight(
+                length_mm=data.get("length_mm") or data.get("lengthMm") or data.get("sheet_length") or data.get("sheetLength"),
+                width_mm=data.get("width_mm") or data.get("widthMm") or data.get("sheet_width") or data.get("sheetWidth"),
+                thickness_mm=data.get("thickness_mm") or data.get("thicknessMm") or data.get("sheet_thickness") or data.get("sheetThickness"),
+                material_or_grade=data.get("material_or_grade") or data.get("metalGrade") or data.get("material") or "MS",
+                density=data.get("density"),
+                pieces=pieces,
+            )
+            return Response(result)
+        elif calc_type in ("tube", "pipe", "section"):
+            result = calculate_tube_weight(
+                profile=data.get("profile") or data.get("tubeProfile") or "Round",
+                wall_thickness_mm=data.get("wall_thickness_mm") or data.get("wallThicknessMm") or data.get("wall_thickness") or data.get("wallThickness"),
+                length_mm=data.get("length_mm") or data.get("lengthMm") or data.get("tube_length") or data.get("tubeLength"),
+                outer_diameter_mm=data.get("outer_diameter_mm") or data.get("outerDiameterMm") or data.get("outer_diameter") or data.get("outerDiameter"),
+                outer_width_mm=data.get("outer_width_mm") or data.get("outerWidthMm") or data.get("outer_width") or data.get("outerWidth"),
+                outer_height_mm=data.get("outer_height_mm") or data.get("outerHeightMm") or data.get("outer_height") or data.get("outerHeight"),
+                material_or_grade=data.get("material_or_grade") or data.get("metalGrade") or data.get("material") or "MS",
+                density=data.get("density"),
+                pieces=pieces,
+            )
+            return Response(result)
+        else:
+            return Response(
+                {"is_valid": False, "errors": [f"Unknown calculation type: {calc_type}. Must be 'sheet' or 'tube'."]},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
     def check_delete_allowed(self, item):
         """api.md §4.2 -- archiving is blocked if an open document references it."""
         from apps.purchase.models import PurchaseOrderLine

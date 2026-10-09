@@ -21,7 +21,8 @@ LINE_FIELDS = [
 
 #: Header fields every document exposes.
 HEADER_FIELDS = [
-    "id", "partyId", "partyName", "party_gstin", "billing_address",
+    "id", "partyId", "partyName", "isOneTimeParty", "partyType", "partyPhone", "partyEmail",
+    "party_gstin", "billing_address",
     "shipping_address", "place_of_supply", "date", "notes", "terms",
     "subtotal", "total_discount", "taxable_value", "cgst", "sgst", "igst", "cess",
     "total_tax", "freight_charges", "other_charges", "round_off", "total",
@@ -95,8 +96,14 @@ class DocumentSerializer(BaseModelSerializer):
     the same for every document.
     """
 
-    partyId = TenantPrimaryKeyRelatedField(source="party", model="masters.Party")
-    partyName = serializers.CharField(source="party_name", read_only=True)
+    partyId = TenantPrimaryKeyRelatedField(
+        source="party", model="masters.Party", required=False, allow_null=True
+    )
+    partyName = serializers.CharField(source="party_name", required=False, allow_blank=True, allow_null=True)
+    isOneTimeParty = serializers.BooleanField(source="is_one_time_party", required=False, default=False)
+    partyType = serializers.CharField(source="party_type", required=False, allow_blank=True, allow_null=True)
+    partyPhone = serializers.CharField(source="party_phone", required=False, allow_blank=True, allow_null=True)
+    partyEmail = serializers.EmailField(source="party_email", required=False, allow_blank=True, allow_null=True)
     date = serializers.DateField(source="doc_date")
     balance_due = serializers.SerializerMethodField()
     lineItems = serializers.ListField(
@@ -117,6 +124,39 @@ class DocumentSerializer(BaseModelSerializer):
     def get_balance_due(self, document):
         return document.balance_due
 
+    def to_internal_value(self, data):
+        data = dict(data)
+        if "billingAddress" in data and "billing_address" not in data:
+            data["billing_address"] = data["billingAddress"]
+        if "shippingAddress" in data and "shipping_address" not in data:
+            data["shipping_address"] = data["shippingAddress"]
+        if "placeOfSupply" in data and "place_of_supply" not in data:
+            data["place_of_supply"] = data["placeOfSupply"]
+        if "partyGstin" in data and "party_gstin" not in data:
+            data["party_gstin"] = data["partyGstin"]
+        return super().to_internal_value(data)
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        is_one_time = attrs.get("is_one_time_party", getattr(self.instance, "is_one_time_party", False))
+        party = attrs.get("party", getattr(self.instance, "party", None))
+        party_name = (attrs.get("party_name") or getattr(self.instance, "party_name", "") or "").strip()
+
+        if is_one_time:
+            if not party_name and not (party and party.name):
+                from .exceptions import ValidationFailed
+                raise ValidationFailed(
+                    "Party name is required for one-time parties.",
+                    field_errors={"partyName": ["Required."]},
+                )
+        elif not party and not party_name and self.instance is None:
+            from .exceptions import ValidationFailed
+            raise ValidationFailed(
+                "Either a registered customer or party name is required.",
+                field_errors={"partyId": ["Required."]},
+            )
+        return attrs
+
     def to_representation(self, instance):
         data = super().to_representation(instance)
         data.pop("lineItems", None)
@@ -126,6 +166,17 @@ class DocumentSerializer(BaseModelSerializer):
         serialized = self.line_serializer(lines, many=True, context=self.context).data
         self._attach_serials(instance, lines, serialized)
         data["lineItems"] = serialized
+
+        # Ensure compatibility aliases for frontend
+        data["partyName"] = instance.party_name or (instance.party.name if instance.party else "")
+        data["partyGstin"] = instance.party_gstin or (instance.party.gstin if instance.party else "")
+        data["isOneTimeParty"] = bool(instance.is_one_time_party)
+        data["partyType"] = instance.party_type or (instance.party.type if instance.party else "")
+        data["partyPhone"] = instance.party_phone or (instance.party.phone if instance.party else "")
+        data["partyEmail"] = instance.party_email or (instance.party.email if instance.party else "")
+        data["billingAddress"] = instance.billing_address or {}
+        data["shippingAddress"] = instance.shipping_address or {}
+        data["placeOfSupply"] = instance.place_of_supply or ""
         return data
 
     def _attach_serials(self, instance, lines, serialized):
