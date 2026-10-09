@@ -22,6 +22,7 @@ api_v1 = [
     path("admin/", include(admin_urlpatterns)),
     # Shared masters (api.md §4)
     path("parties/", include("apps.masters.urls")),
+    path("masters/", include("apps.inventory.urls")),
     path("inventory/", include("apps.inventory.urls")),
     # Documents (api.md §5, §6)
     path("sales/", include("apps.sales.urls")),

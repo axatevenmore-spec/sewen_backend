@@ -302,8 +302,13 @@ class Item(TenantModel, LegacyIdMixin):
     lifecycle_status = models.TextField(choices=LIFECYCLE, default="Active")
     custom_field_values = models.JSONField(default=dict, blank=True)
 
+    # Metal / Fabrication specs (Sheets & Tubes)
+    metal_grade = models.TextField(null=True, blank=True)
+
     # Sheet spec
     has_sheet_spec = models.BooleanField(default=False)
+    sheet_thickness = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    sheet_thickness_unit = models.TextField(default="mm", null=True, blank=True)
     sheet_height = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
     sheet_height_unit = models.TextField(choices=DIMENSION_UNITS, null=True, blank=True)
     sheet_width = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
@@ -313,7 +318,23 @@ class Item(TenantModel, LegacyIdMixin):
     sheet_weight_kg = models.DecimalField(
         max_digits=18, decimal_places=4, null=True, blank=True
     )
-    dimension_unit = models.TextField(null=True, blank=True)  # legacy single-axis unit
+
+    # Tube / Pipe spec
+    has_tube_spec = models.BooleanField(default=False)
+    tube_profile = models.TextField(
+        choices=[("Round", "Round"), ("Square", "Square"), ("Rectangular", "Rectangular")],
+        null=True,
+        blank=True,
+    )
+    outer_diameter = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    outer_width = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    outer_height = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    wall_thickness = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    tube_length = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    weight_per_meter = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    weight_per_piece = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+
+    dimension_unit = models.TextField(default="mm", null=True, blank=True)  # legacy single-axis unit
 
     class Meta:
         db_table = "items"

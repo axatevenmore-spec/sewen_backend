@@ -178,6 +178,8 @@ def assert_credit_limit(party, additional_amount, *, user=None, override=False):
 
     Checked against the derived balance plus open unbilled orders (db.md §4.1).
     """
+    if party is None:
+        return
     limit = party.credit_limit
     if limit is None or D(limit) <= ZERO:
         return
@@ -1186,6 +1188,11 @@ def allocate_payment_in(payment, allocations, *, user=None):
             raise BusinessRuleViolation(
                 "Cannot record payment against a draft invoice. Finalize it first.",
                 code=Codes.PAYMENT_ON_DRAFT,
+            )
+        if invoice.party_id != payment.party_id:
+            raise BusinessRuleViolation(
+                f"Cannot allocate payment from customer {payment.party_id} to invoice of customer {invoice.party_id}.",
+                code="CROSS_CUSTOMER_ALLOCATION_NOT_ALLOWED",
             )
 
         already = round2(allocated_to(payment.client_id, "SalesInvoice", invoice.id))

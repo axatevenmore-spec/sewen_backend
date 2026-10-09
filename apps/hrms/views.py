@@ -1189,7 +1189,13 @@ class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
         )
 
     def perform_create(self, serializer):
-        self.check_own_employee(serializer.validated_data.get("employee"))
+        employee = serializer.validated_data.get("employee")
+        if not employee:
+            resolved = self._resolve_employee(self.request)
+            if resolved:
+                serializer.validated_data["employee"] = resolved
+                employee = resolved
+        self.check_own_employee(employee)
         request_row = super().perform_create(serializer)
         services.assert_no_overlap(request_row)
         return request_row
@@ -2184,17 +2190,56 @@ class AssetCategoryViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = None
     ordering = ["name"]
-    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+    permission_map = {"read": [], "write": ["edit_staff"]}
 
 
-class AssetRequestViewSet(TenantModelViewSet):
+class AssetRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
     queryset = AssetRequest.objects.select_related("employee", "category", "fulfilled_asset")
     serializer_class = AssetRequestSerializer
     audit_entity_type = "AssetRequest"
     status_field = "status"
     ordering = ["-created_at"]
-    filter_map = {"employeeId": "employee_id"}
-    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+    filter_map = {"employeeId": "employee_id", "status": "status"}
+    team_scope_permissions = ("edit_staff", "view_staff")
+    permission_map = {"read": [], "create": [], "write": ["edit_staff"]}
+
+    def perform_create(self, serializer):
+        employee = serializer.validated_data.get("employee")
+        if not employee:
+            resolved = self._resolve_employee(self.request)
+            if resolved:
+                serializer.validated_data["employee"] = resolved
+                employee = resolved
+        self.check_own_employee(employee)
+        return super().perform_create(serializer)
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        approved = self.request.data.get("approved")
+        status = self.request.data.get("status")
+        instance = serializer.instance
+        if approved is True:
+            instance.status = "Approved"
+            instance.approver = self.request.user
+        elif approved is False:
+            instance.status = "Rejected"
+            instance.approver = self.request.user
+        elif status in ("Pending", "Approved", "Fulfilled", "Rejected"):
+            instance.status = status
+            if status in ("Approved", "Rejected", "Fulfilled"):
+                instance.approver = self.request.user
+
+        fulfilled_asset_id = self.request.data.get("fulfilledAssetId") or self.request.data.get("fulfilled_asset")
+        if fulfilled_asset_id:
+            from apps.hrms.models import Asset
+            asset = Asset.objects.filter(pk=fulfilled_asset_id, client_id=self.request.client_id).first()
+            if asset:
+                instance.fulfilled_asset = asset
+                instance.status = "Fulfilled"
+
+        instance.save()
+        self.write_audit("update_status", instance, description=f"Asset request marked {instance.status}")
+        return super().perform_update(serializer)
 
 
 class HrDocumentViewSet(TenantModelViewSet):

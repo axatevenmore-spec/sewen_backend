@@ -470,6 +470,8 @@ def recalculate_party_balance(client_id, party):
     from apps.masters.models import Party
 
     party_id = getattr(party, "id", party)
+    if not party_id:
+        return ZERO
     rows = JournalLine.objects.filter(
         client_id=client_id, party_id=party_id, deleted_at__isnull=True
     ).exclude(journal_entry__status="Reversed").aggregate(

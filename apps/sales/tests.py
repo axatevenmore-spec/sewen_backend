@@ -179,6 +179,171 @@ class WithBillWithoutBillPaymentTests(TestCase):
         receipt.refresh_from_db()
         self.assertEqual(receipt.status, "CANCELLED")
 
+    def test_case_a_cross_customer_allocation_rejected(self):
+        """Test Case A: Attempting to allocate payment from Customer 1 to Customer 2's invoice must be rejected."""
+        party2 = Party.objects.create(
+            client=self.client_obj,
+            code="CUST-002",
+            type="Customer",
+            name="Beta Ltd",
+            email="beta@example.com",
+        )
+        invoice2 = SalesInvoice.objects.create(
+            client=self.client_obj,
+            invoice_number="INV-TEST-002",
+            party=party2,
+            party_name="Beta Ltd",
+            doc_date=date.today(),
+            due_date=date.today(),
+            subtotal=Decimal("60000.00"),
+            taxable_value=Decimal("60000.00"),
+            total_tax=Decimal("0.00"),
+            total=Decimal("60000.00"),
+            amount_paid=Decimal("0.00"),
+            status="Unpaid",
+            posted_at=timezone.now(),
+        )
+        api_client = APIClient()
+        tokens = build_tokens(self.user)
+        api_client.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['access']}")
+
+        # Attempt to record payment for party 1 against party 2's invoice via API
+        resp = api_client.post(
+            "/api/v1/sales/payments/",
+            {
+                "partyId": str(self.party.id),
+                "invoiceId": str(invoice2.id),
+                "amount": "50000.00",
+                "paymentDate": str(date.today()),
+                "mode": "Cash",
+                "paymentType": "WITH_BILL",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+        # Also direct service call must raise BusinessRuleViolation
+        with self.assertRaises(Exception):
+            services.record_payment_in(
+                client=self.client_obj,
+                party=self.party,
+                amount=Decimal("50000.00"),
+                payment_date=date.today(),
+                mode="Cash",
+                payment_type="WITH_BILL",
+                allocations=[{"invoiceId": str(invoice2.id), "amount": "50000.00"}],
+                user=self.user,
+            )
+
+    def test_case_d_multiple_installments_lead_to_zero_outstanding(self):
+        """Test Case D: Multiple installments strictly in PaymentIn leading to zero outstanding and Paid status."""
+        inv = SalesInvoice.objects.create(
+            client=self.client_obj,
+            invoice_number="INV-INSTALLMENT-001",
+            party=self.party,
+            party_name="Acme Corp",
+            doc_date=date.today(),
+            due_date=date.today(),
+            subtotal=Decimal("100000.00"),
+            taxable_value=Decimal("100000.00"),
+            total_tax=Decimal("0.00"),
+            total=Decimal("100000.00"),
+            amount_paid=Decimal("0.00"),
+            status="Unpaid",
+            posted_at=timezone.now(),
+        )
+        # Payment 1: 25,000 -> Outstanding = 75,000, Partially Paid
+        pay1 = services.record_payment_in(
+            client=self.client_obj,
+            party=self.party,
+            amount=Decimal("25000.00"),
+            payment_date=date.today(),
+            mode="Cash",
+            payment_type="WITH_BILL",
+            invoice=inv,
+            user=self.user,
+        )
+        inv.refresh_from_db()
+        self.assertEqual(inv.status, "Partially Paid")
+        out1 = services.invoice_outstanding(inv)
+        self.assertEqual(out1["outstanding"], Decimal("75000.00"))
+
+        # Payment 2: 25,000 -> Outstanding = 50,000, Partially Paid
+        pay2 = services.record_payment_in(
+            client=self.client_obj,
+            party=self.party,
+            amount=Decimal("25000.00"),
+            payment_date=date.today(),
+            mode="Cash",
+            payment_type="WITH_BILL",
+            invoice=inv,
+            user=self.user,
+        )
+        inv.refresh_from_db()
+        self.assertEqual(inv.status, "Partially Paid")
+        out2 = services.invoice_outstanding(inv)
+        self.assertEqual(out2["outstanding"], Decimal("50000.00"))
+
+        # Payment 3: 50,000 -> Outstanding = 0.00, Paid
+        pay3 = services.record_payment_in(
+            client=self.client_obj,
+            party=self.party,
+            amount=Decimal("50000.00"),
+            payment_date=date.today(),
+            mode="Cash",
+            payment_type="WITH_BILL",
+            invoice=inv,
+            user=self.user,
+        )
+        inv.refresh_from_db()
+        self.assertEqual(inv.status, "Paid")
+        out3 = services.invoice_outstanding(inv)
+        self.assertEqual(out3["outstanding"], Decimal("0.00"))
+
+        # Verify 3 distinct PaymentIn records exist and total collected = 100,000
+        payments = PaymentIn.objects.filter(invoice=inv)
+        self.assertEqual(payments.count(), 3)
+        total_collected = sum(p.amount for p in payments)
+        self.assertEqual(total_collected, Decimal("100000.00"))
+
+    def test_case_e_excess_payment_saved_as_advance(self):
+        """Test Case E: Excess payment: invoice balance paid to zero, unallocated remainder saved as customer advance."""
+        inv = SalesInvoice.objects.create(
+            client=self.client_obj,
+            invoice_number="INV-ADVANCE-001",
+            party=self.party,
+            party_name="Acme Corp",
+            doc_date=date.today(),
+            due_date=date.today(),
+            subtotal=Decimal("40000.00"),
+            taxable_value=Decimal("40000.00"),
+            total_tax=Decimal("0.00"),
+            total=Decimal("40000.00"),
+            amount_paid=Decimal("0.00"),
+            status="Unpaid",
+            posted_at=timezone.now(),
+        )
+        # Customer pays 50,000, allocated 40,000 to invoice
+        payment = services.record_payment_in(
+            client=self.client_obj,
+            party=self.party,
+            amount=Decimal("50000.00"),
+            payment_date=date.today(),
+            mode="Cash",
+            payment_type="WITH_BILL",
+            allocations=[{"invoiceId": str(inv.id), "amount": "40000.00"}],
+            user=self.user,
+        )
+        inv.refresh_from_db()
+        self.assertEqual(inv.status, "Paid")
+        self.assertEqual(inv.amount_paid, Decimal("40000.00"))
+        out = services.invoice_outstanding(inv)
+        self.assertEqual(out["outstanding"], Decimal("0.00"))
+
+        payment.refresh_from_db()
+        self.assertEqual(payment.allocated_amount, Decimal("40000.00"))
+        self.assertEqual(payment.unallocated_amount, Decimal("10000.00"))
+
 
 class SalesInvoiceCashAllocationTests(TestCase):
     def setUp(self):

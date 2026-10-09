@@ -532,7 +532,9 @@ class BulkAttendanceSerializer(BaseSerializer):
 
 
 class RegularizationSerializer(BaseModelSerializer):
-    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeId = TenantPrimaryKeyRelatedField(
+        source="employee", model="hrms.Employee", required=False, allow_null=True
+    )
     employeeName = serializers.CharField(source="employee.name", read_only=True)
     date = serializers.DateField(source="work_date")
     requestedCheckIn = serializers.DateTimeField(
@@ -554,6 +556,36 @@ class RegularizationSerializer(BaseModelSerializer):
         ]
         read_only_fields = ["status", "approver", "decided_at", "created_at"]
 
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        work_date = data.get("date") or data.get("work_date")
+        if work_date:
+            for time_field in ("requestedCheckIn", "requested_check_in"):
+                val = data.get(time_field)
+                if val and isinstance(val, str) and len(val) <= 8 and ":" in val:
+                    data[time_field] = f"{work_date}T{val}:00" if len(val) == 5 else f"{work_date}T{val}"
+            for time_field in ("requestedCheckOut", "requested_check_out"):
+                val = data.get(time_field)
+                if val and isinstance(val, str) and len(val) <= 8 and ":" in val:
+                    data[time_field] = f"{work_date}T{val}:00" if len(val) == 5 else f"{work_date}T{val}"
+
+        emp_id = data.get("employeeId") or data.get("employee_id")
+        if emp_id and isinstance(emp_id, str):
+            import uuid
+            try:
+                uuid.UUID(emp_id)
+            except ValueError:
+                from apps.hrms.models import Employee
+                request = self.context.get("request")
+                client_id = getattr(request, "client_id", None) or (request.user.client_id if request and hasattr(request, "user") else None)
+                if client_id:
+                    emp = Employee.objects.filter(
+                        employee_code=emp_id, client_id=client_id, deleted_at__isnull=True
+                    ).first()
+                    if emp:
+                        data["employeeId"] = str(emp.id)
+        return super().to_internal_value(data)
+
 
 # ---------------------------------------------------------------------------
 # Leave (api.md §11.3)
@@ -569,7 +601,9 @@ class LeaveTypeSerializer(BaseModelSerializer):
 
 
 class LeaveRequestSerializer(BaseModelSerializer):
-    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeId = TenantPrimaryKeyRelatedField(
+        source="employee", model="hrms.Employee", required=False, allow_null=True
+    )
     employeeName = serializers.CharField(source="employee.name", read_only=True)
     employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
     type = serializers.CharField(source="leave_type.name", read_only=True)
@@ -1085,18 +1119,26 @@ class AssetSerializer(BaseModelSerializer):
 
 
 class AssetRequestSerializer(BaseModelSerializer):
-    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeId = TenantPrimaryKeyRelatedField(
+        source="employee", model="hrms.Employee", required=False, allow_null=True
+    )
     employeeName = serializers.CharField(source="employee.name", read_only=True)
     categoryId = TenantPrimaryKeyRelatedField(
         source="category", model="hrms.AssetCategory", required=False, allow_null=True
     )
+    categoryName = serializers.CharField(source="category.name", read_only=True)
+    fulfilledAssetId = TenantPrimaryKeyRelatedField(
+        source="fulfilled_asset", model="hrms.Asset", required=False, allow_null=True
+    )
+    fulfilledAssetName = serializers.CharField(source="fulfilled_asset.name", read_only=True)
 
     class Meta:
         model = AssetRequest
         fields = [
-            "id", "employeeId", "employeeName", "categoryId", "justification",
-            "status", "approver", "fulfilled_asset", "created_at",
+            "id", "employeeId", "employeeName", "categoryId", "categoryName", "justification",
+            "status", "approver", "fulfilled_asset", "fulfilledAssetId", "fulfilledAssetName", "created_at",
         ]
+        read_only_fields = ["status", "approver", "fulfilled_asset", "created_at"]
 
 
 class HrDocumentSerializer(BaseModelSerializer):
