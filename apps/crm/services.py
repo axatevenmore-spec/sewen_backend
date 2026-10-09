@@ -57,6 +57,8 @@ def team_roster(client_id):
     Each person also carries ``isProjectManager`` (system role code ``PM``),
     which the PMS "Project Manager" dropdowns filter on. Users whose system
     role is ``PM`` always appear, even with empty ``crm_roles``.
+    All active internal staff members appear under their assigned CRM roles or
+    their system role/designation if ``crm_roles`` is empty.
     """
     from apps.accounts.models import User
 
@@ -65,31 +67,43 @@ def team_roster(client_id):
         User.objects.filter(
             client_id=client_id, deleted_at__isnull=True, status="Active"
         )
-        .select_related("role")
-        .only(
-            "id",
-            "name",
-            "email",
-            "department",
-            "crm_roles",
-            "role",
-            "role__code",
-        )
+        .exclude(role__code="CU")
+        .exclude(party__isnull=False)
+        .select_related("role", "employee__designation", "employee__department")
     )
 
     for user in users:
         role_code = user.role.code if user.role_id and user.role else None
+        designation = (
+            user.employee.designation.name
+            if (user.employee_id and user.employee and user.employee.designation)
+            else (user.role.name if user.role else "")
+        )
+        department = (
+            user.employee.department.name
+            if (user.employee_id and user.employee and user.employee.department)
+            else (user.department or "")
+        )
         person = {
             "id": str(user.id),
             "name": user.name,
             "email": user.email,
-            "department": user.department,
+            "department": department,
+            "designation": designation,
             "isProjectManager": role_code == "PM",
         }
-        for role in user.crm_roles or []:
+
+        assigned_roles = list(user.crm_roles or [])
+        if role_code == "PM" and "Project Manager" not in assigned_roles:
+            assigned_roles.append("Project Manager")
+
+        if not assigned_roles:
+            fallback_role = user.role.name if user.role else (designation or "Staff")
+            assigned_roles.append(fallback_role)
+
+        for role in assigned_roles:
             roster.setdefault(role, []).append(dict(person))
-        if role_code == "PM" and "Project Manager" not in (user.crm_roles or []):
-            roster.setdefault("Project Manager", []).append(dict(person))
+
     return roster
 
 
