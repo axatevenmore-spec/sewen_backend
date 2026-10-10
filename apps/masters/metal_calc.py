@@ -270,3 +270,268 @@ def calculate_tube_weight(
         "weight_per_piece": round4(weight_per_piece) if weight_per_piece is not None else None,
         "total_weight": round4(total_weight) if total_weight is not None else None,
     }
+
+
+def calculate_flat_weight(
+    width_mm,
+    thickness_mm,
+    length_mm=None,
+    material_or_grade="MS",
+    density=None,
+    pieces=1,
+):
+    """
+    Calculates flat bar theoretical weight:
+    Area (mm²) = Width * Thickness
+    Weight per meter (kg/m) = Area * Density / 1000
+    Weight per piece (kg) = Weight per meter * (Length_mm / 1000)
+    """
+    errors = []
+    try:
+        w = Decimal(str(width_mm)) if width_mm is not None else None
+        if w is None or w <= Decimal("0"):
+            errors.append("Width must be greater than 0 mm.")
+    except Exception:
+        errors.append("Invalid width value.")
+        w = None
+
+    try:
+        t = Decimal(str(thickness_mm)) if thickness_mm is not None else None
+        if t is None or t <= Decimal("0"):
+            errors.append("Thickness must be greater than 0 mm.")
+    except Exception:
+        errors.append("Invalid thickness value.")
+        t = None
+
+    try:
+        length = Decimal(str(length_mm)) if length_mm is not None else None
+        if length is not None and length <= Decimal("0"):
+            errors.append("Length must be greater than 0 mm.")
+    except Exception:
+        errors.append("Invalid length value.")
+        length = None
+
+    if errors:
+        return {"is_valid": False, "errors": errors, "weight_per_meter": None, "weight_per_piece": None}
+
+    rho = resolve_density(material_or_grade, density)
+    area_mm2 = w * t
+    weight_per_meter = (area_mm2 * rho) / Decimal("1000")
+
+    weight_per_piece = None
+    if length is not None:
+        weight_per_piece = weight_per_meter * (length / Decimal("1000"))
+
+    return {
+        "is_valid": True,
+        "errors": [],
+        "density": rho,
+        "area_mm2": round4(area_mm2),
+        "weight_per_meter": round4(weight_per_meter),
+        "weight_per_piece": round4(weight_per_piece) if weight_per_piece is not None else None,
+    }
+
+
+def calculate_channel_beam_weight(
+    flange_width_mm,
+    web_height_mm,
+    web_thickness_mm,
+    flange_thickness_mm,
+    length_mm=None,
+    material_or_grade="MS",
+    density=None,
+    pieces=1,
+):
+    """
+    Calculates Channel / Beam theoretical weight:
+    Area (mm²) = 2 * (Flange Width * Flange Thickness) + (Web Height - 2 * Flange Thickness) * Web Thickness
+    Weight per meter (kg/m) = Area * Density / 1000
+    Weight per piece (kg) = Weight per meter * (Length_mm / 1000)
+    """
+    errors = []
+    try:
+        bf = Decimal(str(flange_width_mm)) if flange_width_mm is not None else None
+        if bf is None or bf <= Decimal("0"):
+            errors.append("Flange width must be greater than 0 mm.")
+    except Exception:
+        errors.append("Invalid flange width.")
+        bf = None
+
+    try:
+        hw = Decimal(str(web_height_mm)) if web_height_mm is not None else None
+        if hw is None or hw <= Decimal("0"):
+            errors.append("Web height must be greater than 0 mm.")
+    except Exception:
+        errors.append("Invalid web height.")
+        hw = None
+
+    try:
+        tw = Decimal(str(web_thickness_mm)) if web_thickness_mm is not None else None
+        if tw is None or tw <= Decimal("0"):
+            errors.append("Web thickness must be greater than 0 mm.")
+    except Exception:
+        errors.append("Invalid web thickness.")
+        tw = None
+
+    try:
+        tf = Decimal(str(flange_thickness_mm)) if flange_thickness_mm is not None else None
+        if tf is None or tf <= Decimal("0"):
+            errors.append("Flange thickness must be greater than 0 mm.")
+        elif hw is not None and (Decimal("2") * tf >= hw):
+            errors.append("2x flange thickness cannot exceed or equal web height.")
+    except Exception:
+        errors.append("Invalid flange thickness.")
+        tf = None
+
+    try:
+        length = Decimal(str(length_mm)) if length_mm is not None else None
+        if length is not None and length <= Decimal("0"):
+            errors.append("Length must be greater than 0 mm.")
+    except Exception:
+        errors.append("Invalid length value.")
+        length = None
+
+    if errors:
+        return {"is_valid": False, "errors": errors, "weight_per_meter": None, "weight_per_piece": None}
+
+    rho = resolve_density(material_or_grade, density)
+    area_mm2 = (Decimal("2") * bf * tf) + ((hw - (Decimal("2") * tf)) * tw)
+    weight_per_meter = (area_mm2 * rho) / Decimal("1000")
+
+    weight_per_piece = None
+    if length is not None:
+        weight_per_piece = weight_per_meter * (length / Decimal("1000"))
+
+    return {
+        "is_valid": True,
+        "errors": [],
+        "density": rho,
+        "area_mm2": round4(area_mm2),
+        "weight_per_meter": round4(weight_per_meter),
+        "weight_per_piece": round4(weight_per_piece) if weight_per_piece is not None else None,
+    }
+
+
+
+def calculate_rod_weight(
+    diameter_mm,
+    length_mm=None,
+    material_or_grade="MS",
+    density=None,
+    pieces=1,
+):
+    """
+    Calculates round rod / bar theoretical weight:
+    Area (mm²) = π * (Diameter / 2)²
+    Weight per meter (kg/m) = Area * Density / 1000
+    Weight per piece (kg) = Weight per meter * (Length_mm / 1000)
+    """
+    errors = []
+    try:
+        dia = Decimal(str(diameter_mm)) if diameter_mm is not None else None
+        if dia is None or dia <= Decimal("0"):
+            errors.append("Diameter must be greater than 0 mm.")
+    except Exception:
+        errors.append("Invalid diameter value.")
+        dia = None
+
+    try:
+        length = Decimal(str(length_mm)) if length_mm is not None else None
+        if length is not None and length <= Decimal("0"):
+            errors.append("Length must be greater than 0 mm.")
+    except Exception:
+        errors.append("Invalid length value.")
+        length = None
+
+    if errors:
+        return {"is_valid": False, "errors": errors, "weight_per_meter": None, "weight_per_piece": None}
+
+    rho = resolve_density(material_or_grade, density)
+    pi = Decimal(str(math.pi))
+    radius = dia / Decimal("2")
+    area_mm2 = pi * (radius ** Decimal("2"))
+    weight_per_meter = (area_mm2 * rho) / Decimal("1000")
+
+    weight_per_piece = None
+    if length is not None:
+        weight_per_piece = weight_per_meter * (length / Decimal("1000"))
+
+    return {
+        "is_valid": True,
+        "errors": [],
+        "density": rho,
+        "area_mm2": round4(area_mm2),
+        "weight_per_meter": round4(weight_per_meter),
+        "weight_per_piece": round4(weight_per_piece) if weight_per_piece is not None else None,
+    }
+
+
+def calculate_angle_weight(
+    leg_a_mm,
+    leg_b_mm,
+    thickness_mm,
+    length_mm=None,
+    material_or_grade="MS",
+    density=None,
+    pieces=1,
+):
+    """
+    Calculates L-angle theoretical weight:
+    Area (mm²) = (Leg_A + Leg_B - Thickness) * Thickness
+    Weight per meter (kg/m) = Area * Density / 1000
+    Weight per piece (kg) = Weight per meter * (Length_mm / 1000)
+    """
+    errors = []
+    try:
+        la = Decimal(str(leg_a_mm)) if leg_a_mm is not None else None
+        if la is None or la <= Decimal("0"):
+            errors.append("Leg A must be greater than 0 mm.")
+    except Exception:
+        errors.append("Invalid Leg A value.")
+        la = None
+
+    try:
+        lb = Decimal(str(leg_b_mm)) if leg_b_mm is not None else la
+        if lb is None or lb <= Decimal("0"):
+            errors.append("Leg B must be greater than 0 mm.")
+    except Exception:
+        errors.append("Invalid Leg B value.")
+        lb = None
+
+    try:
+        t = Decimal(str(thickness_mm)) if thickness_mm is not None else None
+        if t is None or t <= Decimal("0"):
+            errors.append("Thickness must be greater than 0 mm.")
+        elif la is not None and lb is not None and (t >= la or t >= lb):
+            errors.append("Thickness cannot be >= leg dimensions.")
+    except Exception:
+        errors.append("Invalid thickness value.")
+        t = None
+
+    try:
+        length = Decimal(str(length_mm)) if length_mm is not None else None
+        if length is not None and length <= Decimal("0"):
+            errors.append("Length must be greater than 0 mm.")
+    except Exception:
+        errors.append("Invalid length value.")
+        length = None
+
+    if errors:
+        return {"is_valid": False, "errors": errors, "weight_per_meter": None, "weight_per_piece": None}
+
+    rho = resolve_density(material_or_grade, density)
+    area_mm2 = (la + lb - t) * t
+    weight_per_meter = (area_mm2 * rho) / Decimal("1000")
+
+    weight_per_piece = None
+    if length is not None:
+        weight_per_piece = weight_per_meter * (length / Decimal("1000"))
+
+    return {
+        "is_valid": True,
+        "errors": [],
+        "density": rho,
+        "area_mm2": round4(area_mm2),
+        "weight_per_meter": round4(weight_per_meter),
+        "weight_per_piece": round4(weight_per_piece) if weight_per_piece is not None else None,
+    }

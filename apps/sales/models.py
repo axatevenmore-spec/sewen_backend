@@ -447,6 +447,9 @@ class DeliveryChallan(DocumentHeader):
     quotation = models.ForeignKey(
         Quotation, null=True, blank=True, on_delete=models.SET_NULL, related_name="challans"
     )
+    crm_lead = models.ForeignKey(
+        "crm.Lead", null=True, blank=True, on_delete=models.SET_NULL, related_name="challans"
+    )
     dispatch_date = models.DateField(null=True, blank=True)
     vehicle_number = models.TextField(null=True, blank=True)
     transporter = models.TextField(null=True, blank=True)

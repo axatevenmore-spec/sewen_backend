@@ -322,7 +322,7 @@ def create_project_from_order(order, *, project_manager_id=None, priority="Mediu
 
     project = Project.objects.create(
         client_id=order.client_id,
-        code=allocate_number(order.client, "PRJ"),
+        code=allocate_number(order.client, "PRJ", unique_in=(Project, "code")),
         sales_order=order,
         party=order.party,
         customer_name=order.party_name or order.party.name,
@@ -617,7 +617,7 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
 
     def perform_create(self, serializer):
         serializer.validated_data["code"] = allocate_number(
-            self.request.user.client, "PRJ"
+            self.request.user.client, "PRJ", unique_in=(Project, "code")
         )
         return super().perform_create(serializer)
 

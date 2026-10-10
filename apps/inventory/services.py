@@ -18,7 +18,7 @@ from django.db.models import DecimalField, F, Q, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
-from apps.core.exceptions import BusinessRuleViolation, Codes, ValidationFailed
+from apps.core.exceptions import BusinessRuleViolation, Codes, Conflict, ValidationFailed
 from apps.core.money import ZERO, D, round2, round4
 
 from .models import REVERSAL_OF, StockBalance, StockMovement
@@ -44,6 +44,7 @@ def post_movement(
     type,
     quantity,
     weighed_qty=None,
+    uom=None,
     unit_cost=None,
     reference_type=None,
     reference_id=None,
@@ -55,6 +56,8 @@ def post_movement(
     notes=None,
     user=None,
     original_movement=None,
+    prevent_duplicate=False,
+    allow_negative=False,
 ):
     """Append one movement and update the balance in the same transaction.
 
@@ -79,9 +82,9 @@ def post_movement(
             field_errors={"locationId": ["Required."]},
         )
 
-    # api.md §7.2 -- orphan movements are only allowed for ADJUSTMENT, and only
-    # with a reason. The database enforces it too; this is the friendly half.
-    if reference_id is None and type != "ADJUSTMENT":
+    # api.md §7.2 -- orphan movements are only allowed for ADJUSTMENT and OPENING_STOCK.
+    # The database enforces it too; this is the friendly half.
+    if reference_id is None and type not in ("ADJUSTMENT", "OPENING_STOCK"):
         raise ValidationFailed(
             "Every stock movement must reference a document.",
             field_errors={"referenceId": ["Required for this movement type."]},
@@ -92,6 +95,29 @@ def post_movement(
             field_errors={"reason": ["Required for a manual adjustment."]},
         )
 
+    # Guard against duplicate posting of the same source document/reference
+    if prevent_duplicate and reference_type and reference_id:
+        existing = StockMovement.objects.filter(
+            client_id=client_id,
+            reference_type=reference_type,
+            reference_id=reference_id,
+            item_id=item_id,
+            type=type,
+            reversal_movement__isnull=True,
+        )
+        if existing.exists():
+            raise Conflict(
+                f"Stock movement of type {type} for {reference_type} {reference_number or reference_id} has already been posted.",
+                code=Codes.ALREADY_POSTED,
+            )
+
+    # Resolve unit of measure (uom)
+    if uom is None:
+        uom = getattr(item, "uom", None)
+        if uom is None:
+            from apps.masters.models import Item
+            uom = Item.objects.filter(pk=item_id).values_list("uom", flat=True).first()
+
     movement = StockMovement.objects.create(
         client_id=client_id,
         item_id=item_id,
@@ -99,6 +125,7 @@ def post_movement(
         type=type,
         quantity=quantity,
         weighed_qty=round4(weighed_qty) if weighed_qty is not None else None,
+        uom=uom,
         unit_cost=round4(unit_cost) if unit_cost is not None else None,
         reference_type=reference_type,
         reference_id=reference_id,
@@ -119,11 +146,13 @@ def post_movement(
             reversal_movement=movement
         )
 
-    _apply_to_balance(movement)
+    # Reversals are allowed negative if necessary to unwind transactions
+    effective_allow_negative = allow_negative or (original_movement is not None)
+    _apply_to_balance(movement, allow_negative=effective_allow_negative)
     return movement
 
 
-def _apply_to_balance(movement):
+def _apply_to_balance(movement, allow_negative=False):
     """Keep ``stock_balances`` in step with the ledger, in the same transaction.
 
     db.md §7.2 offers a matview or a trigger-maintained table; this is the
@@ -138,12 +167,23 @@ def _apply_to_balance(movement):
 
     effective = movement.effective_quantity
 
-    if movement.type == "FAULTY":
-        # db.md §7.2 -- FAULTY quantity is excluded from on_hand and counted
-        # separately as `damaged`.
+    if movement.type in ("FAULTY", "SCRAP"):
+        # Damaged / scrap quantity is counted separately as damaged
         balance.damaged = (balance.damaged or ZERO) + abs(effective)
-    else:
-        balance.on_hand = (balance.on_hand or ZERO) + effective
+
+    new_on_hand = (balance.on_hand or ZERO) + effective
+    if not allow_negative and new_on_hand < ZERO:
+        raise BusinessRuleViolation(
+            f"Stock balance cannot become negative for item {movement.item_id}. "
+            f"Requested change {effective}, current {balance.on_hand or ZERO}, resulting {new_on_hand}.",
+            code=Codes.INSUFFICIENT_STOCK,
+            payload={
+                "itemId": str(movement.item_id),
+                "currentOnHand": str(balance.on_hand or ZERO),
+                "resultingOnHand": str(new_on_hand),
+            },
+        )
+    balance.on_hand = new_on_hand
 
     if effective > ZERO and movement.unit_cost is not None:
         balance.inward_qty = (balance.inward_qty or ZERO) + effective
@@ -204,7 +244,36 @@ def _reversal_type_for(movement_type):
             return reversal
     if movement_type == "PURCHASE_RETURN":
         return "PURCHASE"
+    if movement_type == "TRANSFER_OUT":
+        return "TRANSFER_IN"
+    if movement_type == "TRANSFER_IN":
+        return "TRANSFER_OUT"
+    if movement_type in ("ADJUSTMENT", "OPENING_STOCK"):
+        return "ADJUSTMENT"
+    if movement_type in ("ZONE_ISSUE", "MATERIAL_ISSUE", "SERVICE_USAGE"):
+        return "ADJUSTMENT"
+    if movement_type in ("FAULTY", "SCRAP"):
+        return "ADJUSTMENT"
     return None
+
+
+def has_document_posted_stock(client_id, reference_type, reference_id):
+    """Check whether a non-reversed movement already exists for this document."""
+    return StockMovement.objects.filter(
+        client_id=client_id,
+        reference_type=reference_type,
+        reference_id=reference_id,
+        reversal_movement__isnull=True,
+    ).exists()
+
+
+def assert_not_already_posted(client_id, reference_type, reference_id):
+    """Raise Conflict if stock movements already exist for this document."""
+    if has_document_posted_stock(client_id, reference_type, reference_id):
+        raise Conflict(
+            f"Stock has already been posted for {reference_type} {reference_id}.",
+            code=Codes.ALREADY_POSTED,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -275,7 +344,12 @@ def stock_status(available, reorder_level):
 
 
 def calculate_item_stock(client_id, item, location_id=None):
-    """``{ onHand, reserved, damaged, available, status }`` for one item."""
+    """``{ onHand, reserved, damaged, available, status, openingStock, totalInward, totalOutward }``.
+
+    Reference formula:
+    Available Stock = Opening Stock + Posted Inward - Posted Outward - Reserved Stock.
+    Opening stock is tracked distinctly from general inward so it is never counted twice.
+    """
     item_id = getattr(item, "id", item)
     reorder_level = getattr(item, "reorder_level", None)
     if reorder_level is None:
@@ -287,9 +361,55 @@ def calculate_item_stock(client_id, item, location_id=None):
         )
 
     balance = balances_for(client_id, [item_id], location_id).get(item_id, {})
-    on_hand = balance.get("on_hand", ZERO) or ZERO
     damaged = balance.get("damaged", ZERO) or ZERO
     reserved = reserved_quantity(client_id, [item_id]).get(item_id, ZERO) or ZERO
+
+    # Calculate from append-only movement ledger
+    mv_qs = StockMovement.objects.filter(
+        client_id=client_id,
+        item_id=item_id,
+        deleted_at__isnull=True,
+    )
+    if location_id:
+        mv_qs = mv_qs.filter(location_id=location_id)
+
+    agg = mv_qs.aggregate(
+        opening=Coalesce(
+            Sum(
+                "quantity",
+                filter=Q(type="OPENING_STOCK") | (Q(type="ADJUSTMENT") & Q(notes__icontains="opening"))
+            ),
+            Value(ZERO_QTY),
+            output_field=DecimalField(max_digits=18, decimal_places=4),
+        ),
+        inward=Coalesce(
+            Sum(
+                "quantity",
+                filter=Q(quantity__gt=0) & ~Q(type="OPENING_STOCK") & ~(Q(type="ADJUSTMENT") & Q(notes__icontains="opening"))
+            ),
+            Value(ZERO_QTY),
+            output_field=DecimalField(max_digits=18, decimal_places=4),
+        ),
+        outward=Coalesce(
+            Sum(
+                "quantity",
+                filter=Q(quantity__lt=0)
+            ),
+            Value(ZERO_QTY),
+            output_field=DecimalField(max_digits=18, decimal_places=4),
+        ),
+    )
+    opening_stock = agg["opening"] or ZERO
+    total_inward = agg["inward"] or ZERO
+    total_outward = abs(agg["outward"] or ZERO)
+
+    has_movements = mv_qs.exists()
+    if has_movements:
+        on_hand = opening_stock + total_inward - total_outward
+    else:
+        on_hand = balance.get("on_hand", ZERO) or ZERO
+        opening_stock = on_hand
+
     available = on_hand - reserved
 
     return {
@@ -298,6 +418,9 @@ def calculate_item_stock(client_id, item, location_id=None):
         "damaged": damaged,
         "available": available,
         "status": stock_status(available, reorder_level),
+        "openingStock": opening_stock,
+        "totalInward": total_inward,
+        "totalOutward": total_outward,
     }
 
 
@@ -321,29 +444,82 @@ def stock_by_location(client_id, item_id):
     ]
 
 
-def annotate_items_with_stock(client_id, items):
+def annotate_items_with_stock(client_id, items, location_id=None):
     """Attach derived stock to a page of items without an N+1.
 
     db.md §15 flags the item list as one of the screens that will hurt first;
-    this resolves the whole page in two aggregate queries.
+    this resolves the whole page in batched aggregate queries.
     """
     items = list(items)
     if not items:
         return items
     item_ids = [item.id for item in items]
-    balances = balances_for(client_id, item_ids)
+    balances = balances_for(client_id, item_ids, location_id)
     reserved_map = reserved_quantity(client_id, item_ids)
+
+    # Batch compute movement aggregates for all item_ids on this page
+    mv_qs = StockMovement.objects.filter(
+        client_id=client_id,
+        item_id__in=item_ids,
+        deleted_at__isnull=True,
+    )
+    if location_id:
+        mv_qs = mv_qs.filter(location_id=location_id)
+
+    mv_rows = mv_qs.values("item_id").annotate(
+        opening=Coalesce(
+            Sum(
+                "quantity",
+                filter=Q(type="OPENING_STOCK") | (Q(type="ADJUSTMENT") & Q(notes__icontains="opening"))
+            ),
+            Value(ZERO_QTY),
+            output_field=DecimalField(max_digits=18, decimal_places=4),
+        ),
+        inward=Coalesce(
+            Sum(
+                "quantity",
+                filter=Q(quantity__gt=0) & ~Q(type="OPENING_STOCK") & ~(Q(type="ADJUSTMENT") & Q(notes__icontains="opening"))
+            ),
+            Value(ZERO_QTY),
+            output_field=DecimalField(max_digits=18, decimal_places=4),
+        ),
+        outward=Coalesce(
+            Sum(
+                "quantity",
+                filter=Q(quantity__lt=0)
+            ),
+            Value(ZERO_QTY),
+            output_field=DecimalField(max_digits=18, decimal_places=4),
+        ),
+    )
+    mv_map = {row["item_id"]: row for row in mv_rows}
 
     for item in items:
         balance = balances.get(item.id, {})
-        on_hand = balance.get("on_hand", ZERO) or ZERO
+        mv_data = mv_map.get(item.id, {})
+        opening = mv_data.get("opening", ZERO) or ZERO
+        inward = mv_data.get("inward", ZERO) or ZERO
+        outward = abs(mv_data.get("outward", ZERO) or ZERO)
+
+        bal_on_hand = balance.get("on_hand", ZERO) or ZERO
+        if item.id in mv_map:
+            on_hand = opening + inward - outward
+        else:
+            on_hand = bal_on_hand
+            opening = bal_on_hand
+
         damaged = balance.get("damaged", ZERO) or ZERO
         reserved = reserved_map.get(item.id, ZERO) or ZERO
+        available = on_hand - reserved
+
+        item.opening_qty = opening
+        item.inward_qty = inward
+        item.outward_qty = outward
         item.on_hand_qty = on_hand
         item.reserved_qty = reserved
         item.damaged_qty = damaged
-        item.available_qty = on_hand - reserved
-        item.stock_status = stock_status(item.available_qty, item.reorder_level)
+        item.available_qty = available
+        item.stock_status = stock_status(available, item.reorder_level)
     return items
 
 
@@ -370,18 +546,28 @@ def assert_sufficient_stock(client_id, item, quantity, location_id=None, label=N
     if not item_obj.holds_stock:
         return  # Service items hold no stock (api.md §4.2).
 
+    # Row-level lock on StockBalance to prevent concurrent overselling race conditions
+    if location_id:
+        StockBalance.objects.select_for_update().filter(
+            client_id=client_id, item_id=item_obj.id, location_id=location_id
+        ).first()
+    else:
+        list(StockBalance.objects.select_for_update().filter(
+            client_id=client_id, item_id=item_obj.id
+        ))
+
     stock = calculate_item_stock(client_id, item_obj, location_id)
-    stock["available"] = stock["available"] + max(D(own_reserved or ZERO), ZERO)
-    if D(quantity) > stock["available"]:
+    available = stock["available"] + max(D(own_reserved or ZERO), ZERO)
+    if D(quantity) > available:
         raise BusinessRuleViolation(
             f"Not enough stock for {label or item_obj.name}. "
-            f"Requested {round4(quantity)}, available {round4(stock['available'])}.",
+            f"Requested {round4(quantity)}, available {round4(available)}.",
             code=Codes.INSUFFICIENT_STOCK,
             payload={
                 "itemId": str(item_obj.id),
                 "sku": item_obj.sku,
                 "requested": str(round4(quantity)),
-                "available": str(round4(stock["available"])),
+                "available": str(round4(available)),
             },
         )
 
@@ -557,3 +743,135 @@ def previously_returned_serials(client_id, sales_invoice_id):
             client_id=client_id, line_table="sales_return_lines", line_id__in=list(line_ids)
         ).values_list("serial__serial_no", flat=True)
     )
+
+
+# ---------------------------------------------------------------------------
+# Reconciliation Engine (Phase 4 / db.md §13)
+# ---------------------------------------------------------------------------
+@transaction.atomic
+def reconcile_stock(client_id, item_id=None, location_id=None, auto_fix=False):
+    """Reconciles StockBalance records against the append-only StockMovement ledger.
+
+    Returns a report detailing discrepancies between StockBalance.on_hand
+    and the sum of StockMovements (Opening + Inward - Outward).
+    If `auto_fix=True`, updates StockBalance rows to match the ledger source of truth.
+    """
+    from apps.masters.models import Item, Location
+
+    mv_qs = StockMovement.objects.filter(
+        client_id=client_id, deleted_at__isnull=True
+    ).exclude(type="FAULTY")
+    bal_qs = StockBalance.objects.filter(
+        client_id=client_id, deleted_at__isnull=True
+    )
+
+    if item_id:
+        mv_qs = mv_qs.filter(item_id=item_id)
+        bal_qs = bal_qs.filter(item_id=item_id)
+    if location_id:
+        mv_qs = mv_qs.filter(location_id=location_id)
+        bal_qs = bal_qs.filter(location_id=location_id)
+
+    ledger_rows = mv_qs.values("item_id", "location_id").annotate(
+        opening=Coalesce(
+            Sum(
+                "quantity",
+                filter=Q(type="OPENING_STOCK") | (Q(type="ADJUSTMENT") & Q(notes__icontains="opening"))
+            ),
+            Value(ZERO_QTY),
+            output_field=DecimalField(max_digits=18, decimal_places=4),
+        ),
+        inward=Coalesce(
+            Sum(
+                "quantity",
+                filter=Q(quantity__gt=0) & ~Q(type="OPENING_STOCK") & ~(Q(type="ADJUSTMENT") & Q(notes__icontains="opening"))
+            ),
+            Value(ZERO_QTY),
+            output_field=DecimalField(max_digits=18, decimal_places=4),
+        ),
+        outward=Coalesce(
+            Sum(
+                "quantity",
+                filter=Q(quantity__lt=0)
+            ),
+            Value(ZERO_QTY),
+            output_field=DecimalField(max_digits=18, decimal_places=4),
+        ),
+        net=Coalesce(
+            Sum("quantity"),
+            Value(ZERO_QTY),
+            output_field=DecimalField(max_digits=18, decimal_places=4),
+        ),
+    )
+    ledger_map = {(row["item_id"], row["location_id"]): row for row in ledger_rows}
+
+    balances = {
+        (b.item_id, b.location_id): b
+        for b in bal_qs.select_related("item", "location")
+    }
+
+    all_keys = set(ledger_map.keys()) | set(balances.keys())
+
+    needed_items = {k[0] for k in all_keys if k not in balances}
+    needed_locations = {k[1] for k in all_keys if k not in balances}
+    item_cache = {i.id: i for i in Item.objects.filter(id__in=needed_items)} if needed_items else {}
+    location_cache = {l.id: l for l in Location.objects.filter(id__in=needed_locations)} if needed_locations else {}
+
+    discrepancies = []
+    total_checked = len(all_keys)
+
+    for (i_id, l_id) in sorted(all_keys, key=lambda x: str(x)):
+        bal = balances.get((i_id, l_id))
+        led = ledger_map.get((i_id, l_id))
+
+        bal_on_hand = bal.on_hand if bal else ZERO
+        led_opening = led["opening"] if led else ZERO
+        led_inward = led["inward"] if led else ZERO
+        led_outward = abs(led["outward"]) if led else ZERO
+        led_on_hand = led["net"] if led else ZERO
+
+        item_obj = bal.item if bal else item_cache.get(i_id)
+        loc_obj = bal.location if bal else location_cache.get(l_id)
+
+        sku = getattr(item_obj, "sku", "")
+        item_name = getattr(item_obj, "name", "")
+        loc_name = getattr(loc_obj, "name", "")
+
+        diff = bal_on_hand - led_on_hand
+        if diff != ZERO:
+            entry = {
+                "itemId": str(i_id),
+                "sku": sku,
+                "itemName": item_name,
+                "locationId": str(l_id),
+                "locationName": loc_name,
+                "balanceOnHand": bal_on_hand,
+                "ledgerOnHand": led_on_hand,
+                "openingStock": led_opening,
+                "postedInward": led_inward,
+                "postedOutward": led_outward,
+                "difference": diff,
+                "status": "DISCREPANCY",
+            }
+            if auto_fix:
+                if bal:
+                    bal.on_hand = led_on_hand
+                    bal.save(update_fields=["on_hand", "updated_at"])
+                else:
+                    StockBalance.objects.create(
+                        client_id=client_id,
+                        item_id=i_id,
+                        location_id=l_id,
+                        on_hand=led_on_hand,
+                        damaged=ZERO_QTY,
+                    )
+                entry["status"] = "FIXED"
+            discrepancies.append(entry)
+
+    return {
+        "totalBalancesChecked": total_checked,
+        "discrepanciesCount": len(discrepancies),
+        "autoFixed": auto_fix,
+        "discrepancies": discrepancies,
+    }
+

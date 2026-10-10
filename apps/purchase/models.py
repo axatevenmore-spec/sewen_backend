@@ -177,6 +177,7 @@ class PurchaseBillLine(DocumentLine):
 # ---------------------------------------------------------------------------
 class GoodsReceipt(TenantModel, LegacyIdMixin):
     GRN_QC_STATUSES = ["Pending", "Approved", "Rejected", "On Hold"]
+    GRN_STATUSES = ["Draft", "Received", "Cancelled"]
 
     grn_number = models.TextField()
     purchase_order = models.ForeignKey(
@@ -190,6 +191,7 @@ class GoodsReceipt(TenantModel, LegacyIdMixin):
     location = models.ForeignKey(
         "masters.Location", on_delete=models.PROTECT, related_name="receipts"
     )
+    status = models.TextField(choices=choices(GRN_STATUSES), default="Received")
     qc_status = models.TextField(choices=choices(GRN_QC_STATUSES), default="Pending")
     qc_note = models.TextField(null=True, blank=True)
     qc_by = models.ForeignKey(
@@ -229,6 +231,7 @@ class GoodsReceiptLine(TenantModel):
     #: prefers it, and the movement must record the same number the UI showed.
     weighed_qty = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
     rejected_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
+    uom = models.TextField(null=True, blank=True)
     batch_number = models.TextField(null=True, blank=True)
     unit_cost = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     variation_pct = models.DecimalField(max_digits=9, decimal_places=4, null=True, blank=True)

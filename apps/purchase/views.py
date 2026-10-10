@@ -339,21 +339,109 @@ class PurchaseBillViewSet(SalesDocumentViewSet):
         return Response(self.get_serializer(bill).data)
 
 
-class GoodsReceiptViewSet(ReadOnlyTenantViewSet):
-    """``GET /purchase/receipts/`` -- the worklist (api.md §6.3).
+class GoodsReceiptViewSet(TenantModelViewSet):
+    """``/purchase/receipts/`` -- GRN receipts workbench & records (api.md §6.3)."""
 
-    "Bills where ``goodsReceived = false``, plus receipts held at a
-    non-``Approved`` QC verdict."
-    """
-
-    queryset = GoodsReceipt.objects.select_related("party", "purchase_bill", "location")
+    queryset = GoodsReceipt.objects.select_related(
+        "party", "purchase_order", "purchase_bill", "location", "created_by"
+    ).prefetch_related(
+        "lines__item", "lines__item__grade", "lines__item__category", "lines__item__item_type"
+    )
     serializer_class = GoodsReceiptSerializer
+    audit_entity_type = "GoodsReceipt"
+    audit_label_field = "grn_number"
     required_permissions = ["view_purchase"]
-    status_field = "qc_status"
+    permission_map = {"write": ["receive_goods"]}
+    status_field = "status"
     default_date_field = "receipt_date"
     ordering = ["-receipt_date"]
+    search_fields = ["grn_number", "party__name", "qc_note"]
+
+    @transaction.atomic
+    def create(self, request, *args, **kwargs):
+        """Create a Goods Receipt Note (GRN) mapping to inventory SKUs and specs."""
+        from apps.core.permissions import require_permission
+        require_permission(request.user, "receive_goods")
+
+        data = request.data
+        party_id = data.get("partyId") or data.get("party") or data.get("vendorId")
+        location_id = data.get("locationId") or data.get("location")
+        po_id = data.get("purchaseOrderId") or data.get("purchase_order")
+        bill_id = data.get("purchaseBillId") or data.get("purchase_bill")
+        receipt_date = data.get("receiptDate") or data.get("receipt_date") or timezone.localdate()
+        status_val = data.get("status") or "Received"
+        qc_status = data.get("qcStatus") or data.get("qc_status") or "Approved"
+        qc_note = data.get("qcNote") or data.get("qc_note") or ""
+        lines_data = data.get("lines") or data.get("items") or []
+
+        if not party_id and po_id:
+            from .models import PurchaseOrder
+            po = PurchaseOrder.objects.filter(pk=po_id, client_id=request.client_id).first()
+            if po:
+                party_id = po.party_id
+        if not party_id:
+            raise ValidationFailed("Vendor / Party is required.", field_errors={"partyId": ["Required."]})
+        if not location_id:
+            raise ValidationFailed("Warehouse Location is required.", field_errors={"locationId": ["Required."]})
+        if not lines_data:
+            raise ValidationFailed("GRN requires at least one line item.", field_errors={"lines": ["Add at least one line."]})
+
+        grn_number = data.get("grnNumber") or allocate_number(request.user.client, "GRN", receipt_date)
+        receipt = GoodsReceipt.objects.create(
+            client=request.user.client,
+            grn_number=grn_number,
+            purchase_order_id=po_id,
+            purchase_bill_id=bill_id,
+            party_id=party_id,
+            receipt_date=receipt_date,
+            location_id=location_id,
+            status=status_val if status_val in ("Draft", "Received") else "Received",
+            qc_status=qc_status,
+            qc_note=qc_note,
+            created_by=request.user,
+        )
+
+        for line in lines_data:
+            item_id = line.get("itemId") or line.get("item")
+            ordered_qty = Decimal(str(line.get("orderedQty") or line.get("ordered_qty") or line.get("qty") or 0))
+            received_qty = Decimal(str(line.get("receivedQty") or line.get("received_qty") or ordered_qty))
+            weighed_qty = Decimal(str(line["weighedQty"])) if line.get("weighedQty") is not None else (Decimal(str(line["weighed_qty"])) if line.get("weighed_qty") is not None else None)
+            rejected_qty = Decimal(str(line.get("rejectedQty") or line.get("rejected_qty") or 0))
+            unit_cost = Decimal(str(line.get("unitCost") or line.get("unit_cost") or 0))
+            uom = line.get("uom")
+            batch_number = line.get("batchNumber") or line.get("batch_number")
+            po_line_id = line.get("purchaseOrderLineId") or line.get("purchase_order_line")
+
+            GoodsReceiptLine.objects.create(
+                client=request.user.client,
+                goods_receipt=receipt,
+                purchase_order_line_id=po_line_id,
+                item_id=item_id,
+                ordered_qty=ordered_qty,
+                received_qty=received_qty,
+                weighed_qty=weighed_qty,
+                rejected_qty=rejected_qty,
+                uom=uom,
+                unit_cost=unit_cost,
+                batch_number=batch_number,
+            )
+
+        if receipt.status == "Received":
+            services.post_goods_receipt(receipt, user=request.user)
+
+        self.write_audit("create", receipt, description=f"GRN {receipt.grn_number} created with status {receipt.status}")
+        return Response(self.get_serializer(receipt).data, status=status.HTTP_201_CREATED)
 
     def list(self, request, *args, **kwargs):
+        if request.query_params.get("view") == "records" or request.query_params.get("pure") == "true" or "status" in request.query_params:
+            queryset = self.filter_queryset(self.get_queryset())
+            page = self.paginate_queryset(queryset)
+            if page is not None:
+                serializer = self.get_serializer(page, many=True)
+                return self.get_paginated_response(serializer.data)
+            serializer = self.get_serializer(queryset, many=True)
+            return Response(envelope(serializer.data))
+
         pending_bills = PurchaseBill.objects.filter(
             client_id=request.client_id, deleted_at__isnull=True, goods_received=False
         ).exclude(status="Cancelled").select_related("party")
@@ -387,6 +475,7 @@ class GoodsReceiptViewSet(ReadOnlyTenantViewSet):
                 "vendorName": receipt.party.name,
                 "date": receipt.receipt_date,
                 "qcStatus": receipt.qc_status,
+                "status": receipt.status,
                 "goodsReceived": True,
             }
             for receipt in held_receipts
@@ -401,6 +490,29 @@ class GoodsReceiptViewSet(ReadOnlyTenantViewSet):
                 },
             )
         )
+
+    @action(detail=True, methods=["post"])
+    def post(self, request, pk=None):
+        """Post a Draft Goods Receipt Note to inventory stock movements."""
+        from apps.core.permissions import require_permission
+        require_permission(request.user, "receive_goods")
+
+        receipt = self.get_object()
+        receipt = services.post_goods_receipt(receipt, user=request.user)
+        self.write_audit("post", receipt, description=f"GRN {receipt.grn_number} posted to stock movements.")
+        return Response(self.get_serializer(receipt).data)
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        """Cancel a Goods Receipt Note and reverse stock movements."""
+        from apps.core.permissions import require_permission
+        require_permission(request.user, "cancel_purchase_document")
+
+        receipt = self.get_object()
+        reason = request.data.get("reason") or "User cancelled GRN"
+        receipt = services.cancel_goods_receipt(receipt, reason=reason, user=request.user)
+        self.write_audit("cancel", receipt, description=f"GRN {receipt.grn_number} cancelled: {reason}")
+        return Response(self.get_serializer(receipt).data)
 
     @action(detail=True, methods=["post"])
     def qc(self, request, pk=None):

@@ -91,12 +91,18 @@ def format_number(prefix, separator, fy_label, value, pad_width):
 
 
 @transaction.atomic
-def allocate_number(client, series_key, on_date=None):
+def allocate_number(client, series_key, on_date=None, unique_in=None):
     """Allocate the next number in a series. Call inside the creating transaction.
 
     Takes ``pg_advisory_xact_lock`` on (client, series, fy) so concurrent
     allocations serialise on just this tenant's series rather than the table,
     and the lock is released at commit or rollback.
+
+    ``unique_in=(Model, "field")`` skips numbers that tenant's rows already
+    carry (soft-deleted ones included) and moves the counter past them. A series
+    can fall behind its records -- rows restored from a snapshot or written
+    without the counter -- and would otherwise hand out a duplicate that the
+    unique constraint rejects on every attempt.
     """
     from .models import NumberSeries
 
@@ -130,19 +136,33 @@ def allocate_number(client, series_key, on_date=None):
         series = NumberSeries.objects.select_for_update().get(pk=series.pk)
 
     allocated = series.next_value
-    series.next_value = allocated + 1
-    series.save(update_fields=["next_value"])
-
     try:
-        return format_number(
+        number = format_number(
             series.prefix, series.separator, series.fy_label, allocated, series.pad_width
         )
+        if unique_in is not None:
+            model, field = unique_in
+            used = model._base_manager.filter(client_id=client_id)
+            # Bounded: a series is never thousands of numbers behind its records.
+            for _ in range(10000):
+                if not used.filter(**{field: number}).exists():
+                    break
+                allocated += 1
+                number = format_number(
+                    series.prefix, series.separator, series.fy_label, allocated, series.pad_width
+                )
+            else:
+                raise ValueError(f"no free number in series {series_key}")
     except Exception as exc:  # pragma: no cover - defensive
         raise EvenmoreAPIError(
             "Could not allocate a document number.",
             code=Codes.NUMBER_ALLOCATION_FAILED,
             detail=str(exc),
         ) from exc
+
+    series.next_value = allocated + 1
+    series.save(update_fields=["next_value"])
+    return number
 
 
 def peek_next(client, series_key, on_date=None):

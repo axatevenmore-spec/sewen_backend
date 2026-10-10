@@ -290,6 +290,17 @@ class OwnEmployeeScopeMixin:
                     request.user.save(update_fields=["employee"])
                 return emp
 
+        if getattr(request.user, "is_authenticated", False) and (getattr(request.user, "client", None) or client_id):
+            try:
+                from apps.hrms.user_link import create_employee_for
+                emp = create_employee_for(request.user)
+                if hasattr(request.user, "save"):
+                    request.user.employee = emp
+                    request.user.save(update_fields=["employee"])
+                return emp
+            except Exception:
+                pass
+
         return None
 
 # ---------------------------------------------------------------------------
@@ -1097,6 +1108,11 @@ class RegularizationViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
             if resolved:
                 serializer.validated_data["employee"] = resolved
                 employee = resolved
+        if not employee:
+            raise ValidationFailed(
+                "No employee profile found or linked to this user account.",
+                code="NO_EMPLOYEE",
+            )
         self.check_own_employee(employee)
         return super().perform_create(serializer)
 

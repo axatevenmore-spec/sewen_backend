@@ -5,6 +5,7 @@ Parties, items, categories, units, locations, serials and the machine BOM.
 One ``parties`` table serves customers and vendors; the UI shows it three ways
 (``/parties``, ``/crm/customers``, vendor pickers) but there is one record.
 """
+from decimal import Decimal
 from django.db import models
 
 from apps.core.models import LegacyIdMixin, TenantModel
@@ -139,19 +140,61 @@ class PartyContact(TenantModel):
 
 
 # ---------------------------------------------------------------------------
-# db.md §4.2 -- Items and inventory master
+# db.md §4.2 -- Items, Item Types, Categories and Masters
 # ---------------------------------------------------------------------------
+class ItemType(TenantModel, LegacyIdMixin):
+    """Configurable metal and product item type master (Sheet, Rod, Angle, Tube, Pipe, Channel, Beam, Flat, Bar, etc.)."""
+
+    code = models.TextField()
+    name = models.TextField()
+    description = models.TextField(null=True, blank=True)
+    shape_profile = models.TextField(null=True, blank=True)
+    dimension_schema = models.JSONField(default=dict, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "item_types"
+        ordering = ["name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_item_types_code",
+            ),
+            models.UniqueConstraint(
+                fields=["client", "name"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_item_types_name",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["client", "name"], name="ix_item_types_name"),
+            models.Index(fields=["client", "code"], name="ix_item_types_code"),
+        ]
+
+    def __str__(self):
+        return self.name
+
+
 class ItemCategory(TenantModel, LegacyIdMixin):
     KINDS = [("machine", "machine"), ("stock", "stock")]
 
     name = models.TextField()
     code = models.TextField()
     kind = models.TextField(choices=KINDS, default="stock")
+    item_type = models.ForeignKey(
+        ItemType, null=True, blank=True, on_delete=models.SET_NULL, related_name="categories"
+    )
     description = models.TextField(null=True, blank=True)
     has_sub_parts = models.BooleanField(default=False)
     lead_time_days = models.IntegerField(default=0)
     #: api.md §4.2 -- the HSN default for this family, resolved on item create.
     default_hsn_code = models.TextField(null=True, blank=True)
+    default_unit = models.ForeignKey(
+        "masters.Unit", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    default_uom = models.TextField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
 
     class Meta:
         db_table = "item_categories"
@@ -161,11 +204,57 @@ class ItemCategory(TenantModel, LegacyIdMixin):
                 fields=["client", "code"],
                 condition=models.Q(deleted_at__isnull=True),
                 name="uq_item_categories_code",
-            )
+            ),
+            models.UniqueConstraint(
+                fields=["client", "item_type", "name"],
+                condition=models.Q(deleted_at__isnull=True, item_type__isnull=False),
+                name="uq_category_item_type_name",
+            ),
+            models.UniqueConstraint(
+                fields=["client", "name"],
+                condition=models.Q(deleted_at__isnull=True, item_type__isnull=True),
+                name="uq_category_name_no_type",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["client", "name"], name="ix_item_categories_name"),
+            models.Index(fields=["client", "item_type"], name="ix_item_categories_type"),
         ]
 
     def __str__(self):
         return self.name
+
+
+class MaterialGrade(TenantModel, LegacyIdMixin):
+    """Configurable material grade master (e.g. MS, SS304, SS316, Aluminium 6061)."""
+
+    code = models.TextField()
+    name = models.TextField()
+    material_category = models.ForeignKey(
+        ItemCategory, null=True, blank=True, on_delete=models.SET_NULL, related_name="grades"
+    )
+    family = models.TextField(default="Mild Steel")
+    density = models.DecimalField(max_digits=8, decimal_places=4, default=Decimal("7.8500"))
+    description = models.TextField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        db_table = "material_grades"
+        ordering = ["code"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "code"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_material_grades_code",
+            ),
+        ]
+        indexes = [
+            models.Index(fields=["client", "code"], name="ix_material_grades_code"),
+            models.Index(fields=["client", "family"], name="ix_material_grades_family"),
+        ]
+
+    def __str__(self):
+        return self.code
 
 
 class CategoryCustomField(TenantModel):
@@ -267,8 +356,14 @@ class Item(TenantModel, LegacyIdMixin):
     sku = models.TextField()
     name = models.TextField()
     description = models.TextField(null=True, blank=True)
+    item_type = models.ForeignKey(
+        ItemType, null=True, blank=True, on_delete=models.SET_NULL, related_name="items"
+    )
     category = models.ForeignKey(
         ItemCategory, null=True, blank=True, on_delete=models.SET_NULL, related_name="items"
+    )
+    grade = models.ForeignKey(
+        MaterialGrade, null=True, blank=True, on_delete=models.SET_NULL, related_name="items"
     )
     item_kind = models.TextField(choices=ITEM_KINDS, default="Standalone")
     hsn_code = models.TextField(null=True, blank=True)
@@ -336,6 +431,15 @@ class Item(TenantModel, LegacyIdMixin):
 
     dimension_unit = models.TextField(default="mm", null=True, blank=True)  # legacy single-axis unit
 
+    # Universal / Structural / Rod / Angle / Beam dimensions (Phase 3)
+    diameter = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    inner_diameter = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    finish_coating = models.TextField(null=True, blank=True)  # e.g., "2B", "No. 4", "Polished", "Galvanized", "Mill Finish", "Pickled"
+    leg_a = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)  # Angle leg 1 or Channel flange
+    leg_b = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)  # Angle leg 2 or Channel web height
+    web_thickness = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+    flange_thickness = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+
     class Meta:
         db_table = "items"
         ordering = ["name"]
@@ -354,6 +458,11 @@ class Item(TenantModel, LegacyIdMixin):
             ),
             models.Index(fields=["client", "sku"], name="ix_items_sku"),
             models.Index(fields=["client", "item_kind"], name="ix_items_kind"),
+            models.Index(
+                fields=["client", "item_type"],
+                name="ix_items_type",
+                condition=models.Q(deleted_at__isnull=True),
+            ),
         ]
 
     def __str__(self):

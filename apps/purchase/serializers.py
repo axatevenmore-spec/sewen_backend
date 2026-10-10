@@ -180,30 +180,65 @@ class GoodsReceiptLineSerializer(BaseModelSerializer):
     itemId = serializers.CharField(source="item_id", read_only=True)
     sku = serializers.CharField(source="item.sku", read_only=True)
     itemName = serializers.CharField(source="item.name", read_only=True)
+    itemType = serializers.CharField(source="item.item_type.name", read_only=True, allow_null=True)
+    grade = serializers.SerializerMethodField()
+    dimensions = serializers.SerializerMethodField()
+    uom = serializers.SerializerMethodField()
+    orderedQty = serializers.DecimalField(source="ordered_qty", max_digits=18, decimal_places=4, read_only=True)
+    receivedQty = serializers.DecimalField(source="received_qty", max_digits=18, decimal_places=4, read_only=True)
+    weighedQty = serializers.DecimalField(source="weighed_qty", max_digits=18, decimal_places=4, read_only=True, allow_null=True)
+    rejectedQty = serializers.DecimalField(source="rejected_qty", max_digits=18, decimal_places=4, read_only=True)
+    unitCost = serializers.DecimalField(source="unit_cost", max_digits=18, decimal_places=4, read_only=True)
 
     class Meta:
         model = GoodsReceiptLine
         fields = [
-            "id", "itemId", "sku", "itemName", "ordered_qty", "received_qty",
-            "weighed_qty", "rejected_qty", "batch_number", "unit_cost",
-            "variation_pct",
+            "id", "itemId", "sku", "itemName", "itemType", "grade", "dimensions",
+            "ordered_qty", "received_qty", "orderedQty", "receivedQty",
+            "weighed_qty", "weighedQty", "rejected_qty", "rejectedQty",
+            "uom", "batch_number", "unit_cost", "unitCost", "variation_pct",
         ]
+
+    def get_grade(self, line):
+        if not line.item:
+            return None
+        if getattr(line.item, "grade_id", None) and line.item.grade:
+            return line.item.grade.code or line.item.grade.name
+        return getattr(line.item, "metal_grade", None)
+
+    def get_dimensions(self, line):
+        from apps.inventory.views import format_item_spec
+        return format_item_spec(line.item) if line.item else ""
+
+    def get_uom(self, line):
+        return line.uom or (line.item.uom if line.item else "Nos")
 
 
 class GoodsReceiptSerializer(BaseModelSerializer):
     lines = GoodsReceiptLineSerializer(many=True, read_only=True)
     vendorName = serializers.CharField(source="party.name", read_only=True)
+    partyName = serializers.CharField(source="party.name", read_only=True)
     billNumber = serializers.CharField(
-        source="purchase_bill.bill_number", read_only=True
+        source="purchase_bill.bill_number", read_only=True, allow_null=True
     )
+    poNumber = serializers.CharField(
+        source="purchase_order.po_number", read_only=True, allow_null=True
+    )
+    locationName = serializers.CharField(source="location.name", read_only=True, allow_null=True)
+    creatorName = serializers.SerializerMethodField()
 
     class Meta:
         model = GoodsReceipt
         fields = [
-            "id", "grn_number", "purchase_order", "purchase_bill", "billNumber",
-            "party", "vendorName", "receipt_date", "location", "qc_status",
-            "qc_note", "qc_at", "lines", "created_at",
+            "id", "grn_number", "purchase_order", "purchase_bill", "billNumber", "poNumber",
+            "party", "vendorName", "partyName", "receipt_date", "location", "locationName",
+            "status", "qc_status", "qc_note", "qc_at", "creatorName", "lines", "created_at",
         ]
+
+    def get_creatorName(self, receipt):
+        if receipt.created_by:
+            return getattr(receipt.created_by, "name", None) or getattr(receipt.created_by, "email", "Staff")
+        return "System"
 
 
 # ---------------------------------------------------------------------------
