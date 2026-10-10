@@ -738,6 +738,46 @@ class StageTaskViewSet(TenantModelViewSet):
     filter_map = {"stageId": "stage_id"}
     permission_map = {"read": ["view_task"], "write": ["manage_pipeline"]}
 
+    # Adding a stage task is the deliberate act that puts a master task into a
+    # stage, so the master's "used in stages" is written with it -- and removing
+    # it takes the stage back off. Without this the two lists disagree, and the
+    # next save of the master (``services.sync_master_task_stages``) would put
+    # back the row the user had just taken out of the stage.
+
+    def after_create(self, instance):
+        self.link_master(instance)
+
+    def after_update(self, instance, before):
+        master_changed = str(before.get("master_task_id") or "") != str(instance.master_task_id or "")
+        stage_changed = str(before.get("stage_id") or "") != str(instance.stage_id or "")
+        if not (master_changed or stage_changed):
+            return
+        self.unlink_master(before.get("master_task_id"), before.get("stage_id"))
+        self.link_master(instance)
+
+    def link_master(self, instance):
+        if instance.master_task_id:
+            instance.master_task.stages.add(instance.stage)
+
+    def unlink_master(self, master_task_id, stage_id):
+        """The master only stops claiming a stage once nothing is left in it."""
+        if not master_task_id or not stage_id:
+            return
+        master = MasterTask.objects.filter(pk=master_task_id).first()
+        if master is None:
+            return
+        still_used = StageTask.objects.filter(
+            master_task_id=master.pk, stage_id=stage_id, deleted_at__isnull=True
+        ).exists()
+        if not still_used:
+            master.stages.remove(stage_id)
+
+    def perform_destroy(self, instance):
+        master_task_id = instance.master_task_id
+        stage_id = instance.stage_id
+        super().perform_destroy(instance)
+        self.unlink_master(master_task_id, stage_id)
+
 
 class TaskViewSet(TenantModelViewSet):
     queryset = Task.objects.select_related("lead", "deal", "assignee")

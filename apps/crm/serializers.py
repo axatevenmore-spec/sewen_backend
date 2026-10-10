@@ -146,6 +146,12 @@ class LeadSerializer(BaseModelSerializer):
     estimatesCount = serializers.SerializerMethodField()
     deliveryChallansCount = serializers.SerializerMethodField()
     salesInvoicesCount = serializers.SerializerMethodField()
+    #: The linked customer party's outstanding balance. A lead is not a posted
+    #: document, so this is 0 unless the lead is attached to a customer -- which
+    #: is what the sales "Customer Account" picker shows next to the name.
+    balance = serializers.SerializerMethodField()
+    #: What to show for this lead: the company if it has one, else the contact.
+    displayName = serializers.SerializerMethodField()
 
     class Meta:
         model = Lead
@@ -155,12 +161,20 @@ class LeadSerializer(BaseModelSerializer):
             "city", "state", "country", "amount", "job_title", "industry",
             "avatarColor", "latitude", "longitude", "is_pinned", "party",
             "lost_reason", "custom_values",
+            "balance", "displayName",
             "productsCount", "sourcesCount", "filesCount", "openTasksCount",
             "callsCount", "estimatesCount", "deliveryChallansCount",
             "salesInvoicesCount",
             "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
+
+    def get_balance(self, lead):
+        party = lead.party
+        return str(party.balance) if party is not None and party.balance is not None else "0"
+
+    def get_displayName(self, lead):
+        return lead.company or lead.name or ""
 
     def _counter(self, lead, attribute):
         return getattr(lead, attribute, 0)

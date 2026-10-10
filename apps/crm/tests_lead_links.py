@@ -77,6 +77,49 @@ class LeadSectionLinkTests(TestCase):
         resp = self.post("/master-tasks/", {"title": "Probe", "stages": [str(foreign.id)]})
         self.assertEqual(resp.status_code, 400, resp.content)
 
+    def test_a_master_task_joins_no_stage_until_it_is_added_to_one(self):
+        # Created from Task Roles: the library row only. In particular it must
+        # not turn up in the first stage just because that is where it sits.
+        resp = self.post("/master-tasks/", {"title": "Whastapp ping", "role": "BDE", "stages": []})
+        self.assertEqual(resp.status_code, 201, resp.content)
+        master_id = resp.json()["id"]
+        self.assertFalse(self.linked(master_id).exists())
+        self.assertEqual(self.api.get(f"{API}/stage-tasks/").json()["count"], 0)
+
+        # Adding it to a stage is the deliberate step that puts it there.
+        resp = self.post("/stage-tasks/", {"stageId": str(self.demo.id), "masterTaskId": master_id})
+        self.assertEqual(resp.status_code, 201, resp.content)
+        stage_task_id = resp.json()["id"]
+        self.assertEqual([row.stage_id for row in self.linked(master_id)], [self.demo.id])
+        self.assertEqual(
+            list(MasterTask.objects.get(pk=master_id).stages.values_list("id", flat=True)),
+            [self.demo.id],
+        )
+
+        # Taking it out of the stage takes it off the master too, so saving the
+        # master afterwards cannot put the row back.
+        self.assertEqual(self.api.delete(f"{API}/stage-tasks/{stage_task_id}/").status_code, 204)
+        master = MasterTask.objects.get(pk=master_id)
+        self.assertEqual(list(master.stages.values_list("id", flat=True)), [])
+        self.patch(f"/master-tasks/{master_id}/", {"role": "Area Sales Manager"})
+        self.assertFalse(self.linked(master_id).exists())
+
+    def test_editing_a_task_role_leaves_the_stages_alone(self):
+        master_id = self.post("/master-tasks/", {"title": "Follow up", "role": "BDE"}).json()["id"]
+        template = self.post(
+            "/stage-tasks/", {"stageId": str(self.demo.id), "masterTaskId": master_id}
+        ).json()
+        # The stage task is given per-stage settings of its own.
+        self.patch(f"/stage-tasks/{template['id']}/", {"required": True, "maxRepeats": 4})
+
+        # Saving the library row -- what Task Roles does -- leaves it in place.
+        self.patch(f"/master-tasks/{master_id}/", {"role": "Sales Support Executive"})
+        row = self.linked(master_id).get()
+        self.assertEqual(
+            (row.stage_id, row.assignee_role, row.required, row.max_repeats),
+            (self.demo.id, "Sales Support Executive", True, 4),
+        )
+
     def test_task_templates_accept_task_forms_only(self):
         resp = self.post("/master-tasks/", {"title": "Bad", "formId": str(self.lead_form.id)})
         self.assertEqual(resp.status_code, 400, resp.content)
