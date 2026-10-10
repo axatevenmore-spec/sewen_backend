@@ -33,25 +33,75 @@ class StockMovementSerializer(BaseModelSerializer):
     itemId = serializers.CharField(source="item_id", read_only=True)
     itemSku = serializers.CharField(source="item.sku", read_only=True)
     itemName = serializers.CharField(source="item.name", read_only=True)
+    itemType = serializers.SerializerMethodField()
+    category = serializers.CharField(source="item.category.name", read_only=True, allow_null=True)
+    grade = serializers.SerializerMethodField()
+    dimensions = serializers.SerializerMethodField()
+    specification = serializers.SerializerMethodField()
     locationId = serializers.CharField(source="location_id", read_only=True)
     locationName = serializers.CharField(source="location.name", read_only=True)
-    referenceId = serializers.CharField(source="reference_id", read_only=True)
-    sourceDocumentId = serializers.CharField(source="source_document_id", read_only=True)
-    originalMovementId = serializers.CharField(source="original_movement_id", read_only=True)
-    reversalMovementId = serializers.CharField(source="reversal_movement_id", read_only=True)
+    direction = serializers.SerializerMethodField()
+    status = serializers.SerializerMethodField()
+    isReversed = serializers.SerializerMethodField()
+    referenceType = serializers.CharField(source="reference_type", read_only=True, allow_null=True)
+    referenceId = serializers.CharField(source="reference_id", read_only=True, allow_null=True)
+    referenceNumber = serializers.CharField(source="reference_number", read_only=True, allow_null=True)
+    sourceDocumentType = serializers.CharField(source="source_document_type", read_only=True, allow_null=True)
+    sourceDocumentId = serializers.CharField(source="source_document_id", read_only=True, allow_null=True)
+    originalMovementId = serializers.CharField(source="original_movement_id", read_only=True, allow_null=True)
+    reversalMovementId = serializers.CharField(source="reversal_movement_id", read_only=True, allow_null=True)
+    creatorName = serializers.SerializerMethodField()
     date = serializers.DateField(source="movement_date", read_only=True)
     serials = serializers.SerializerMethodField()
 
     class Meta:
         model = StockMovement
         fields = [
-            "id", "itemId", "itemSku", "itemName", "locationId", "locationName",
-            "type", "quantity", "weighed_qty", "unit_cost",
-            "reference_type", "referenceId", "reference_number",
-            "source_document_type", "sourceDocumentId",
-            "originalMovementId", "reversalMovementId",
-            "batch_number", "serials", "date", "notes", "created_at",
+            "id", "itemId", "itemSku", "itemName", "itemType", "category", "grade",
+            "dimensions", "specification", "locationId", "locationName", "direction",
+            "type", "quantity", "weighed_qty", "uom", "unit_cost",
+            "reference_type", "referenceType", "referenceId", "reference_number", "referenceNumber",
+            "source_document_type", "sourceDocumentType", "sourceDocumentId",
+            "originalMovementId", "reversalMovementId", "isReversed", "status",
+            "creatorName", "batch_number", "serials", "date", "notes", "created_at",
         ]
+
+    def get_itemType(self, movement):
+        if not movement.item:
+            return None
+        if getattr(movement.item, "item_type", None):
+            return movement.item.item_type.name
+        if movement.item.category and getattr(movement.item.category, "item_type", None):
+            return movement.item.category.item_type.name
+        return None
+
+    def get_grade(self, movement):
+        if not movement.item:
+            return None
+        if getattr(movement.item, "grade_id", None) and movement.item.grade:
+            return movement.item.grade.code or movement.item.grade.name
+        return getattr(movement.item, "metal_grade", None)
+
+    def get_dimensions(self, movement):
+        from apps.inventory.views import format_item_spec
+        return format_item_spec(movement.item) if movement.item else ""
+
+    def get_specification(self, movement):
+        return self.get_dimensions(movement)
+
+    def get_direction(self, movement):
+        return "IN" if movement.quantity > 0 else "OUT"
+
+    def get_isReversed(self, movement):
+        return movement.reversal_movement_id is not None
+
+    def get_status(self, movement):
+        return "Reversed" if movement.reversal_movement_id else "Posted"
+
+    def get_creatorName(self, movement):
+        if movement.created_by:
+            return getattr(movement.created_by, "name", None) or getattr(movement.created_by, "email", "Staff")
+        return "System"
 
     def get_serials(self, movement):
         from apps.masters.models import ItemSerial
@@ -80,6 +130,7 @@ class StockAdjustmentSerializer(BaseSerializer):
     quantity = QuantityField()
     #: True means "set stock to this number"; False means "add this delta".
     isAbsolute = serializers.BooleanField(required=False, default=False)
+    movementType = serializers.CharField(required=False, default="ADJUSTMENT")
     reason = serializers.CharField()
     unitCost = serializers.DecimalField(
         max_digits=18, decimal_places=4, coerce_to_string=False, required=False
@@ -90,8 +141,16 @@ class StockPositionSerializer(BaseSerializer):
     itemId = serializers.CharField()
     sku = serializers.CharField()
     name = serializers.CharField()
+    itemType = serializers.CharField(allow_null=True, required=False)
     category = serializers.CharField(allow_null=True)
+    grade = serializers.CharField(allow_null=True, required=False)
+    dimensions = serializers.CharField(allow_null=True, required=False)
+    locationId = serializers.CharField(allow_null=True, required=False)
+    locationName = serializers.CharField(allow_null=True, required=False)
     uom = serializers.CharField()
+    openingBalance = QuantityField(required=False)
+    totalInward = QuantityField(required=False)
+    totalOutward = QuantityField(required=False)
     onHand = QuantityField()
     reserved = QuantityField()
     available = QuantityField()
@@ -214,46 +273,42 @@ class FaultyPartSerializer(BaseModelSerializer):
 #         read_only_fields = ["ticket_number", "created_at"]
 
 
-# Hidden: Zone Requests out of scope (Sweven spec) -- restore by uncommenting this block.
-# class ZoneRequestLineSerializer(BaseModelSerializer):
-#     itemId = TenantPrimaryKeyRelatedField(source="item", queryset=Item.objects.all())
-#     sku = serializers.CharField(source="item.sku", read_only=True)
-#     product = serializers.CharField(source="item.name", read_only=True)
-#     qty = QuantityField(source="requested_qty")
-#     warehouseStock = serializers.SerializerMethodField()
+class ZoneRequestLineSerializer(BaseModelSerializer):
+    itemId = TenantPrimaryKeyRelatedField(source="item", queryset=Item.objects.all())
+    sku = serializers.CharField(source="item.sku", read_only=True)
+    product = serializers.CharField(source="item.name", read_only=True)
+    qty = QuantityField(source="requested_qty")
+    warehouseStock = serializers.SerializerMethodField()
 
-#     class Meta:
-#         model = ZoneRequestLine
-#         fields = ["id", "itemId", "sku", "product", "qty", "issued_qty", "warehouseStock"]
+    class Meta:
+        model = ZoneRequestLine
+        fields = ["id", "itemId", "sku", "product", "qty", "issued_qty", "warehouseStock"]
 
-#     def get_warehouseStock(self, line):
-#         """api.md §7.3 -- ``warehouseStock`` is the available quantity *at the
-#         time the request is read*, so it is computed on read."""
-#         from . import services as stock
+    def get_warehouseStock(self, line):
+        from . import services as stock
 
-#         client_id = self.context.get("client_id") or line.client_id
-#         return stock.calculate_item_stock(client_id, line.item_id)["available"]
+        client_id = self.context.get("client_id") or line.client_id
+        return stock.calculate_item_stock(client_id, line.item_id)["available"]
 
 
-# Hidden: Zone Requests out of scope (Sweven spec) -- restore by uncommenting this block.
-# class ZoneRequestSerializer(BaseModelSerializer):
-#     lines = ZoneRequestLineSerializer(many=True, required=False)
-#     zone = serializers.CharField(source="zone_location.name", read_only=True)
-#     zoneLocationId = TenantPrimaryKeyRelatedField(
-#         source="zone_location", queryset=Location.objects.all()
-#     )
-#     requestedBy = serializers.CharField(source="requested_by_name", required=False, allow_null=True)
-#     date = serializers.DateField(source="request_date", required=False, allow_null=True)
+class ZoneRequestSerializer(BaseModelSerializer):
+    lines = ZoneRequestLineSerializer(many=True, required=False)
+    zone = serializers.CharField(source="zone_location.name", read_only=True)
+    zoneLocationId = TenantPrimaryKeyRelatedField(
+        source="zone_location", queryset=Location.objects.all()
+    )
+    requestedBy = serializers.CharField(source="requested_by_name", required=False, allow_null=True)
+    date = serializers.DateField(source="request_date", required=False, allow_null=True)
 
-#     class Meta:
-#         model = ZoneRequest
-#         fields = [
-#             "id", "request_number", "requestedBy", "zone", "zoneLocationId",
-#             "target_sector", "date", "requested_at", "status", "notes",
-#             "manager_signoff_needed", "reject_reason", "lines",
-#             "created_at", "updated_at",
-#         ]
-#         read_only_fields = ["request_number", "requested_at", "created_at", "updated_at"]
+    class Meta:
+        model = ZoneRequest
+        fields = [
+            "id", "request_number", "requestedBy", "zone", "zoneLocationId",
+            "target_sector", "date", "requested_at", "status", "notes",
+            "manager_signoff_needed", "reject_reason", "lines",
+            "created_at", "updated_at",
+        ]
+        read_only_fields = ["request_number", "requested_at", "created_at", "updated_at"]
 
 
 class StockAuditLineSerializer(BaseModelSerializer):

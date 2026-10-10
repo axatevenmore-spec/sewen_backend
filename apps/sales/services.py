@@ -46,14 +46,18 @@ from .models import (
     NON_RESERVING_STAGES,
     CashPaymentReceipt,
     DeliveryChallan,
+    DeliveryChallanLine,
     PaymentAllocation,
     PaymentIn,
     SalesInvoice,
+    SalesInvoiceLine,
     SalesInvoiceRevision,
     SalesOrder,
     SalesOrderLine,
     SalesReturn,
 )
+
+QTY = DecimalField(max_digits=18, decimal_places=4)
 
 #: api.md §5.7 -- dueDate defaults to invoice date + 30 days.
 DEFAULT_PAYMENT_TERM_DAYS = 30
@@ -634,30 +638,54 @@ def finalize_invoice(invoice, *, user=None, override_credit_limit=False):
 
 
 def _post_invoice_stock(invoice, lines, *, user=None):
-    """api.md §5.7 rule 3 -- avoid double depletion.
+    """Avoid double depletion (api.md §5.7 rule 3).
 
     A line already dispatched on a challan has moved its stock; matching on the
-    source order line is what makes that check reliable.
+    source order line and tracking the exact quantity already dispatched prevents
+    both under-depletion on partial challans and double-depletion.
     """
-    # Replaced (quotation-first sales): resolving the warehouse up front made a
-    # service / custom-only invoice fail with NO_LOCATION on a workspace that
-    # has no Inventory set up. It is now resolved on the first stock line.
-    # location_id = invoice.location_id or _default_location_id(invoice.client_id)
     location_id = invoice.location_id
 
     for line in lines:
         if line.item_id is None or not line.item.holds_stock:
             continue
         if line.delivery_challan_line_id is not None:
-            continue  # dispatched already
-        if line.sales_order_line_id and _already_dispatched(line.sales_order_line_id):
+            continue  # Dispatched directly by the linked challan line
+
+        qty_to_deduct = D(line.qty)
+        if line.sales_order_line_id:
+            dispatched_on_challans = (
+                DeliveryChallanLine.objects.filter(
+                    sales_order_line_id=line.sales_order_line_id,
+                    deleted_at__isnull=True,
+                    delivery_challan__status__in=CHALLAN_SHIPPED_STATUSES,
+                ).aggregate(total=Coalesce(Sum("qty"), Value(Decimal("0.0000")), output_field=QTY))["total"]
+                or ZERO
+            )
+            order_line = line.sales_order_line
+            prior_direct_invoiced = (
+                SalesInvoiceLine.objects.filter(
+                    sales_order_line_id=line.sales_order_line_id,
+                    delivery_challan_line__isnull=True,
+                    sales_invoice__posted_at__isnull=False,
+                    deleted_at__isnull=True,
+                )
+                .exclude(sales_invoice_id=invoice.id)
+                .aggregate(total=Coalesce(Sum("qty"), Value(Decimal("0.0000")), output_field=QTY))["total"]
+                or ZERO
+            )
+            unmoved_order_qty = max(D(order_line.qty) - D(dispatched_on_challans) - D(prior_direct_invoiced), ZERO)
+            qty_to_deduct = min(qty_to_deduct, unmoved_order_qty)
+
+        if qty_to_deduct <= ZERO:
             continue
+
         if location_id is None:
             location_id = _default_location_id(invoice.client_id)
 
         stock.assert_not_qc_blocked(invoice.client_id, line.item_id, line.item_name)
         stock.assert_sufficient_stock(
-            invoice.client_id, line.item, line.qty, location_id, line.item_name,
+            invoice.client_id, line.item, qty_to_deduct, location_id, line.item_name,
             own_reserved=_own_reservation(line),
         )
 
@@ -665,14 +693,14 @@ def _post_invoice_stock(invoice, lines, *, user=None):
             invoice.client_id, "sales_invoice_lines", [line.id]
         ).get(line.id, [])
         resolved = stock.resolve_serials(invoice.client_id, line.item_id, serials)
-        stock.assert_serial_count(line.item, line.qty, serials, line.item_name)
+        stock.assert_serial_count(line.item, qty_to_deduct, serials, line.item_name)
 
         movement = stock.post_movement(
             client_id=invoice.client_id,
             item=line.item_id,
             location=location_id,
             type="SALE",
-            quantity=-D(line.qty),
+            quantity=-D(qty_to_deduct),
             unit_cost=line.item.cost_price,
             reference_type="SalesInvoice",
             reference_id=invoice.id,
@@ -807,17 +835,48 @@ def dispatch_challan(challan, *, user=None):
 
         if line.item_id is None or not line.item.holds_stock:
             continue
+
+        qty_to_deduct = D(line.qty)
+        if line.sales_order_line_id:
+            order_line = line.sales_order_line
+            # 1. Total moved by other shipped challans for this order line
+            moved_by_challans = (
+                DeliveryChallanLine.objects.filter(
+                    sales_order_line_id=line.sales_order_line_id,
+                    delivery_challan__status__in=CHALLAN_SHIPPED_STATUSES,
+                    deleted_at__isnull=True,
+                )
+                .exclude(pk=line.pk)
+                .aggregate(total=Coalesce(Sum("qty"), Value(Decimal("0.0000")), output_field=QTY))["total"]
+                or ZERO
+            )
+            # 2. Total moved by direct posted invoices for this order line
+            moved_by_invoices = (
+                SalesInvoiceLine.objects.filter(
+                    sales_order_line_id=line.sales_order_line_id,
+                    delivery_challan_line__isnull=True,
+                    sales_invoice__posted_at__isnull=False,
+                    deleted_at__isnull=True,
+                ).aggregate(total=Coalesce(Sum("qty"), Value(Decimal("0.0000")), output_field=QTY))["total"]
+                or ZERO
+            )
+            unmoved_order_qty = max(D(order_line.qty) - D(moved_by_challans) - D(moved_by_invoices), ZERO)
+            qty_to_deduct = min(qty_to_deduct, unmoved_order_qty)
+
+        if qty_to_deduct <= ZERO:
+            continue
+
         if location_id is None:
             location_id = _default_location_id(challan.client_id)
 
         stock.assert_not_qc_blocked(challan.client_id, line.item_id, line.item_name)
         stock.assert_sufficient_stock(
-            challan.client_id, line.item, line.qty, location_id, line.item_name,
+            challan.client_id, line.item, qty_to_deduct, location_id, line.item_name,
             own_reserved=_own_reservation(line),
         )
 
         serial_numbers = serial_map.get(line.id, [])
-        stock.assert_serial_count(line.item, line.qty, serial_numbers, line.item_name)
+        stock.assert_serial_count(line.item, qty_to_deduct, serial_numbers, line.item_name)
         resolved = stock.resolve_serials(challan.client_id, line.item_id, serial_numbers)
 
         movement = stock.post_movement(
@@ -825,7 +884,7 @@ def dispatch_challan(challan, *, user=None):
             item=line.item_id,
             location=location_id,
             type="SALE",
-            quantity=-D(line.qty),
+            quantity=-D(qty_to_deduct),
             unit_cost=line.item.cost_price,
             reference_type="DeliveryChallan",
             reference_id=challan.id,

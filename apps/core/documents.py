@@ -170,6 +170,24 @@ class DocumentLine(TenantModel):
         self.uom = self.uom or item.uom
         if not self.description:
             self.description = item.description
+        if hasattr(self, "material_grade") and not self.material_grade:
+            self.material_grade = (
+                (item.grade.code if getattr(item, "grade", None) else None)
+                or getattr(item, "metal_grade", None)
+            )
+        if hasattr(self, "unit_weight") and (self.unit_weight is None or self.unit_weight == 0):
+            weight = getattr(item, "theoretical_weight", None) or getattr(item, "sheet_weight_kg", None) or getattr(item, "weight_per_piece", None)
+            if weight:
+                self.unit_weight = weight
+        if hasattr(self, "specification") and not self.specification:
+            from apps.inventory.views import format_item_spec
+            self.specification = format_item_spec(item)
+        if hasattr(self, "line_kind") and not self.line_kind:
+            item_type = getattr(item, "item_type", None)
+            if not item_type and getattr(item, "category", None) and getattr(item.category, "item_type", None):
+                item_type = item.category.item_type
+            if item_type:
+                self.line_kind = item_type.name
 
 
 def total_check_constraint(table_name):

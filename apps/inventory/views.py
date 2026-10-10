@@ -48,11 +48,39 @@ from .serializers import (
     StockAuditSerializer,
     StockMovementSerializer,
     StockTransferSerializer,
-    # ZoneRequestSerializer,  # Hidden: out of scope
+    ZoneRequestSerializer,
 )
 
 QTY = DecimalField(max_digits=18, decimal_places=4)
 MONEY = DecimalField(max_digits=18, decimal_places=2)
+
+
+def format_item_spec(item):
+    if not item:
+        return ""
+    if getattr(item, "specification", None):
+        return item.specification
+    parts = []
+    thk = getattr(item, "sheet_thickness", None) or getattr(item, "wall_thickness", None) or getattr(item, "thickness_mm", None)
+    if thk:
+        parts.append(f"{thk}mm THK")
+    length = getattr(item, "sheet_length", None) or getattr(item, "tube_length", None) or getattr(item, "length_mm", None)
+    width = getattr(item, "sheet_width", None) or getattr(item, "outer_width", None) or getattr(item, "width_mm", None)
+    if length and width:
+        parts.append(f"{length}x{width}mm")
+    elif length:
+        parts.append(f"L={length}mm")
+    dia = getattr(item, "diameter", None) or getattr(item, "outer_diameter", None) or getattr(item, "diameter_mm", None)
+    if dia:
+        parts.append(f"Dia {dia}mm")
+    leg_a = getattr(item, "leg_a", None) or getattr(item, "leg_a_mm", None)
+    leg_b = getattr(item, "leg_b", None) or getattr(item, "leg_b_mm", None)
+    if leg_a and leg_b:
+        parts.append(f"{leg_a}x{leg_b}mm")
+    finish = getattr(item, "finish_coating", None)
+    if finish:
+        parts.append(f"Finish: {finish}")
+    return " | ".join(parts) if parts else ""
 
 
 # ---------------------------------------------------------------------------
@@ -65,28 +93,45 @@ class StockPositionView(APIView):
     required_permissions = ["view_inventory"]
 
     def get(self, request):
-        queryset = Item.objects.filter(
-            client_id=request.client_id, deleted_at__isnull=True
-        ).exclude(item_kind="Service").select_related("category")
+        queryset = (
+            Item.objects.filter(client_id=request.client_id, deleted_at__isnull=True)
+            .exclude(item_kind="Service")
+            .select_related("category", "category__item_type", "item_type", "grade", "default_location")
+        )
 
         category_id = request.query_params.get("categoryId")
         if category_id:
             queryset = queryset.filter(category_id=category_id)
 
-        location_id = request.query_params.get("locationId")
-        items = list(queryset)
-        stock.annotate_items_with_stock(request.client_id, items)
-
-        if location_id:
-            balances = stock.balances_for(
-                request.client_id, [item.id for item in items], location_id
+        item_type_id = request.query_params.get("itemTypeId")
+        if item_type_id:
+            queryset = queryset.filter(
+                Q(item_type_id=item_type_id) | Q(category__item_type_id=item_type_id)
             )
-            for item in items:
-                row = balances.get(item.id, {})
-                item.on_hand_qty = row.get("on_hand", ZERO) or ZERO
-                item.damaged_qty = row.get("damaged", ZERO) or ZERO
-                item.available_qty = item.on_hand_qty - (item.reserved_qty or ZERO)
-                item.stock_status = stock.stock_status(item.available_qty, item.reorder_level)
+
+        grade = request.query_params.get("grade")
+        if grade:
+            queryset = queryset.filter(
+                Q(grade__code__iexact=grade)
+                | Q(grade__name__iexact=grade)
+                | Q(metal_grade__iexact=grade)
+            )
+
+        search = request.query_params.get("search")
+        if search:
+            queryset = queryset.filter(
+                Q(sku__icontains=search)
+                | Q(name__icontains=search)
+                | Q(specification__icontains=search)
+            )
+
+        location_id = request.query_params.get("locationId")
+        loc_obj = None
+        if location_id:
+            loc_obj = Location.objects.filter(pk=location_id, client_id=request.client_id).first()
+
+        items = list(queryset)
+        stock.annotate_items_with_stock(request.client_id, items, location_id=location_id)
 
         if request.query_params.get("belowReorder") == "true":
             items = [item for item in items if item.stock_status in ("Low Stock", "Critical")]
@@ -100,13 +145,39 @@ class StockPositionView(APIView):
             unit_cost = round4(item.cost_price)
             value = round2(D(item.on_hand_qty) * unit_cost)
             total_value += value
+
+            item_type_name = None
+            if getattr(item, "item_type", None):
+                item_type_name = item.item_type.name
+            elif item.category and getattr(item.category, "item_type", None):
+                item_type_name = item.category.item_type.name
+
+            category_name = item.category.name if item.category_id else None
+            grade_name = None
+            if getattr(item, "grade_id", None) and item.grade:
+                grade_name = item.grade.code or item.grade.name
+            elif getattr(item, "metal_grade", None):
+                grade_name = item.metal_grade
+            dimensions = format_item_spec(item)
+            loc_name = loc_obj.name if loc_obj else (item.default_location.name if item.default_location else "All Locations")
+            loc_id_str = str(loc_obj.id) if loc_obj else (str(item.default_location_id) if item.default_location_id else None)
+
             rows.append(
                 {
                     "itemId": str(item.id),
                     "sku": item.sku,
                     "name": item.name,
-                    "category": item.category.name if item.category_id else None,
+                    "itemType": item_type_name,
+                    "category": category_name,
+                    "grade": grade_name,
+                    "dimensions": dimensions,
+                    "specification": dimensions,
+                    "locationId": loc_id_str,
+                    "locationName": loc_name,
                     "uom": item.uom,
+                    "openingBalance": item.opening_qty,
+                    "totalInward": item.inward_qty,
+                    "totalOutward": item.outward_qty,
                     "onHand": item.on_hand_qty,
                     "reserved": item.reserved_qty,
                     "available": item.available_qty,
@@ -167,7 +238,9 @@ class StockMovementViewSet(ReadOnlyTenantViewSet):
     reversing movements (api.md §7.2).
     """
 
-    queryset = StockMovement.objects.select_related("item", "location")
+    queryset = StockMovement.objects.select_related(
+        "item", "item__category", "item__item_type", "item__grade", "location", "created_by"
+    )
     serializer_class = StockMovementSerializer
     required_permissions = ["view_inventory"]
     status_field = None
@@ -185,6 +258,20 @@ class StockMovementViewSet(ReadOnlyTenantViewSet):
     search_fields = ["reference_number", "item__sku", "item__name", "notes"]
     ordering = ["-movement_date", "-created_at"]
 
+    def filter_queryset(self, queryset):
+        qs = super().filter_queryset(queryset)
+        direction = self.request.query_params.get("direction")
+        if direction:
+            if direction.lower() in ("in", "inward"):
+                qs = qs.filter(quantity__gt=0)
+            elif direction.lower() in ("out", "outward"):
+                qs = qs.filter(quantity__lt=0)
+
+        source_doc_type = self.request.query_params.get("sourceDocumentType") or self.request.query_params.get("source_document_type")
+        if source_doc_type:
+            qs = qs.filter(Q(source_document_type__iexact=source_doc_type) | Q(reference_type__iexact=source_doc_type))
+        return qs
+
     def get_aggregates(self, queryset):
         rows = queryset.aggregate(
             inward=Coalesce(
@@ -199,6 +286,28 @@ class StockMovementViewSet(ReadOnlyTenantViewSet):
         )
         rows["outward"] = abs(rows["outward"])
         return rows
+
+    @action(detail=False, methods=["get"], url_path="inward")
+    def inward(self, request):
+        """``GET /inventory/movements/inward/`` -- all inward movements."""
+        qs = self.filter_queryset(self.get_queryset().filter(quantity__gt=0))
+        page = self.paginate_queryset(qs)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        serializer = self.get_serializer(qs, many=True)
+        return Response(envelope(serializer.data))
+
+    @action(detail=False, methods=["get"], url_path="outward")
+    def outward(self, request):
+        """``GET /inventory/movements/outward/`` -- all outward movements."""
+        qs = self.filter_queryset(self.get_queryset().filter(quantity__lt=0))
+        page = self.paginate_queryset(qs)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            return self.get_paginated_response(serializer.data)
+        serializer = self.get_serializer(qs, many=True)
+        return Response(envelope(serializer.data))
 
 
 class StockAdjustmentView(APIView):
@@ -235,11 +344,15 @@ class StockAdjustmentView(APIView):
                 code="NO_CHANGE",
             )
 
+        movement_type = data.get("movementType") or "ADJUSTMENT"
+        if movement_type not in ("ADJUSTMENT", "OPENING_STOCK"):
+            movement_type = "ADJUSTMENT"
+
         movement = stock.post_movement(
             client_id=request.client_id,
             item=item,
             location=location,
-            type="ADJUSTMENT",
+            type=movement_type,
             quantity=delta,
             unit_cost=data.get("unitCost") or item.cost_price,
             notes=data["reason"],
@@ -257,6 +370,26 @@ class StockAdjustmentView(APIView):
             },
             status=status.HTTP_201_CREATED,
         )
+
+
+class StockReconciliationView(APIView):
+    """``POST /inventory/stock/reconcile/`` -- reconciles StockBalance against ledger."""
+
+    permission_classes = [HasModulePermission]
+    required_permissions = ["adjust_stock"]
+
+    def post(self, request):
+        item_id = request.data.get("itemId")
+        location_id = request.data.get("locationId")
+        auto_fix = bool(request.data.get("autoFix", False))
+
+        report = stock.reconcile_stock(
+            client_id=request.client_id,
+            item_id=item_id,
+            location_id=location_id,
+            auto_fix=auto_fix,
+        )
+        return Response(report)
 
 
 # ---------------------------------------------------------------------------
@@ -479,71 +612,74 @@ class FaultyPartViewSet(TenantModelViewSet):
 #         return usage
 
 
-# Hidden: Zone Requests out of scope (Sweven spec) -- restore by uncommenting this block.
-# class ZoneRequestViewSet(TenantModelViewSet):
-#     queryset = ZoneRequest.objects.select_related("zone_location").prefetch_related("lines__item")
-#     serializer_class = ZoneRequestSerializer
-#     audit_entity_type = "ZoneRequest"
-#     audit_label_field = "request_number"
-#     required_permissions = ["view_inventory"]
-#     status_field = "status"
-#     default_date_field = "request_date"
-#     search_fields = ["request_number", "requested_by_name", "notes"]
-#     ordering = ["-requested_at"]
+class ZoneRequestViewSet(TenantModelViewSet):
+    queryset = ZoneRequest.objects.select_related("zone_location").prefetch_related("lines__item")
+    serializer_class = ZoneRequestSerializer
+    audit_entity_type = "ZoneRequest"
+    audit_label_field = "request_number"
+    required_permissions = ["view_inventory"]
+    status_field = "status"
+    default_date_field = "request_date"
+    search_fields = ["request_number", "requested_by_name", "notes"]
+    ordering = ["-requested_at"]
 
-#     @transaction.atomic
-#     def perform_create(self, serializer):
-#         lines = serializer.validated_data.pop("lines", [])
-#         serializer.validated_data["request_number"] = allocate_number(
-#             self.request.user.client, "REQ"
-#         )
-#         serializer.validated_data.setdefault("requested_by", self.request.user)
-#         serializer.validated_data.setdefault("requested_by_name", self.request.user.name)
-#         request_row = super().perform_create(serializer)
+    @transaction.atomic
+    def perform_create(self, serializer):
+        lines = serializer.validated_data.pop("lines", [])
+        serializer.validated_data["request_number"] = allocate_number(
+            self.request.user.client, "REQ"
+        )
+        serializer.validated_data.setdefault("requested_by", self.request.user)
+        serializer.validated_data.setdefault("requested_by_name", self.request.user.name)
+        request_row = super().perform_create(serializer)
 
-#         ZoneRequestLine.objects.bulk_create(
-#             [
-#                 ZoneRequestLine(client_id=self.get_client_id(), zone_request=request_row, **line)
-#                 for line in lines
-#             ]
-#         )
-#         return request_row
+        ZoneRequestLine.objects.bulk_create(
+            [
+                ZoneRequestLine(client_id=self.get_client_id(), zone_request=request_row, **line)
+                for line in lines
+            ]
+        )
+        return request_row
 
-#     @transaction.atomic
-#     def perform_update(self, serializer):
-#         """api.md §7 -- only the ``Fulfilled`` transition issues stock."""
-#         previous = serializer.instance.status
-#         request_row = super().perform_update(serializer)
+    @transaction.atomic
+    def perform_update(self, serializer):
+        """api.md §7 -- only the ``Fulfilled`` transition issues stock."""
+        previous = serializer.instance.status
+        request_row = super().perform_update(serializer)
 
-#         if previous != "Fulfilled" and request_row.status == "Fulfilled":
-#             from apps.core.permissions import require_permission
+        if previous != "Fulfilled" and request_row.status == "Fulfilled":
+            from apps.core.permissions import require_permission
 
-#             require_permission(self.request.user, "approve_zone_request")
-#             for line in request_row.lines.filter(deleted_at__isnull=True).select_related("item"):
-#                 quantity = D(line.requested_qty) - D(line.issued_qty)
-#                 if quantity <= ZERO or not line.item.holds_stock:
-#                     continue
-#                 stock.assert_sufficient_stock(
-#                     self.get_client_id(), line.item, quantity,
-#                     request_row.zone_location_id, line.item.name,
-#                 )
-#                 stock.post_movement(
-#                     client_id=self.get_client_id(),
-#                     item=line.item_id,
-#                     location=request_row.zone_location_id,
-#                     type="ZONE_ISSUE",
-#                     quantity=-quantity,
-#                     unit_cost=line.item.cost_price,
-#                     reference_type="ZoneRequest",
-#                     reference_id=request_row.id,
-#                     reference_number=request_row.request_number,
-#                     user=self.request.user,
-#                 )
-#                 line.issued_qty = line.requested_qty
-#                 line.save(update_fields=["issued_qty", "updated_at"])
-#             request_row.issued_by = self.request.user
-#             request_row.save(update_fields=["issued_by", "updated_at"])
-#         return request_row
+            require_permission(self.request.user, "approve_zone_request")
+            for line in request_row.lines.filter(deleted_at__isnull=True).select_related("item"):
+                quantity = D(line.requested_qty) - D(line.issued_qty)
+                if quantity <= ZERO or not line.item.holds_stock:
+                    continue
+                stock.assert_sufficient_stock(
+                    self.get_client_id(), line.item, quantity,
+                    request_row.zone_location_id, line.item.name,
+                )
+                stock.post_movement(
+                    client_id=self.get_client_id(),
+                    item=line.item_id,
+                    location=request_row.zone_location_id,
+                    type="ZONE_ISSUE",
+                    quantity=-quantity,
+                    uom=line.item.uom,
+                    unit_cost=line.item.cost_price,
+                    reference_type="ZoneRequest",
+                    reference_id=request_row.id,
+                    reference_number=request_row.request_number,
+                    source_document_type="ZoneRequest",
+                    source_document_id=request_row.id,
+                    notes=f"Shop-floor material issue against requisition {request_row.request_number}",
+                    user=self.request.user,
+                )
+                line.issued_qty = line.requested_qty
+                line.save(update_fields=["issued_qty", "updated_at"])
+            request_row.issued_by = self.request.user
+            request_row.save(update_fields=["issued_by", "updated_at"])
+        return request_row
 
 
 # ---------------------------------------------------------------------------
@@ -788,6 +924,13 @@ class ReworkOrderViewSet(TenantModelViewSet):
         rework.status = "Scrapped" if rework.scrap_qty >= rework.quantity else "In Rework"
         rework.save(update_fields=["scrap_qty", "scrap_rate_pct", "status", "updated_at"])
 
+        location_id = (
+            request.data.get("locationId")
+            or getattr(rework.goods_receipt, "location_id", None)
+            or rework.item.default_location_id
+            or Location.objects.filter(client_id=request.client_id).values_list("id", flat=True).first()
+        )
+
         scr_num = allocate_number(request.user.client, "SCR")
         scrap = ScrapLog.objects.create(
             client=rework.client,
@@ -799,6 +942,28 @@ class ReworkOrderViewSet(TenantModelViewSet):
             rework_order=rework,
             logged_by=request.user,
         )
+
+        if location_id and rework.item.holds_stock:
+            stock.assert_sufficient_stock(
+                request.client_id, rework.item, scrap_qty, location_id, rework.item.name
+            )
+            stock.post_movement(
+                client_id=request.client_id,
+                item=rework.item_id,
+                location=location_id,
+                type="SCRAP",
+                quantity=-scrap_qty,
+                uom=rework.item.uom,
+                unit_cost=rework.item.cost_price,
+                reference_type="ScrapLog",
+                reference_id=scrap.id,
+                reference_number=scr_num,
+                source_document_type="ScrapLog",
+                source_document_id=scrap.id,
+                notes=f"Scrap write-off from rework order {rework.rework_number}: {scrap_reason}",
+                user=request.user,
+            )
+
         self.write_audit("log_scrap", rework, description=f"Scrapped {scrap_qty} units under {scr_num}.")
         return Response({
             "rework": self.get_serializer(rework).data,
@@ -806,12 +971,53 @@ class ReworkOrderViewSet(TenantModelViewSet):
         })
 
 
-class ScrapLogViewSet(ReadOnlyTenantViewSet):
+class ScrapLogViewSet(TenantModelViewSet):
     queryset = ScrapLog.objects.select_related("item", "rework_order", "logged_by")
     serializer_class = ScrapLogSerializer
+    audit_entity_type = "ScrapLog"
+    audit_label_field = "scrap_number"
     required_permissions = ["view_inventory"]
+    permission_map = {"write": ["adjust_stock"]}
     search_fields = ["scrap_number", "item__name", "scrap_reason"]
     ordering = ["-logged_at"]
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        item = serializer.validated_data["item"]
+        qty = Decimal(str(serializer.validated_data["quantity"]))
+        location_id = (
+            self.request.data.get("locationId")
+            or item.default_location_id
+            or Location.objects.filter(client_id=self.get_client_id()).values_list("id", flat=True).first()
+        )
+        if not location_id:
+            raise ValidationFailed("Location is required to scrap material.", field_errors={"locationId": ["Required."]})
+
+        scr_num = allocate_number(self.request.user.client, "SCR")
+        serializer.validated_data["scrap_number"] = scr_num
+        serializer.validated_data["logged_by"] = self.request.user
+        scrap = super().perform_create(serializer)
+
+        if item.holds_stock:
+            stock.assert_sufficient_stock(self.get_client_id(), item, qty, location_id, item.name)
+            stock.post_movement(
+                client_id=self.get_client_id(),
+                item=item.id,
+                location=location_id,
+                type="SCRAP",
+                quantity=-qty,
+                uom=item.uom,
+                unit_cost=item.cost_price,
+                reference_type="ScrapLog",
+                reference_id=scrap.id,
+                reference_number=scr_num,
+                source_document_type="ScrapLog",
+                source_document_id=scrap.id,
+                movement_date=timezone.localdate(),
+                notes=scrap.scrap_reason,
+                user=self.request.user,
+            )
+        return scrap
 
 
 # Hidden: QC out of scope

@@ -10,29 +10,35 @@ from rest_framework.routers import DefaultRouter
 
 from apps.masters.views import (
     ItemCategoryViewSet,
+    ItemTypeViewSet,
     ItemViewSet,
     LocationViewSet,
+    MaterialGradeViewSet,
     UnitViewSet,
 )
 
 from . import views
 
 router = DefaultRouter(trailing_slash=True)
+router.register("item-types", ItemTypeViewSet, basename="inventory-item-types")
+router.register("material-grades", MaterialGradeViewSet, basename="inventory-material-grades")
 router.register("items", ItemViewSet, basename="inventory-items")
 router.register("categories", ItemCategoryViewSet, basename="inventory-categories")
 router.register("units", UnitViewSet, basename="inventory-units")
 router.register("locations", LocationViewSet, basename="inventory-locations")
 router.register("movements", views.StockMovementViewSet, basename="inventory-movements")
 router.register("transfers", views.StockTransferViewSet, basename="inventory-transfers")
-router.register("faulty-parts", views.FaultyPartViewSet, basename="inventory-faulty-parts")
+# router.register("faulty-parts", views.FaultyPartViewSet, basename="inventory-faulty-parts") # Hidden: Faulty Parts out of scope
 router.register("demo-units", views.DemoUnitViewSet, basename="inventory-demo-units")
 router.register("rework-orders", views.ReworkOrderViewSet, basename="inventory-rework-orders")
 router.register("scrap-logs", views.ScrapLogViewSet, basename="inventory-scrap-logs")
+router.register("zone-requests", views.ZoneRequestViewSet, basename="inventory-zone-requests")
 # router.register("quality-inspections", views.QualityInspectionViewSet, basename="inventory-quality-inspections") # Hidden: QC out of scope
 router.register("audits", views.StockAuditViewSet, basename="inventory-audits")
 
 urlpatterns = [
     path("stock/summary/", views.StockSummaryView.as_view(), name="inventory-stock-summary"),
+    path("stock/reconcile/", views.StockReconciliationView.as_view(), name="inventory-stock-reconcile"),
     path("stock/", views.StockPositionView.as_view(), name="inventory-stock"),
     path("adjustments/", views.StockAdjustmentView.as_view(), name="inventory-adjustments"),
     # Hidden: Valuation & Ageing screen out of scope (Sweven spec). ValuationView

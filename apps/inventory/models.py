@@ -11,6 +11,7 @@ from apps.core.models import LegacyIdMixin, TenantModel
 
 #: api.md §7.2 -- the full movement vocabulary.
 MOVEMENT_TYPES = [
+    ("OPENING_STOCK", "OPENING_STOCK"),
     ("PURCHASE", "PURCHASE"),
     ("PURCHASE_RETURN", "PURCHASE_RETURN"),
     ("PURCHASE_REVERSAL", "PURCHASE_REVERSAL"),
@@ -22,8 +23,10 @@ MOVEMENT_TYPES = [
     ("TRANSFER_OUT", "TRANSFER_OUT"),
     ("ADJUSTMENT", "ADJUSTMENT"),
     ("FAULTY", "FAULTY"),
+    ("SCRAP", "SCRAP"),
     ("SERVICE_USAGE", "SERVICE_USAGE"),
     ("ZONE_ISSUE", "ZONE_ISSUE"),
+    ("MATERIAL_ISSUE", "MATERIAL_ISSUE"),
 ]
 
 #: Movements that reverse an earlier one, keyed to what they reverse.
@@ -54,6 +57,7 @@ class StockMovement(TenantModel, LegacyIdMixin):
     weighed_qty = models.DecimalField(
         max_digits=18, decimal_places=4, null=True, blank=True
     )
+    uom = models.TextField(null=True, blank=True)
     unit_cost = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
 
     reference_type = models.TextField(null=True, blank=True)
@@ -81,9 +85,9 @@ class StockMovement(TenantModel, LegacyIdMixin):
                 condition=~models.Q(quantity=0), name="ck_movement_nonzero"
             ),
             # api.md §7.2 -- every movement carries a reference document; orphan
-            # movements are allowed only for ADJUSTMENT, and only with a reason.
+            # movements are allowed only for ADJUSTMENT and OPENING_STOCK.
             models.CheckConstraint(
-                condition=models.Q(reference_id__isnull=False) | models.Q(type="ADJUSTMENT"),
+                condition=models.Q(reference_id__isnull=False) | models.Q(type__in=["ADJUSTMENT", "OPENING_STOCK"]),
                 name="ck_movement_reference",
             ),
             models.CheckConstraint(

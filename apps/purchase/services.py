@@ -296,7 +296,7 @@ def apportion_landed_cost(bill, lines):
     return lines
 
 
-def _create_goods_receipt(bill, lines, location_id, qc_status, *, user=None):
+def _create_goods_receipt(bill, lines, location_id, qc_status, *, user=None, status="Received"):
     """A first-class GRN, which db.md §6.1 recommends even though the frontend
     has none -- the bill-scoped endpoint above is what the page calls."""
     receipt = GoodsReceipt.objects.create(
@@ -307,6 +307,7 @@ def _create_goods_receipt(bill, lines, location_id, qc_status, *, user=None):
         party=bill.party,
         receipt_date=timezone.localdate(),
         location_id=location_id,
+        status=status,
         qc_status="Approved" if qc_status == "Approved" else "Pending",
         created_by=user if getattr(user, "is_authenticated", False) else None,
     )
@@ -321,6 +322,7 @@ def _create_goods_receipt(bill, lines, location_id, qc_status, *, user=None):
                 ordered_qty=line.qty,
                 received_qty=line.received_qty,
                 weighed_qty=line.received_weight,
+                uom=getattr(line.item, "uom", None),
                 batch_number=line.batch_number,
                 unit_cost=line.landed_unit_cost,
                 variation_pct=line.variation_pct,
@@ -348,6 +350,7 @@ def _post_receipt_stock(bill, lines, location_id, overrides, receipt, *, user=No
             type="PURCHASE",
             quantity=quantity,
             weighed_qty=line.received_weight if line.is_weight_item else None,
+            uom=getattr(line.item, "uom", None),
             unit_cost=line.landed_unit_cost,
             reference_type="PurchaseBill",
             reference_id=bill.id,
@@ -356,6 +359,7 @@ def _post_receipt_stock(bill, lines, location_id, overrides, receipt, *, user=No
             source_document_id=receipt.id,
             batch_number=line.batch_number,
             movement_date=timezone.localdate(),
+            prevent_duplicate=True,
             user=user,
         )
 
@@ -367,6 +371,120 @@ def _post_receipt_stock(bill, lines, location_id, overrides, receipt, *, user=No
                 bill.client_id, line.item, serial_numbers, location_id, movement,
                 line.batch_number,
             )
+
+
+@transaction.atomic
+def post_goods_receipt(receipt, *, user=None):
+    """Posts a GoodsReceipt directly to inventory movements and updates linked PO."""
+    receipt = GoodsReceipt.objects.select_for_update().get(pk=receipt.pk)
+    if receipt.status == "Cancelled":
+        raise Conflict("Cannot post a cancelled Goods Receipt Note.", code=Codes.ALREADY_CANCELLED)
+    if receipt.status == "Received" and stock.has_document_posted_stock(receipt.client_id, "GoodsReceipt", receipt.id):
+        raise Conflict(f"Goods Receipt {receipt.grn_number} has already been posted to stock.", code=Codes.ALREADY_POSTED)
+
+    location_id = receipt.location_id
+    if not location_id:
+        raise ValidationFailed("Warehouse location is required to receive goods.", field_errors={"locationId": ["Required."]})
+
+    lines = list(receipt.lines.select_related("item", "purchase_order_line").all())
+    if not lines:
+        raise ValidationFailed("Goods receipt must have at least one line item.", field_errors={"lines": ["Empty lines."]})
+
+    posted_movements = []
+    for line in lines:
+        if line.item_id is None or not line.item.holds_stock:
+            continue
+        qty = D(line.received_qty)
+        if qty <= ZERO:
+            continue
+
+        item_uom = line.uom or getattr(line.item, "uom", None) or "Nos"
+        weighed_qty = line.weighed_qty if line.item.is_weight_item else None
+
+        mv = stock.post_movement(
+            client_id=receipt.client_id,
+            item=line.item_id,
+            location=location_id,
+            type="PURCHASE",
+            quantity=qty,
+            weighed_qty=weighed_qty,
+            uom=item_uom,
+            unit_cost=line.unit_cost or line.item.cost_price,
+            reference_type="GoodsReceipt",
+            reference_id=receipt.id,
+            reference_number=receipt.grn_number,
+            source_document_type="GoodsReceipt",
+            source_document_id=receipt.id,
+            batch_number=line.batch_number,
+            movement_date=receipt.receipt_date,
+            prevent_duplicate=True,
+            user=user,
+        )
+        posted_movements.append(mv)
+
+        # Update PO line if linked (supports partial receipts)
+        if line.purchase_order_line_id:
+            po_line = PurchaseOrderLine.objects.select_for_update().get(pk=line.purchase_order_line_id)
+            po_line.received_qty = round4(D(po_line.received_qty) + qty)
+            po_line.save(update_fields=["received_qty", "updated_at"])
+
+    receipt.status = "Received"
+    receipt.save(update_fields=["status", "updated_at"])
+
+    # If linked to a PO, update PO received status
+    if receipt.purchase_order_id:
+        _refresh_po_status_after_receipt(receipt.purchase_order)
+
+    return receipt
+
+
+@transaction.atomic
+def cancel_goods_receipt(receipt, *, reason=None, user=None):
+    """Cancels a GoodsReceipt and reverses all associated stock movements."""
+    receipt = GoodsReceipt.objects.select_for_update().get(pk=receipt.pk)
+    if receipt.status == "Cancelled":
+        raise Conflict("This Goods Receipt Note is already cancelled.", code=Codes.ALREADY_CANCELLED)
+
+    # Reverse movements
+    stock.reverse_movements(
+        reference_type="GoodsReceipt",
+        reference_id=receipt.id,
+        client_id=receipt.client_id,
+        user=user,
+        notes=reason or f"Cancellation of GRN {receipt.grn_number}",
+    )
+
+    # If linked to a PO, revert PO received quantities
+    for line in receipt.lines.select_related("purchase_order_line").all():
+        if line.purchase_order_line_id:
+            po_line = PurchaseOrderLine.objects.select_for_update().get(pk=line.purchase_order_line_id)
+            po_line.received_qty = max(round4(D(po_line.received_qty) - D(line.received_qty)), ZERO)
+            po_line.save(update_fields=["received_qty", "updated_at"])
+
+    if receipt.purchase_order_id:
+        _refresh_po_status_after_receipt(receipt.purchase_order)
+
+    receipt.status = "Cancelled"
+    receipt.save(update_fields=["status", "updated_at"])
+    return receipt
+
+
+def _refresh_po_status_after_receipt(po):
+    po = PurchaseOrder.objects.select_for_update().get(pk=po.pk)
+    if po.status in ("Cancelled", "Closed"):
+        return
+    lines = po.line_items.filter(deleted_at__isnull=True)
+    total_ord = sum((D(l.qty) for l in lines), ZERO)
+    total_rec = sum((D(l.received_qty) for l in lines), ZERO)
+    if total_ord > ZERO and total_rec >= total_ord:
+        new_status = "Received"
+    elif total_rec > ZERO:
+        new_status = "Partially Received"
+    else:
+        new_status = po.status
+    if po.status != new_status:
+        po.status = new_status
+        po.save(update_fields=["status", "updated_at"])
 
 
 def _register_serials(client_id, item, serial_numbers, location_id, movement, batch_number):

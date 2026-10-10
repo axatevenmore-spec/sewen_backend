@@ -481,6 +481,11 @@ def _clone_document(source, target_model, overrides, *, number_field, series,
         "shipping_address", "place_of_supply", "notes", "terms",
         "freight_charges", "other_charges", "discount_override",
     ]
+    # The lead link travels down the pipeline (Estimate -> Quotation/Challan)
+    # when both documents carry it.
+    for lead_field in ("crm_lead_id",):
+        if hasattr(source, lead_field) and hasattr(target_model, lead_field):
+            copied_fields.append(lead_field)
     payload = {field: getattr(source, field) for field in copied_fields}
     payload["doc_date"] = timezone.localdate()
     payload.update(overrides)
@@ -551,6 +556,122 @@ class QuotationViewSet(ApprovalLinkActions, SalesDocumentViewSet):
                 f"This quotation is {quotation.status}.", code=Codes.ALREADY_DONE
             )
 
+        mappings = {}
+        raw_lines = request.data.get("lines") or request.data.get("lineMappings") or []
+        if isinstance(raw_lines, dict):
+            mappings = raw_lines
+        elif isinstance(raw_lines, list):
+            for entry in raw_lines:
+                if isinstance(entry, dict):
+                    lid = str(entry.get("lineId") or entry.get("id") or entry.get("line_id") or "")
+                    if lid:
+                        mappings[lid] = entry
+
+        def get_line_overrides(quote_line):
+            if not mappings:
+                return {}
+            lid = str(quote_line.id)
+            mapping = mappings.get(lid)
+            if not mapping:
+                mapping = mappings.get(str(quote_line.line_no)) or mappings.get(str(quote_line.line_no - 1))
+            if not mapping:
+                return {}
+
+            overrides = {}
+            # Quantity validation
+            req_qty = mapping.get("qty")
+            if req_qty is not None:
+                try:
+                    qty_dec = Decimal(str(req_qty))
+                except Exception:
+                    raise ValidationFailed(
+                        "Invalid quantity.",
+                        field_errors={"qty": ["Quantity must be a valid number."]},
+                    )
+                if qty_dec <= ZERO:
+                    raise ValidationFailed(
+                        "Requested quantity must be greater than zero.",
+                        field_errors={"qty": ["Quantity must be greater than 0."]},
+                    )
+                overrides["qty"] = qty_dec
+
+            # Item link validation
+            item_id = mapping.get("itemId") or mapping.get("item_id")
+            if item_id in (None, "", "custom"):
+                # Explicit custom metal product / no inventory SKU
+                return overrides
+
+            from apps.masters.models import Item
+            from apps.inventory.views import format_item_spec
+            item = Item.objects.filter(
+                client_id=quotation.client_id,
+                pk=item_id,
+                deleted_at__isnull=True,
+            ).select_related("category", "category__item_type", "item_type", "grade").first()
+            if not item:
+                raise ValidationFailed(
+                    f"Inventory item not found for line {quote_line.line_no}.",
+                    field_errors={"itemId": [f"Item {item_id} does not exist or has been deleted."]},
+                )
+
+            # Specification validation (item type, category, grade, uom)
+            expected_type = mapping.get("itemType") or mapping.get("item_type")
+            if expected_type:
+                actual_type = (
+                    item.item_type.name if item.item_type
+                    else (item.category.item_type.name if item.category and item.category.item_type else "")
+                )
+                if actual_type and actual_type.lower() != str(expected_type).lower():
+                    raise ValidationFailed(
+                        f"Item type mismatch: item is '{actual_type}', expected '{expected_type}'.",
+                        field_errors={"itemType": [f"Selected item type '{actual_type}' does not match."]},
+                    )
+
+            expected_category = mapping.get("category") or mapping.get("categoryId") or mapping.get("category_id")
+            if expected_category:
+                if str(item.category_id) != str(expected_category) and (not item.category or item.category.name.lower() != str(expected_category).lower()):
+                    raise ValidationFailed(
+                        f"Item category mismatch for item {item.sku}.",
+                        field_errors={"category": ["Category does not match selected item."]},
+                    )
+
+            expected_grade = mapping.get("materialGrade") or mapping.get("grade") or mapping.get("gradeId")
+            if expected_grade:
+                item_grade = (item.grade.code if item.grade else None) or item.metal_grade or ""
+                if item_grade and item_grade.lower() != str(expected_grade).lower():
+                    raise ValidationFailed(
+                        f"Material grade mismatch: item is '{item_grade}', expected '{expected_grade}'.",
+                        field_errors={"materialGrade": [f"Grade '{item_grade}' does not match."]},
+                    )
+
+            expected_uom = mapping.get("uom") or mapping.get("unit")
+            if expected_uom and item.uom:
+                if item.uom.lower() != str(expected_uom).lower() and item.sales_unit and item.sales_unit.lower() != str(expected_uom).lower():
+                    raise ValidationFailed(
+                        f"UOM mismatch: item UOM is '{item.uom}', requested '{expected_uom}'.",
+                        field_errors={"uom": [f"UOM '{expected_uom}' does not match item UOM '{item.uom}'."]},
+                    )
+
+            overrides["item_id"] = item.id
+            overrides["sku"] = item.sku
+            overrides["item_name"] = item.name
+            overrides["hsn_code"] = item.hsn_code or quote_line.hsn_code
+            overrides["uom"] = item.uom or quote_line.uom
+            if not quote_line.specification:
+                overrides["specification"] = format_item_spec(item)
+            if not quote_line.material_grade:
+                overrides["material_grade"] = (item.grade.code if item.grade else None) or item.metal_grade
+            if not quote_line.line_kind:
+                it = item.item_type or (item.category.item_type if item.category else None)
+                if it:
+                    overrides["line_kind"] = it.name
+            if not quote_line.unit_weight:
+                w = item.theoretical_weight or item.sheet_weight_kg or item.weight_per_piece
+                if w:
+                    overrides["unit_weight"] = w
+
+            return overrides
+
         order = _clone_document(
             quotation,
             SalesOrder,
@@ -565,6 +686,7 @@ class QuotationViewSet(ApprovalLinkActions, SalesDocumentViewSet):
             series="SO",
             line_model_name="SalesOrderLine",
             line_fk="sales_order",
+            line_overrides=get_line_overrides,
         )
         quotation.status = "Converted"
         quotation.save(update_fields=["status", "updated_at"])

@@ -80,6 +80,41 @@ def line_serializer_for(line_model, table_name, extra_fields=(), extra_read_only
                     raise serializers.ValidationError(f"{key} cannot be negative.")
             return value
 
+        def to_representation(self, instance):
+            data = super().to_representation(instance)
+            item = getattr(instance, "item", None)
+            if item:
+                from apps.inventory.views import format_item_spec
+
+                item_spec = format_item_spec(item)
+                item_grade = (
+                    item.grade.code if getattr(item, "grade", None) else None
+                ) or getattr(item, "metal_grade", None)
+                item_type = getattr(item, "item_type", None)
+                if (
+                    not item_type
+                    and getattr(item, "category", None)
+                    and getattr(item.category, "item_type", None)
+                ):
+                    item_type = item.category.item_type
+                item_type_name = item_type.name if item_type else None
+                category_name = (
+                    item.category.name if getattr(item, "category", None) else None
+                )
+
+                if not data.get("specification") and item_spec:
+                    data["specification"] = item_spec
+                if not data.get("materialGrade") and item_grade:
+                    data["materialGrade"] = item_grade
+                if not data.get("lineKind") and item_type_name:
+                    data["lineKind"] = item_type_name
+
+                data.setdefault("dimensions", item_spec)
+                data.setdefault("grade", item_grade)
+                data.setdefault("category", category_name)
+                data.setdefault("itemType", item_type_name)
+            return data
+
         class Meta(DocumentLineSerializer.Meta):
             model = line_model
             # Replaced (metal-industry sales): every sales line also carries
@@ -313,7 +348,7 @@ class DeliveryChallanSerializer(DocumentSerializer):
     class Meta:
         model = DeliveryChallan
         fields = HEADER_FIELDS + [
-            "challan_number", "status", "sales_order", "quotation",
+            "challan_number", "status", "sales_order", "quotation", "crm_lead",
             "dispatch_date", "vehicle_number", "transporter", "lr_number",
             "delivery_location", "location", "delivered_at",
             # Weighbridge (sheet-metal dispatch is by weight).

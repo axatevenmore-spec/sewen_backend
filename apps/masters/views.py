@@ -21,7 +21,9 @@ from .models import (
     ItemCategory,
     ItemPart,
     ItemSerial,
+    ItemType,
     Location,
+    MaterialGrade,
     Party,
     PartyContact,
     Unit,
@@ -33,7 +35,9 @@ from .serializers import (
     ItemPartSerializer,
     ItemSerializer,
     ItemSerialSerializer,
+    ItemTypeSerializer,
     LocationSerializer,
+    MaterialGradeSerializer,
     PartyContactSerializer,
     PartySerializer,
     UnitSerializer,
@@ -302,6 +306,11 @@ class ItemViewSet(TenantModelViewSet):
     filter_map = {
         "itemKind": "item_kind",
         "item_kind": "item_kind",
+        "itemType": "item_type_id",
+        "itemTypeId": "item_type_id",
+        "item_type_id": "item_type_id",
+        "gradeId": "grade_id",
+        "grade_id": "grade_id",
         "categoryId": "category_id",
         "category_id": "category_id",
         "location": "default_location_id",
@@ -381,8 +390,7 @@ class ItemViewSet(TenantModelViewSet):
 
         instance = super().perform_create(serializer)
 
-        # Opening stock itself posts an ADJUSTMENT movement (api.md §4.2), so
-        # even the first number has a cause behind it.
+        # Opening stock posts an explicit OPENING_STOCK movement (Phase 4).
         opening = self.request.data.get("openingQty") or self.request.data.get("availableQty")
         if opening and D(opening) > ZERO and instance.holds_stock:
             location = instance.default_location_id or _any_location(self.get_client_id())
@@ -391,7 +399,7 @@ class ItemViewSet(TenantModelViewSet):
                     client_id=self.get_client_id(),
                     item=instance.id,
                     location=location,
-                    type="ADJUSTMENT",
+                    type="OPENING_STOCK",
                     quantity=D(opening),
                     unit_cost=instance.cost_price,
                     notes="Opening stock on item creation",
@@ -774,10 +782,86 @@ def _import_rows(request, rows, dry_run, serializer_class, model, required=()):
 
 
 # ---------------------------------------------------------------------------
-# Categories, units, locations (api.md §4.3)
+# Item Types and Categories (api.md §4.3, Phase 2)
 # ---------------------------------------------------------------------------
+class ItemTypeViewSet(TenantModelViewSet):
+    queryset = ItemType.objects.all()
+    serializer_class = ItemTypeSerializer
+    audit_entity_type = "ItemType"
+    audit_label_field = "name"
+    search_fields = ["name", "code", "description"]
+    permission_map = {"write": ["view_inventory"]}
+    ordering = ["name"]
+    status_field = "is_active"
+    filter_map = {"isActive": "is_active", "is_active": "is_active"}
+
+    def check_delete_allowed(self, item_type):
+        cat_count = item_type.categories.filter(deleted_at__isnull=True).count()
+        item_count = item_type.items.filter(deleted_at__isnull=True).count()
+        if cat_count or item_count:
+            raise Conflict(
+                f"Cannot delete item type: {cat_count} category(ies) and {item_count} item(s) are linked to it. Deactivate instead.",
+                code="ITEM_TYPE_IN_USE",
+                payload={"categoryCount": cat_count, "itemCount": item_count},
+            )
+
+    @action(detail=True, methods=["post"])
+    def activate(self, request, pk=None):
+        item_type = self.get_object()
+        item_type.is_active = True
+        item_type.save(update_fields=["is_active", "updated_at"])
+        return Response(self.get_serializer(item_type).data)
+
+    @action(detail=True, methods=["post"])
+    def deactivate(self, request, pk=None):
+        item_type = self.get_object()
+        item_type.is_active = False
+        item_type.save(update_fields=["is_active", "updated_at"])
+        return Response(self.get_serializer(item_type).data)
+
+
+class MaterialGradeViewSet(TenantModelViewSet):
+    queryset = MaterialGrade.objects.select_related("material_category")
+    serializer_class = MaterialGradeSerializer
+    audit_entity_type = "MaterialGrade"
+    audit_label_field = "name"
+    search_fields = ["name", "code", "family"]
+    permission_map = {"write": ["view_inventory"]}
+    ordering = ["name"]
+    status_field = "is_active"
+    filter_map = {
+        "isActive": "is_active",
+        "is_active": "is_active",
+        "categoryId": "material_category_id",
+        "category_id": "material_category_id",
+    }
+
+    def check_delete_allowed(self, grade):
+        item_count = grade.items.filter(deleted_at__isnull=True).count()
+        if item_count:
+            raise Conflict(
+                f"Cannot delete grade: {item_count} item(s) are linked to it. Deactivate instead.",
+                code="GRADE_IN_USE",
+                payload={"itemCount": item_count},
+            )
+
+    @action(detail=True, methods=["post"])
+    def activate(self, request, pk=None):
+        grade = self.get_object()
+        grade.is_active = True
+        grade.save(update_fields=["is_active", "updated_at"])
+        return Response(self.get_serializer(grade).data)
+
+    @action(detail=True, methods=["post"])
+    def deactivate(self, request, pk=None):
+        grade = self.get_object()
+        grade.is_active = False
+        grade.save(update_fields=["is_active", "updated_at"])
+        return Response(self.get_serializer(grade).data)
+
+
 class ItemCategoryViewSet(TenantModelViewSet):
-    queryset = ItemCategory.objects.prefetch_related("custom_fields")
+    queryset = ItemCategory.objects.prefetch_related("custom_fields").select_related("item_type", "default_unit")
     serializer_class = ItemCategorySerializer
     audit_entity_type = "ItemCategory"
     audit_label_field = "name"
@@ -785,8 +869,15 @@ class ItemCategoryViewSet(TenantModelViewSet):
     # Same rule as items: masters are readable by all, maintained by inventory.
     permission_map = {"write": ["view_inventory"]}
     ordering = ["name"]
-    status_field = None
-    filter_map = {"kind": "kind"}
+    status_field = "is_active"
+    filter_map = {
+        "kind": "kind",
+        "itemType": "item_type_id",
+        "itemTypeId": "item_type_id",
+        "item_type_id": "item_type_id",
+        "isActive": "is_active",
+        "is_active": "is_active",
+    }
 
     def get_queryset(self):
         return super().get_queryset().annotate(
@@ -795,12 +886,27 @@ class ItemCategoryViewSet(TenantModelViewSet):
 
     def check_delete_allowed(self, category):
         count = category.items.filter(deleted_at__isnull=True).count()
-        if count:
+        parts_count = category.default_parts.filter(deleted_at__isnull=True).count()
+        if count or parts_count:
             raise Conflict(
-                f"{count} item(s) still use this category.",
+                f"Cannot delete category: {count} item(s) and {parts_count} BOM default part(s) are linked to it. Deactivate instead.",
                 code="CATEGORY_IN_USE",
-                payload={"itemCount": count},
+                payload={"itemCount": count, "categoryPartsCount": parts_count},
             )
+
+    @action(detail=True, methods=["post"])
+    def activate(self, request, pk=None):
+        category = self.get_object()
+        category.is_active = True
+        category.save(update_fields=["is_active", "updated_at"])
+        return Response(self.get_serializer(category).data)
+
+    @action(detail=True, methods=["post"])
+    def deactivate(self, request, pk=None):
+        category = self.get_object()
+        category.is_active = False
+        category.save(update_fields=["is_active", "updated_at"])
+        return Response(self.get_serializer(category).data)
 
     @action(detail=True, methods=["get", "post"], url_path="parts")
     def parts(self, request, pk=None):
