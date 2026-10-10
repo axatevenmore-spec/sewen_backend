@@ -108,9 +108,9 @@ class MessengerTests(MessengerFixture, TestCase):
         self.assertEqual(designer, ["Project Chat", "Design Team"])
         admin = [r["title"] for r in self.conversations(self.admin)["results"]]
         self.assertEqual(admin, ["Project Chat", "Design Team", "QC Team"])
-        body = self.conversations(self.outsider)
-        self.assertEqual(body["results"], [])
-        self.assertFalse(body["aggregates"]["isParticipant"])
+        # Not on the project: ``view_pms`` alone does not reach it at all.
+        outsider = self.api(self.outsider).get(f"{self.base}/conversations/")
+        self.assertEqual(outsider.status_code, 404)
 
         qc_chat = self.conv_id(self.pm, "QC Team")
         resp = self.api(self.designer).get(f"{self.base}/conversations/{qc_chat}/messages/")
@@ -121,9 +121,9 @@ class MessengerTests(MessengerFixture, TestCase):
         design_chat = self.conv_id(self.pm, "Design Team")
         self.design_stage.assigned_user = self.qc
         self.design_stage.save()
-        self.assertNotIn(
-            "Design Team", [r["title"] for r in self.conversations(self.designer)["results"]]
-        )
+        # Off the project altogether now, so it is gone, not just its chat.
+        gone = self.api(self.designer).get(f"{self.base}/conversations/")
+        self.assertEqual(gone.status_code, 404)
         self.assertIn("Design Team", [r["title"] for r in self.conversations(self.qc)["results"]])
         self.send(self.designer, design_chat, "still here?", expect=404)
 
@@ -305,4 +305,4 @@ class MessengerTests(MessengerFixture, TestCase):
             f"{self.base}/conversations/", {"kind": "Direct", "userId": str(self.pm.id)},
             format="json",
         )
-        self.assertEqual(denied.status_code, 403)
+        self.assertEqual(denied.status_code, 404)
