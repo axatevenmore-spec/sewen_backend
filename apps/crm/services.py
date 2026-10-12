@@ -21,7 +21,7 @@ from apps.core.audit import notify, record_audit
 from apps.core.exceptions import ValidationFailed
 from apps.core.numbering import allocate_number
 
-from .models import AUTOMATION_SOURCE, Lead, Stage, StageTask, Task
+from .models import AUTOMATION_SOURCE, Deal, DealActivity, Lead, Stage, StageTask, Task
 
 #: api.md §9.3 -- the fallback roles and offsets when the target stage has no
 #: matching template. The server prefers a template from the lead's current
@@ -170,7 +170,6 @@ MASTER_TO_STAGE_TASK = {
     "department": "department",
     "duration_days": "offset_days",
     "priority": "priority",
-    "form_id": "form_id",
 }
 
 
@@ -220,18 +219,16 @@ def sync_master_task_stages(master, *, user=None):
             row.save(update_fields=changed + ["updated_at"])
 
 
-def task_form_for(template):
-    """The task form a generated task opens in: the stage task's own, else its master's."""
-    form = template.form or (template.master_task.form if template.master_task_id else None)
-    return form if form is not None and form.deleted_at is None else None
-
-
 @transaction.atomic
-def run_stage_automation(lead, stage, *, user=None):
+def run_stage_automation(lead, stage, *, user=None, due_at=None):
     """Create the target stage's auto-create tasks and notify the assignees.
 
     Returns the created tasks so ``PATCH /crm/leads/{id}/`` can return
     ``{ lead, createdTasks: [] }`` for the UI to toast.
+
+    ``due_at`` is the date and time the Complete Task form scheduled the move
+    for: when it is given, every task it creates is due that day instead of
+    being offset from today.
     """
     templates = StageTask.objects.filter(
         client_id=lead.client_id, stage=stage, auto_create=True, deleted_at__isnull=True
@@ -255,8 +252,11 @@ def run_stage_automation(lead, stage, *, user=None):
         master = template.master_task if template.master_task_id else None
         role = template.assignee_role or (master.role if master else None)
         department = template.department or (master.department if master else None)
-        form = task_form_for(template)
         assignee = resolve_assignee(lead.client_id, role, department)
+        extra = {"stage": stage.name}
+        if due_at is not None:
+            extra["dueAt"] = due_at.strftime("%Y-%m-%dT%H:%M")
+            extra["dueTime"] = due_at.strftime("%H:%M")
         task = Task.objects.create(
             client_id=lead.client_id,
             task_number=allocate_number(lead.client, "TSK"),
@@ -268,9 +268,11 @@ def run_stage_automation(lead, stage, *, user=None):
             assignee_role=role,
             department=department,
             # The lead task editor opens this form (the frontend reads extra).
-            extra={"taskFormId": str(form.id), "taskFormName": form.name, "stage": stage.name}
-            if form else {"stage": stage.name},
-            due_date=compute_due_date(template.offset_days, template.priority),
+            extra=extra,
+            due_date=(
+                due_at.date() if due_at is not None
+                else compute_due_date(template.offset_days, template.priority)
+            ),
             priority=template.priority,
             status="Open",
             source=AUTOMATION_SOURCE,
@@ -294,7 +296,7 @@ def run_stage_automation(lead, stage, *, user=None):
 
 
 @transaction.atomic
-def change_lead_stage(lead, target_stage, *, user=None):
+def change_lead_stage(lead, target_stage, *, user=None, due_at=None):
     """The stage change and its automation, in one transaction."""
     previous = lead.stage
     if previous_id_equals(previous, target_stage):
@@ -317,7 +319,7 @@ def change_lead_stage(lead, target_stage, *, user=None):
         to_value=target_stage.name,
     )
 
-    created = run_stage_automation(lead, target_stage, user=user)
+    created = run_stage_automation(lead, target_stage, user=user, due_at=due_at)
     return lead, created
 
 
@@ -338,21 +340,102 @@ def next_stage_after(client_id, stage):
     )
 
 
+def resolve_target_stage(lead, target_stage):
+    """The stage a ``move-next-stage`` lands on.
+
+    The Complete Task form's "Move to stage" picker sends the stage the lead is
+    really in, which may be further along than the next one (it skipped ahead) or
+    somewhere else entirely (it was lost). Left unset, the lead simply goes to
+    the stage after its current one.
+    """
+    if target_stage is None:
+        return next_stage_after(lead.client_id, lead.stage)
+
+    if str(target_stage.client_id) != str(lead.client_id):
+        raise ValidationFailed(
+            "That stage belongs to another company.", field_errors={"targetStageId": ["Unknown stage."]}
+        )
+    if not target_stage.is_active:
+        raise ValidationFailed(
+            f"{target_stage.name} is not an active stage.",
+            field_errors={"targetStageId": ["That stage is not active."]},
+        )
+    if previous_id_equals(lead.stage, target_stage):
+        raise ValidationFailed(
+            f"The lead is already in {target_stage.name}.",
+            field_errors={"targetStageId": ["Pick a different stage."]},
+        )
+    return target_stage
+
+
 # ---------------------------------------------------------------------------
 # Task completion (api.md §9.3)
 # ---------------------------------------------------------------------------
+#: A task still to be worked: what blocks a stage move and what "finished with
+#: this lead" closes.
+OPEN_TASK_STATUSES = ["Open", "In Progress", "Waiting"]
+
+
+def open_required_tasks(lead, *, exclude=None):
+    """The lead's open tasks from a *required* template of its current stage.
+
+    A lead may not move on while one of these is still open (the Complete Task
+    form's "Ready to move on").
+    """
+    if lead is None or lead.stage_id is None:
+        return Task.objects.none()
+    rows = Task.objects.filter(
+        client_id=lead.client_id,
+        lead=lead,
+        status__in=OPEN_TASK_STATUSES,
+        stage_task__stage_id=lead.stage_id,
+        stage_task__required=True,
+        deleted_at__isnull=True,
+    )
+    if exclude is not None:
+        rows = rows.exclude(pk=exclude.pk)
+    return rows
+
+
 @transaction.atomic
-def complete_task(task, *, outcome=None, next_action=None, note=None, user=None):
+def complete_task(
+    task, *, outcome=None, next_action=None, note=None, user=None,
+    follow_up_at=None, close_open_tasks=False, target_stage=None,
+):
     """``POST /crm/tasks/{id}/complete/``.
 
     The ``nextAction`` table from api.md §9.3, with the server preferring a
     matching template from the lead's current stage over the hardcoded
     fallbacks.
+
+    The Complete Task form adds three optional inputs:
+
+    - ``follow_up_at`` with ``call-again``: the next attempt of *this* task,
+      scheduled for that date and time, instead of a generic follow-up call.
+    - ``close_open_tasks`` with ``finish``: every other open task on the lead
+      is closed too. The lead stays in its stage.
+    - ``target_stage`` with ``move-next-stage``: the stage the lead is moved to
+      instead of the next one, for a lead that skipped ahead or was lost. The
+      tasks the stage creates are due on ``follow_up_at`` when it is given.
+
+    ``move-next-stage`` is refused while a required task of the current stage
+    is still open.
     """
     if task.status == "Completed":
         from apps.core.exceptions import Conflict, Codes
 
         raise Conflict("This task is already completed.", code=Codes.ALREADY_DONE)
+
+    if next_action == "move-next-stage" and task.lead_id:
+        blocking = list(open_required_tasks(task.lead, exclude=task).values_list("title", flat=True))
+        if blocking:
+            from apps.core.exceptions import BusinessRuleViolation
+
+            names = ", ".join(dict.fromkeys(blocking))
+            raise BusinessRuleViolation(
+                f"Complete these tasks before moving the lead on: {names}.",
+                code="REQUIRED_TASKS_OPEN",
+            )
 
     task.status = "Completed"
     task.outcome = outcome
@@ -365,14 +448,24 @@ def complete_task(task, *, outcome=None, next_action=None, note=None, user=None)
     follow_up = None
     stage_changed = False
     created_tasks = []
+    moved_to = None
 
     if next_action == "move-next-stage" and task.lead_id:
         lead = task.lead
-        target = next_stage_after(lead.client_id, lead.stage)
+        target = resolve_target_stage(lead, target_stage)
         if target is not None:
             # Advancing runs the target stage's own automation, per api.md §9.3.
-            lead, created_tasks = change_lead_stage(lead, target, user=user)
+            lead, created_tasks = change_lead_stage(
+                lead, target, user=user, due_at=follow_up_at
+            )
             stage_changed = True
+            moved_to = target
+
+    elif next_action == "call-again" and follow_up_at and task.lead_id:
+        follow_up = _create_next_attempt(task, follow_up_at, user=user)
+        created_tasks = [follow_up]
+        task.follow_up_task = follow_up
+        task.save(update_fields=["follow_up_task", "updated_at"])
 
     elif next_action in NEXT_ACTION_FALLBACKS and task.lead_id:
         follow_up = _create_follow_up(task, next_action, user=user)
@@ -380,6 +473,21 @@ def complete_task(task, *, outcome=None, next_action=None, note=None, user=None)
             created_tasks = [follow_up]
             task.follow_up_task = follow_up
             task.save(update_fields=["follow_up_task", "updated_at"])
+
+    elif next_action == "finish" and close_open_tasks and task.lead_id:
+        closed_at = timezone.now()
+        Task.objects.filter(
+            client_id=task.client_id,
+            lead_id=task.lead_id,
+            status__in=OPEN_TASK_STATUSES,
+            deleted_at__isnull=True,
+        ).exclude(pk=task.pk).update(
+            status="Cancelled",
+            completion_note="Closed: finished with this lead.",
+            completed_at=closed_at,
+            completed_by=task.completed_by,
+            updated_at=closed_at,
+        )
 
     record_audit(
         client=task.client_id,
@@ -397,7 +505,53 @@ def complete_task(task, *, outcome=None, next_action=None, note=None, user=None)
         "followUpTask": follow_up,
         "createdTasks": created_tasks,
         "stageChanged": stage_changed,
+        "movedToStage": moved_to.name if moved_to is not None else None,
     }
+
+
+def _create_next_attempt(task, follow_up_at, *, user=None):
+    """The same task again, as attempt N+1, due at ``follow_up_at``."""
+    if timezone.is_aware(follow_up_at):
+        follow_up_at = timezone.localtime(follow_up_at)
+    extra = dict(task.extra or {})
+    # This attempt's progress and answers belong to the attempt just closed.
+    for key in ("process", "customValues", "taskFormAnswers"):
+        extra.pop(key, None)
+    extra["attempt"] = int(extra.get("attempt") or 1) + 1
+    extra["dueAt"] = follow_up_at.strftime("%Y-%m-%dT%H:%M")
+    extra["dueTime"] = follow_up_at.strftime("%H:%M")
+
+    follow_up = Task.objects.create(
+        client_id=task.client_id,
+        task_number=allocate_number(task.lead.client, "TSK"),
+        lead=task.lead,
+        deal=task.deal,
+        stage_task=task.stage_task,
+        title=task.title,
+        description=task.description,
+        assignee=task.assignee,
+        assignee_role=task.assignee_role,
+        department=task.department,
+        due_date=follow_up_at.date(),
+        priority=task.priority,
+        status="Open",
+        source=task.source,
+        extra=extra,
+        created_by=user if getattr(user, "is_authenticated", False) else None,
+    )
+    if follow_up.assignee_id:
+        notify(
+            client=task.client_id,
+            recipients=[follow_up.assignee],
+            type="crm.task_assigned",
+            category="crm",
+            title=f"New task: {follow_up.title} (attempt {extra['attempt']})",
+            body=f"Follow-up for {task.lead.name}.",
+            entity_type="CrmTask",
+            entity_id=follow_up.id,
+            actor=user,
+        )
+    return follow_up
 
 
 def _create_follow_up(task, next_action, *, user=None):
@@ -523,6 +677,377 @@ def annotate_lead_counters(client_id, leads):
         lead.sales_invoices_count = invoices.get(lead.id, 0)
         lead.delivery_challans_count = challans.get(lead.id, 0)
     return leads
+
+
+# ---------------------------------------------------------------------------
+# Lead status <-> Deals pipeline
+# ---------------------------------------------------------------------------
+#: Deal stages that close a deal; a lead in a won / lost stage has its deals here.
+CLOSED_DEAL_STAGES = ("Won", "Lost")
+
+
+def is_crm_admin(user):
+    """Admins may reopen a lost lead or deal."""
+    from apps.core.permissions import has_permission
+
+    from .access import ADMIN_PERMISSION
+
+    return bool(getattr(user, "is_superuser", False) or has_permission(user, ADMIN_PERMISSION))
+
+
+#: The look of a Lost / Won stage made for a workspace that has none.
+CLOSING_STAGE_DEFAULTS = {
+    True: {"name": "Lost", "color": "#b91c1c", "icon": "XCircle", "bg": "#fef2f2", "fg": "#991b1b"},
+    False: {"name": "Won", "color": "#15803d", "icon": "Trophy", "bg": "#f0fdf4", "fg": "#166534"},
+}
+
+
+def closing_stage(client_id, *, lost):
+    """The tenant's Lost (or Won) lead stage -- created at the end of the
+    pipeline when the workspace has none, so Mark as Lost always has a home."""
+    flag = {"is_lost": True} if lost else {"is_won": True}
+    live = Stage.objects.filter(client_id=client_id, deleted_at__isnull=True)
+    stage = live.filter(**flag).order_by("sequence").first()
+    if stage is not None:
+        return stage
+
+    defaults = CLOSING_STAGE_DEFAULTS[lost]
+    # A stage already called "Lost" / "Won" just gets its flag.
+    stage = live.filter(name__iexact=defaults["name"]).first()
+    if stage is not None:
+        for field, value in flag.items():
+            setattr(stage, field, value)
+        stage.save(update_fields=[*flag, "updated_at"])
+        return stage
+    last = live.order_by("-sequence").values_list("sequence", flat=True).first() or 0
+    return Stage.objects.create(
+        client_id=client_id,
+        sequence=last + 1,
+        is_active=True,
+        **flag,
+        **defaults,
+    )
+
+
+def reopen_target(lead):
+    """Where a reopened lead goes: the stage it was closed from, else the first open one."""
+    stage = lead.reopen_stage
+    if stage is not None and stage.deleted_at is None and not (stage.is_lost or stage.is_won):
+        return stage
+    return (
+        Stage.objects.filter(
+            client_id=lead.client_id, deleted_at__isnull=True, is_active=True,
+            is_lost=False, is_won=False,
+        )
+        .order_by("sequence")
+        .first()
+    )
+
+
+def _actor(user):
+    return user if getattr(user, "is_authenticated", False) else None
+
+
+def lead_deals(lead):
+    return Deal.objects.filter(lead=lead, deleted_at__isnull=True)
+
+
+def open_lead_deal(lead, stage="Draft", *, user=None, reason=""):
+    """The lead's deal in the pipeline, created in ``stage``."""
+    deal = Deal.objects.create(
+        client_id=lead.client_id,
+        deal_number=allocate_number(lead.client, "DEAL"),
+        title=f"{lead.company or lead.name} opportunity",
+        lead=lead,
+        party=lead.party,
+        owner=lead.owner or _actor(user),
+        stage=stage,
+        value=lead.amount or 0,
+        client_name=lead.company or lead.name,
+        contact_phone=lead.phone,
+        closed_at=timezone.now() if stage in CLOSED_DEAL_STAGES else None,
+        lost_reason=lead.lost_reason if stage == "Lost" else None,
+        created_by=_actor(user),
+    )
+    DealActivity.objects.create(
+        deal=deal, type="created", actor=_actor(user),
+        description=f"Created in {stage} from lead {lead.lead_number}{reason}",
+    )
+    return deal
+
+
+def ensure_lead_deal(lead, *, user=None):
+    """A new lead joins the Deals pipeline as a Draft deal (once)."""
+    if lead.deleted_at is None and not lead_deals(lead).exists():
+        return open_lead_deal(lead, "Draft", user=user, reason=" (new lead)")
+    return None
+
+
+def _move_lead_deals(lead, stage, *, user=None, create=False, only_from=None, reason=""):
+    """Put the lead's deals in ``stage``; with ``create``, open one if it has none."""
+    now = timezone.now()
+    deals = list(lead_deals(lead))
+    if not deals:
+        if create:
+            open_lead_deal(lead, stage, user=user, reason=reason)
+        return
+
+    for deal in deals:
+        if deal.stage == stage or (only_from and deal.stage not in only_from):
+            continue
+        previous = deal.stage
+        deal.stage = stage
+        deal.closed_at = now if stage in CLOSED_DEAL_STAGES else None
+        if stage == "Lost":
+            deal.lost_reason = lead.lost_reason or deal.lost_reason
+        else:
+            deal.lost_reason = None
+        deal.save(update_fields=["stage", "closed_at", "lost_reason", "updated_at"])
+        DealActivity.objects.create(
+            deal=deal, type="stage_change", actor=_actor(user),
+            description=f"Stage moved from {previous} to {stage}{reason}",
+        )
+
+
+@transaction.atomic
+def sync_deals_after_lead_move(lead, previous_stage, *, user=None):
+    """A lead's stage moved: its deals follow.
+
+    Lost / Won put the deals in Lost / Won (opening one when the lead has none,
+    so a lost lead shows in the Deals pipeline's Lost column). Leaving Lost or
+    Won reopens the deals that were closed.
+    """
+    target = lead.stage
+    reason = f" (lead moved to {target.name})"
+    if target.is_lost or target.is_won:
+        if previous_stage is not None and not (previous_stage.is_lost or previous_stage.is_won):
+            lead.reopen_stage = previous_stage
+            lead.save(update_fields=["reopen_stage", "updated_at"])
+        _move_lead_deals(
+            lead, "Lost" if target.is_lost else "Won", user=user, create=True, reason=reason
+        )
+    elif previous_stage is not None and (previous_stage.is_lost or previous_stage.is_won):
+        lead.reopen_stage = None
+        lead.lost_reason = None
+        lead.save(update_fields=["reopen_stage", "lost_reason", "updated_at"])
+        _move_lead_deals(lead, "Open", user=user, only_from=CLOSED_DEAL_STAGES, reason=reason)
+
+
+@transaction.atomic
+def sync_lead_after_deal_move(deal, previous, *, user=None):
+    """A deal's stage moved: its lead follows.
+
+    Lost / Won close the lead into the Lost / Won lead stage; moving the deal
+    out of Lost or Won reopens the lead to the stage it was closed from.
+    Returns the tasks the lead's stage automation created.
+    """
+    lead = deal.lead
+    if lead is None or lead.deleted_at is not None:
+        return []
+    current = lead.stage
+    if deal.stage == "Lost" and not current.is_lost:
+        target = closing_stage(lead.client_id, lost=True)
+    elif deal.stage == "Won" and not current.is_won:
+        target = closing_stage(lead.client_id, lost=False)
+    elif (
+        previous in CLOSED_DEAL_STAGES
+        and deal.stage not in CLOSED_DEAL_STAGES
+        and (current.is_lost or current.is_won)
+    ):
+        target = reopen_target(lead)
+    else:
+        return []
+    if target is None:
+        return []
+
+    if target.is_lost or target.is_won:
+        if not (current.is_lost or current.is_won):
+            lead.reopen_stage = current
+        if target.is_lost and deal.lost_reason_id:
+            lead.lost_reason = deal.lost_reason
+    else:
+        lead.reopen_stage = None
+        lead.lost_reason = None
+    lead.stage = target
+    lead.save(update_fields=["stage", "reopen_stage", "lost_reason", "updated_at"])
+    record_audit(
+        client=lead.client_id,
+        actor=user,
+        action="stage_change",
+        entity_type="CrmLead",
+        entity_id=lead.id,
+        entity_label=lead.lead_number,
+        description=f"Stage changed to {target.name} (deal {deal.deal_number} moved to {deal.stage})",
+        from_value=current.name,
+        to_value=target.name,
+    )
+    # The lead's other deals follow it too.
+    _move_lead_deals(
+        lead,
+        deal.stage if deal.stage in CLOSED_DEAL_STAGES else "Open",
+        user=user,
+        only_from=None if deal.stage in CLOSED_DEAL_STAGES else CLOSED_DEAL_STAGES,
+        reason=f" (deal {deal.deal_number} moved to {deal.stage})",
+    )
+    return run_stage_automation(lead, target, user=user)
+
+
+#: A sales document's status -> where its lead's deal moves: an estimate or
+#: quotation sent to the lead puts a Draft deal in Sent; one the lead accepted
+#: (or a quotation turned into an order) wins the deal.
+DOCUMENT_DEAL_STAGE = {
+    "estimate": {"Sent": "Sent", "Accepted": "Won"},
+    "quotation": {"Sent": "Sent", "Viewed": "Sent", "Accepted": "Won", "Converted": "Won"},
+}
+
+
+@transaction.atomic
+def sync_deal_from_document(document, kind, *, user=None):
+    """An estimate / quotation for a lead changed status: its deal follows.
+
+    ``Sent`` only moves a deal that is still a Draft; ``Won`` moves any deal
+    that is not closed. A Lost deal is left alone -- reopening one is an admin's
+    call. A lead with no deal yet gets one.
+    """
+    target = DOCUMENT_DEAL_STAGE[kind].get(document.status)
+    lead = getattr(document, "crm_lead", None)
+    if target is None or lead is None or lead.deleted_at is not None:
+        return
+    actor = user or getattr(document, "created_by", None)
+    number = getattr(document, f"{kind}_number", None)
+    reason = f" ({kind} {number + ' ' if number else ''}{document.status.lower()})"
+
+    deal = getattr(document, "crm_deal", None) if kind == "quotation" else None
+    deals = [deal] if deal is not None and deal.deleted_at is None else list(lead_deals(lead))
+    if not deals:
+        deals = [open_lead_deal(lead, "Draft", user=actor, reason=reason)]
+
+    for deal in deals:
+        if deal.stage in CLOSED_DEAL_STAGES or deal.stage == target:
+            continue
+        if target == "Sent" and deal.stage != "Draft":
+            continue
+        previous = deal.stage
+        deal.stage = target
+        deal.closed_at = timezone.now() if target in CLOSED_DEAL_STAGES else None
+        deal.save(update_fields=["stage", "closed_at", "updated_at"])
+        DealActivity.objects.create(
+            deal=deal, type="stage_change", actor=_actor(actor),
+            description=f"Stage moved from {previous} to {target}{reason}",
+        )
+        # A won deal wins its lead too.
+        sync_lead_after_deal_move(deal, previous, user=actor)
+
+
+#: How long an auto-generated contract runs from the day the estimate was accepted.
+AUTO_CONTRACT_DAYS = 365
+
+
+def _estimate_marker(estimate):
+    return f"Generated automatically from estimate {estimate.estimate_number or estimate.id}"
+
+
+@transaction.atomic
+def contract_from_estimate(estimate, *, user=None):
+    """The lead accepted an estimate: a Draft contract is generated from it.
+
+    The contract is for the estimate's customer (the lead's, when the estimate
+    was addressed to the lead itself -- created from the lead the way Convert
+    does, since a contract needs a customer record), worth the estimate's
+    total, linked to the lead's deal, and runs a year from today. One contract
+    per estimate.
+    """
+    from apps.masters.models import Party
+
+    from .models import Contract
+
+    lead = estimate.crm_lead
+    if lead is None or lead.deleted_at is not None:
+        return None
+    marker = _estimate_marker(estimate)
+    if Contract.objects.filter(
+        client_id=estimate.client_id, description__startswith=marker, deleted_at__isnull=True
+    ).exists():
+        return None
+
+    actor = _actor(user or estimate.created_by)
+    party = estimate.party or lead.party
+    if party is None:
+        party = Party.objects.create(
+            client_id=lead.client_id,
+            code=allocate_number(lead.client, "CUST"),
+            type="Customer",
+            name=estimate.party_name or lead.company or lead.name,
+            phone=estimate.party_phone or lead.phone,
+            email=estimate.party_email or lead.email,
+            place_of_supply=estimate.place_of_supply or lead.state,
+            created_by=actor,
+        )
+    if lead.party_id is None:
+        lead.party = party
+        lead.save(update_fields=["party", "updated_at"])
+
+    deal = lead_deals(lead).order_by("created_at").first()
+    today = timezone.localdate()
+    customer_name = party.name
+    contract = Contract.objects.create(
+        client_id=lead.client_id,
+        contract_number=allocate_number(lead.client, "CON", today),
+        title=f"Contract - {customer_name}",
+        party=party,
+        deal=deal,
+        contract_type="Other",
+        value=estimate.total,
+        start_date=today,
+        end_date=today + timedelta(days=AUTO_CONTRACT_DAYS),
+        status="Draft",
+        customer_name=customer_name,
+        description=f"{marker} accepted by {lead.name} on {today:%d-%m-%Y}.",
+        created_by=actor,
+    )
+    if deal is not None:
+        DealActivity.objects.create(
+            deal=deal, type="contract", actor=actor,
+            description=f"Contract {contract.contract_number} generated from the accepted estimate.",
+        )
+    record_audit(
+        client=lead.client_id,
+        actor=actor,
+        action="contract_generated",
+        entity_type="CrmLead",
+        entity_id=lead.id,
+        entity_label=lead.lead_number,
+        description=f"Contract {contract.contract_number} generated from estimate {estimate.estimate_number or ''}".strip(),
+    )
+    return contract
+
+
+@transaction.atomic
+def mark_lead_lost(lead, *, lost_reason=None, user=None):
+    """The Leads list's "Mark as Lost": the lead moves to the Lost stage."""
+    target = closing_stage(lead.client_id, lost=True)
+    if target is None:
+        raise ValidationFailed("No Lost stage is configured. Add one in CRM System Setup.")
+    if lead.stage_id == target.id:
+        return lead
+    previous = lead.stage
+    lead.stage = target
+    if lost_reason is not None:
+        lead.lost_reason = lost_reason
+    lead.save(update_fields=["stage", "lost_reason", "updated_at"])
+    record_audit(
+        client=lead.client_id,
+        actor=user,
+        action="stage_change",
+        entity_type="CrmLead",
+        entity_id=lead.id,
+        entity_label=lead.lead_number,
+        description="Marked as lost",
+        from_value=previous.name if previous else None,
+        to_value=target.name,
+    )
+    sync_deals_after_lead_move(lead, previous, user=user)
+    return lead
 
 
 # ---------------------------------------------------------------------------

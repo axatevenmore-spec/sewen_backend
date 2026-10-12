@@ -34,6 +34,11 @@ def sees_all(user):
     )
 
 
+def is_admin(user):
+    """Admins see every task; everyone else only the ones assigned to or by them."""
+    return bool(getattr(user, "is_superuser", False) or has_permission(user, ADMIN_PERMISSION))
+
+
 def sees_all_projects(user):
     return sees_all(user) or has_permission(user, PROJECT_MANAGERS)
 

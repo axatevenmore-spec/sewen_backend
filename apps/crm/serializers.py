@@ -122,6 +122,9 @@ class LeadSerializer(BaseModelSerializer):
     """The lead row, including the eight counters computed server-side."""
 
     leadNumber = serializers.CharField(source="lead_number", read_only=True)
+    #: The customer the lead was converted to (``party``), for the lead's
+    #: estimate / quotation forms.
+    customerName = serializers.CharField(source="party.name", read_only=True, default=None)
     #: JSON ``status`` maps to the stage *name* -- stages are configurable.
     status = serializers.CharField(source="stage.name", read_only=True)
     stageId = TenantPrimaryKeyRelatedField(source="stage", model="crm.Stage")
@@ -146,6 +149,12 @@ class LeadSerializer(BaseModelSerializer):
     estimatesCount = serializers.SerializerMethodField()
     deliveryChallansCount = serializers.SerializerMethodField()
     salesInvoicesCount = serializers.SerializerMethodField()
+    #: The linked customer party's outstanding balance. A lead is not a posted
+    #: document, so this is 0 unless the lead is attached to a customer -- which
+    #: is what the sales "Customer Account" picker shows next to the name.
+    balance = serializers.SerializerMethodField()
+    #: What to show for this lead: the company if it has one, else the contact.
+    displayName = serializers.SerializerMethodField()
 
     class Meta:
         model = Lead
@@ -153,14 +162,22 @@ class LeadSerializer(BaseModelSerializer):
             "id", "leadNumber", "name", "company", "phone", "email", "status",
             "stageId", "owner", "ownerId", "createdOn", "source", "sourceId",
             "city", "state", "country", "amount", "job_title", "industry",
-            "avatarColor", "latitude", "longitude", "is_pinned", "party",
+            "avatarColor", "latitude", "longitude", "is_pinned", "party", "customerName",
             "lost_reason", "custom_values",
+            "balance", "displayName",
             "productsCount", "sourcesCount", "filesCount", "openTasksCount",
             "callsCount", "estimatesCount", "deliveryChallansCount",
             "salesInvoicesCount",
             "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
+
+    def get_balance(self, lead):
+        party = lead.party
+        return str(party.balance) if party is not None and party.balance is not None else "0"
+
+    def get_displayName(self, lead):
+        return lead.company or lead.name or ""
 
     def _counter(self, lead, attribute):
         return getattr(lead, attribute, 0)
@@ -307,21 +324,10 @@ class LeadFileSerializer(BaseModelSerializer):
 # ---------------------------------------------------------------------------
 # Tasks (api.md §9.3)
 # ---------------------------------------------------------------------------
-def _validate_task_form(form):
-    """A task template can only point at a task form (``kind='task'``)."""
-    if form is not None and form.kind != "task":
-        raise serializers.ValidationError("Pick a task form, not a lead form.")
-    return form
-
-
 class MasterTaskSerializer(BaseModelSerializer):
     # Tenant-scoped: a stage id from another workspace is "does not exist".
     stages = TenantPrimaryKeyRelatedField(many=True, model="crm.Stage", required=False)
     stageNames = serializers.SerializerMethodField()
-    formId = TenantPrimaryKeyRelatedField(
-        source="form", model="crm.Form", required=False, allow_null=True
-    )
-    formName = serializers.CharField(source="form.name", read_only=True, default=None)
     order = serializers.IntegerField(source="sort_order", required=False)
     dueIn = serializers.IntegerField(source="duration_days", required=False)
     status = serializers.SerializerMethodField()
@@ -331,11 +337,9 @@ class MasterTaskSerializer(BaseModelSerializer):
         fields = [
             "id", "order", "sort_order", "title", "description", "role",
             "department", "dueIn", "duration_days", "priority", "stages",
-            "stageNames", "formId", "formName", "is_active", "status", "created_at",
+            "stageNames", "is_active", "in_task_roles",
+            "status", "created_at",
         ]
-
-    def validate_formId(self, form):
-        return _validate_task_form(form)
 
     def get_stageNames(self, task):
         return [stage.name for stage in task.stages.all()]
@@ -356,10 +360,6 @@ class StageTaskSerializer(BaseModelSerializer):
     masterTaskId = TenantPrimaryKeyRelatedField(
         source="master_task", model="crm.MasterTask", required=False, allow_null=True
     )
-    formId = TenantPrimaryKeyRelatedField(
-        source="form", model="crm.Form", required=False, allow_null=True
-    )
-    formName = serializers.CharField(source="form.name", read_only=True, default=None)
     maxRepeats = serializers.IntegerField(
         source="max_repeats", required=False, allow_null=True, min_value=0
     )
@@ -370,14 +370,11 @@ class StageTaskSerializer(BaseModelSerializer):
             "id", "stageId", "stageName", "name", "title", "description", "role",
             "assignee_role", "department", "order", "sort_order", "dueIn",
             "offset_days", "priority", "required", "autoCreate", "repeats",
-            "maxRepeats", "master_task", "masterTaskId", "formId", "formName", "created_at",
+            "maxRepeats", "master_task", "masterTaskId", "created_at",
         ]
         extra_kwargs = {"title": {"required": False}, "master_task": {"read_only": True}}
 
     name = serializers.CharField(source="title", required=False)
-
-    def validate_formId(self, form):
-        return _validate_task_form(form)
 
     def validate(self, attrs):
         master = attrs.get("master_task")
@@ -403,6 +400,10 @@ class TaskSerializer(BaseModelSerializer):
         source="deal", model="crm.Deal", required=False, allow_null=True
     )
     leadName = serializers.CharField(source="lead.name", read_only=True)
+    #: The lead's number (``LEAD-0001``), shown as "Lead ID" in the task lists.
+    leadNumber = serializers.CharField(source="lead.lead_number", read_only=True, default=None)
+    #: Who created / assigned the task -- Task Allocation's "Assigned By".
+    createdByName = serializers.CharField(source="created_by.name", read_only=True, default=None)
     #: The stage-task template that generated this task (null for manual ones).
     stageTaskId = serializers.CharField(source="stage_task_id", read_only=True, default=None)
     assigneeId = TenantPrimaryKeyRelatedField(
@@ -414,7 +415,8 @@ class TaskSerializer(BaseModelSerializer):
     class Meta:
         model = Task
         fields = [
-            "id", "task_number", "leadId", "leadName", "stageTaskId", "dealId", "title",
+            "id", "task_number", "leadId", "leadName", "leadNumber", "createdByName",
+            "stageTaskId", "dealId", "title",
             "description", "assigneeId", "assigneeName", "assignee_role",
             "department", "dueDate", "priority", "status", "source", "outcome",
             "next_action", "extra", "completion_note", "completed_at", "follow_up_task",
@@ -438,6 +440,17 @@ class CompleteTaskSerializer(BaseSerializer):
     )
     note = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     completedBy = serializers.CharField(required=False, allow_null=True)
+    #: With ``call-again``: when the next attempt of this task is due.
+    followUpAt = serializers.DateTimeField(required=False, allow_null=True)
+    #: With ``finish``: close every other open task on the lead as well.
+    closeOpenTasks = serializers.BooleanField(required=False, default=False)
+    #: With ``move-next-stage``: the stage to move the lead to. Left out, the
+    #: lead goes to the stage after its current one, as api.md §9.3 says. The
+    #: Complete Task form offers the whole pipeline so a lead that skipped
+    #: ahead (or was lost) can be filed under the stage it actually reached.
+    targetStageId = TenantPrimaryKeyRelatedField(
+        source="target_stage", model="crm.Stage", required=False, allow_null=True
+    )
 
 
 class TaskAllocationAuditSerializer(BaseModelSerializer):
@@ -665,6 +678,12 @@ class FormSerializer(BaseModelSerializer):
             "published_at", "created_at", "updated_at",
         ]
         read_only_fields = ["published_at", "created_at", "updated_at"]
+
+    def validate_kind(self, kind):
+        # Lead Task Forms were removed; only lead forms are made now.
+        if kind == "task":
+            raise serializers.ValidationError("Lead task forms are no longer available.")
+        return kind
 
 
 class FormSubmissionSerializer(BaseModelSerializer):
