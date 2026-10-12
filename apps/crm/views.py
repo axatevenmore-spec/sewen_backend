@@ -25,6 +25,7 @@ from .models import (
     DealActivity,
     DealStage,
     Form,
+    FormSubmission,
     Industry,
     Lead,
     LeadCall,
@@ -176,7 +177,13 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
             serializer.validated_data["stage"] = first
 
         lead = super().perform_create(serializer)
-        services.run_stage_automation(lead, lead.stage, user=self.request.user)
+        form = getattr(serializer, "lead_form", None)
+        if form is not None:
+            # Which Lead Create Form the lead was entered with, as the public
+            # form records it -- the form can later be deactivated or edited.
+            FormSubmission.objects.create(
+                client_id=lead.client_id, form=form, payload=lead.custom_values or {}, lead=lead
+            )
         return lead
 
     def update(self, request, *args, **kwargs):
@@ -860,6 +867,7 @@ class TaskViewSet(TenantModelViewSet):
         "partial_update": ["edit_task"],
         "destroy": ["delete_task"],
         "complete": [],
+        "history": [],
     }
 
     def get_queryset(self):
@@ -899,6 +907,69 @@ class TaskViewSet(TenantModelViewSet):
         )
         serializer.validated_data.setdefault("source", "Manual")
         return super().perform_create(serializer)
+
+    def write_audit(self, action, instance, **kwargs):
+        # Task Allocation's Update Status / Reassign send an optional note or
+        # reason with the change; it is kept on that change's audit line.
+        if action == "update":
+            note = str(self.request.data.get("note") or "").strip()
+            if note:
+                kwargs.setdefault("comments", note)
+        return super().write_audit(action, instance, **kwargs)
+
+    @action(detail=True, methods=["get"])
+    def history(self, request, pk=None):
+        """``GET /crm/tasks/{id}/history/`` -- the task's audit trail as lines.
+
+        Read from the audit log the task's own changes were written to, for
+        anyone who can see the task (the admin Audit Logs screen needs a
+        permission an assignee does not have). Assignment and status changes
+        are spelled out; notes and reasons ride along.
+        """
+        from apps.accounts.models import User
+        from apps.core.models import AuditLog
+
+        task = self.get_object()
+        rows = list(
+            AuditLog.objects.filter(
+                client_id=request.client_id, entity_type="CrmTask", entity_id=task.pk
+            ).order_by("-created_at", "-id")
+        )
+        user_ids = set()
+        for row in rows:
+            for snap in (row.before or {}, row.after or {}):
+                if snap.get("assignee"):
+                    user_ids.add(snap["assignee"])
+        names = {str(u.pk): u.name for u in User.objects.filter(pk__in=user_ids)}
+
+        def who(user_id):
+            return names.get(str(user_id), "Unassigned") if user_id else "Unassigned"
+
+        lines = []
+        for row in rows:
+            actor = row.actor_name or "System"
+            before, after = row.before or {}, row.after or {}
+            texts = []
+            if row.action == "create":
+                texts.append(f"{actor} created this task and assigned it to {who(after.get('assignee'))}")
+            elif row.action == "update":
+                if before.get("assignee") != after.get("assignee"):
+                    texts.append(
+                        f"{actor} reassigned this from {who(before.get('assignee'))} to {who(after.get('assignee'))}"
+                    )
+                if before.get("status") != after.get("status"):
+                    texts.append(
+                        f"{actor} changed the status from {before.get('status')} to {after.get('status')}"
+                    )
+                if not texts:
+                    texts.append(f"{actor} updated this task")
+            else:
+                texts.append(f"{actor}: {row.description or row.action}")
+            text = "; ".join(texts)
+            if row.comments:
+                text = f"{text} — {row.comments}"
+            lines.append({"id": row.pk, "text": text, "at": row.created_at})
+        return Response(envelope(lines))
 
     @action(detail=True, methods=["post"])
     def complete(self, request, pk=None):
@@ -1709,7 +1780,7 @@ class FormViewSet(TenantModelViewSet):
     status_field = None
     search_fields = ["name", "slug"]
     ordering = ["name"]
-    filter_map = {"kind": "kind", "isPublished": "is_published"}
+    filter_map = {"kind": "kind", "isPublished": "is_published", "isActive": "is_active"}
     # Lookup data a lead or deal page renders; any employee assigned one reads it.
     permission_map = {"read": [], "write": ["manage_pipeline"]}
 

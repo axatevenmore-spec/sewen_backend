@@ -465,3 +465,50 @@ class LeadSectionLinkTests(TestCase):
         estimate.status = "Accepted"
         estimate.save(update_fields=["status", "updated_at"])
         self.assertEqual(Contract.objects.filter(deal__lead_id=lead["id"]).count(), 1)
+
+    def test_deal_stages_show_their_status_and_deal_count(self):
+        from apps.crm.models import DealStage
+
+        DealStage.objects.create(client=self.tenant, name="Draft", sequence=1)
+        with self.captureOnCommitCallbacks(execute=True):
+            self.post("/leads/", {"name": "Romeo", "stageId": str(self.new.id)})
+        row = self.api.get(f"{API}/deal-stages/").json()["results"][0]
+        self.assertEqual((row["name"], row["status"], row["count"]), ("Draft", "Active", 1))
+
+    def test_task_history_lists_assignment_status_and_notes(self):
+        lead = self.post("/leads/", {"name": "Sierra", "stageId": str(self.new.id)}).json()
+        task = self.post("/tasks/", {"title": "Call", "leadId": lead["id"]}).json()
+        self.patch(f"/tasks/{task['id']}/", {"assigneeId": str(self.admin.id), "note": "Owner knows them"})
+        self.patch(f"/tasks/{task['id']}/", {"status": "In Progress", "note": "Called once"})
+        rows = self.api.get(f"{API}/tasks/{task['id']}/history/").json()["results"]
+        texts = [row["text"] for row in rows]
+        self.assertEqual(len(texts), 3)
+        self.assertIn("changed the status from Open to In Progress — Called once", texts[0])
+        self.assertIn("reassigned this from Unassigned to Admin — Owner knows them", texts[1])
+        self.assertIn("created this task", texts[2])
+
+    # -- Lead Create Form: Active / Inactive -------------------------------------
+    def test_only_an_active_lead_form_can_create_a_lead(self):
+        from apps.crm.models import FormSubmission
+
+        form_id = str(self.lead_form.id)
+        self.assertIs(self.api.get(f"{API}/forms/{form_id}/").json()["isActive"], True)
+
+        lead = self.post("/leads/", {"name": "Tango", "stageId": str(self.new.id), "formId": form_id,
+                                     "customValues": {"budget": 10}})
+        self.assertEqual(lead.status_code, 201, lead.content)
+        self.assertTrue(FormSubmission.objects.filter(form=self.lead_form, lead_id=lead.json()["id"]).exists())
+
+        # Deactivate: the form stays (and its leads), but new leads cannot use it.
+        resp = self.patch(f"/forms/{form_id}/", {"isActive": False})
+        self.assertEqual((resp.status_code, resp.json()["isActive"]), (200, False))
+        refused = self.post("/leads/", {"name": "Uniform", "stageId": str(self.new.id), "formId": form_id})
+        self.assertEqual(refused.status_code, 400, refused.content)
+        self.assertTrue(Lead.objects.filter(pk=lead.json()["id"]).exists())
+
+        # Editing the layout keeps the status; reactivating makes it usable again.
+        self.patch(f"/forms/{form_id}/", {"schema": {"sections": []}})
+        self.assertIs(self.api.get(f"{API}/forms/{form_id}/").json()["isActive"], False)
+        self.patch(f"/forms/{form_id}/", {"isActive": True})
+        again = self.post("/leads/", {"name": "Victor", "stageId": str(self.new.id), "formId": form_id})
+        self.assertEqual(again.status_code, 201, again.content)
