@@ -871,11 +871,15 @@ class DemoUnitViewSet(TenantModelViewSet):
     @transaction.atomic
     def return_inspection(self, request, pk=None):
         demo = self.get_object()
-        demo.actual_return_date = timezone.now().date()
+        demo.actual_return_date = request.data.get("returnDate") or timezone.now().date()
         demo.status = "Returned - Inspected"
         demo.condition_on_return = request.data.get("condition") or "Good"
         demo.inspection_notes = request.data.get("notes") or "Inspected upon return"
-        demo.save(update_fields=["actual_return_date", "status", "condition_on_return", "inspection_notes", "updated_at"])
+        demo.refurbishment_cost = request.data.get("refurbishmentCost") or 0
+        demo.save(update_fields=[
+            "actual_return_date", "status", "condition_on_return", "inspection_notes",
+            "refurbishment_cost", "updated_at",
+        ])
         self.write_audit("return_inspection", demo, description=f"Demo unit returned. Condition: {demo.condition_on_return}")
         return Response(self.get_serializer(demo).data)
 
@@ -885,7 +889,10 @@ class DemoUnitViewSet(TenantModelViewSet):
         demo = self.get_object()
         demo.status = "Converted to Sale"
         demo.sale_invoice_ref = request.data.get("invoice_ref") or "Pending Invoice"
-        demo.save(update_fields=["status", "sale_invoice_ref", "updated_at"])
+        demo.sale_price = request.data.get("salePrice") or None
+        if request.data.get("notes"):
+            demo.notes = "\n".join(filter(None, [demo.notes, f"Sale: {request.data['notes']}"]))
+        demo.save(update_fields=["status", "sale_invoice_ref", "sale_price", "notes", "updated_at"])
         self.write_audit("convert_sale", demo, description="Demo unit converted to final sale.")
         return Response(self.get_serializer(demo).data)
 
@@ -915,8 +922,12 @@ class ReworkOrderViewSet(TenantModelViewSet):
     def log_scrap(self, request, pk=None):
         rework = self.get_object()
         scrap_qty = Decimal(str(request.data.get("scrap_qty") or 1))
-        scrap_reason = request.data.get("reason") or "Failed rework inspection"
+        scrap_reason = (
+            request.data.get("reason") or request.data.get("scrap_reason") or "Failed rework inspection"
+        )
         loss_amt = Decimal(str(request.data.get("loss_amount") or 0))
+        weight = request.data.get("weight_kg")
+        salvage = Decimal(str(request.data.get("salvage_value") or 0))
 
         rework.scrap_qty += scrap_qty
         if rework.quantity > 0:
@@ -939,6 +950,8 @@ class ReworkOrderViewSet(TenantModelViewSet):
             quantity=scrap_qty,
             scrap_reason=scrap_reason,
             estimated_loss=loss_amt,
+            weight_kg=Decimal(str(weight)) if weight not in (None, "", 0, "0") else None,
+            salvage_value=salvage,
             rework_order=rework,
             logged_by=request.user,
         )
