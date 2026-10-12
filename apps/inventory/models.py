@@ -482,6 +482,12 @@ class DemoUnit(TenantModel, LegacyIdMixin):
     condition_on_return = models.TextField(null=True, blank=True)
     sale_invoice_ref = models.TextField(null=True, blank=True)
     notes = models.TextField(null=True, blank=True)
+    # The serial as typed: a machine that is not serial-tracked has no
+    # ``serial`` row to point at, but its plate number still has to be on record.
+    serial_no = models.TextField(null=True, blank=True)
+    security_deposit = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    refurbishment_cost = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    sale_price = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
 
     class Meta:
         db_table = "inventory_demo_units"
@@ -522,6 +528,9 @@ class ReworkOrder(TenantModel, LegacyIdMixin):
     root_cause = models.TextField(null=True, blank=True)
     rework_labor_hours = models.DecimalField(max_digits=8, decimal_places=2, default=0)
     rework_cost = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    # The two halves of ``rework_cost``, as the rework screen asks for them.
+    labor_cost = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    material_cost = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     scrap_qty = models.DecimalField(max_digits=18, decimal_places=4, default=0)
     scrap_rate_pct = models.DecimalField(max_digits=6, decimal_places=2, default=0)
     status = models.TextField(choices=STATUSES, default="Pending")
@@ -549,6 +558,9 @@ class ScrapLog(TenantModel):
     quantity = models.DecimalField(max_digits=18, decimal_places=4)
     scrap_reason = models.TextField()
     estimated_loss = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    weight_kg = models.DecimalField(max_digits=12, decimal_places=3, null=True, blank=True)
+    # What the scrap dealer is expected to pay for it.
+    salvage_value = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     rework_order = models.ForeignKey(
         ReworkOrder, null=True, blank=True, on_delete=models.SET_NULL, related_name="scrap_logs"
     )

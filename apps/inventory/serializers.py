@@ -378,7 +378,8 @@ class DemoUnitSerializer(BaseModelSerializer):
     itemId = TenantPrimaryKeyRelatedField(source="item", model="masters.Item")
     itemName = serializers.CharField(source="item.name", read_only=True)
     itemSku = serializers.CharField(source="item.sku", read_only=True)
-    serialNumber = serializers.CharField(source="serial.serial_number", read_only=True, allow_null=True)
+    # Typed serial; linked to the item's serial record when it has one.
+    serialNumber = serializers.CharField(source="serial_no", required=False, allow_blank=True, allow_null=True)
     serialId = TenantPrimaryKeyRelatedField(source="serial", model="masters.ItemSerial", required=False, allow_null=True)
     prospectPartyId = TenantPrimaryKeyRelatedField(source="prospect_party", model="masters.Party", required=False, allow_null=True)
 
@@ -389,9 +390,28 @@ class DemoUnitSerializer(BaseModelSerializer):
             "prospect_name", "prospectPartyId", "contact_phone", "contact_email",
             "dispatch_date", "expected_return_date", "actual_return_date",
             "status", "inspection_notes", "condition_on_return", "sale_invoice_ref",
+            "security_deposit", "refurbishment_cost", "sale_price",
             "notes", "created_at", "updated_at",
         ]
         read_only_fields = ["demo_number", "created_at", "updated_at"]
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        serial_no = (attrs.get("serial_no") or "").strip()
+        item = attrs.get("item") or getattr(self.instance, "item", None)
+        if serial_no and item is not None and not attrs.get("serial"):
+            from apps.masters.models import ItemSerial
+
+            attrs["serial"] = ItemSerial.objects.filter(
+                item=item, serial_no=serial_no, deleted_at__isnull=True
+            ).first()
+        return attrs
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if not data.get("serialNumber") and instance.serial_id:
+            data["serialNumber"] = instance.serial.serial_no
+        return data
 
 
 class ReworkOrderSerializer(BaseModelSerializer):
@@ -406,10 +426,20 @@ class ReworkOrderSerializer(BaseModelSerializer):
         fields = [
             "id", "rework_number", "itemId", "itemName", "itemSku", "goodsReceiptId", "grnNumber",
             "quantity", "defect_reason", "root_cause", "rework_labor_hours", "rework_cost",
+            "labor_cost", "material_cost",
             "scrap_qty", "scrap_rate_pct", "status", "assigned_technician", "notes",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["rework_number", "created_at", "updated_at"]
+        read_only_fields = ["rework_number", "rework_cost", "created_at", "updated_at"]
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        # ``rework_cost`` is always labour + material.
+        if "labor_cost" in attrs or "material_cost" in attrs:
+            labor = attrs.get("labor_cost", getattr(self.instance, "labor_cost", 0)) or 0
+            material = attrs.get("material_cost", getattr(self.instance, "material_cost", 0)) or 0
+            attrs["rework_cost"] = labor + material
+        return attrs
 
 
 class ScrapLogSerializer(BaseModelSerializer):
@@ -422,7 +452,7 @@ class ScrapLogSerializer(BaseModelSerializer):
         model = ScrapLog
         fields = [
             "id", "scrap_number", "itemId", "itemName", "quantity", "scrap_reason",
-            "estimated_loss", "reworkOrderId", "reworkNumber", "logged_at",
+            "estimated_loss", "weight_kg", "salvage_value", "reworkOrderId", "reworkNumber", "logged_at",
         ]
         read_only_fields = ["scrap_number", "logged_at"]
 
