@@ -719,10 +719,10 @@ class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
         # Everyone who marks attendance reads their own rows (the mixin scopes
         # them); `view_team_attendance` reads the whole register.
         "read": [("view_team_attendance", "mark_attendance")],
-        # Editing the register by hand is HR's. An employee's own attendance
-        # comes from Punch In / Punch Out, and corrections go through
+        # Either permission writes; the mixin keeps a `mark_attendance`-only
+        # employee to their own rows. Other corrections go through
         # regularization.
-        "write": ["mark_attendance", "view_team_attendance"],
+        "write": [("mark_attendance", "view_team_attendance")],
         # Marking a whole day for many people is a team action.
         "bulk": ["mark_attendance", "view_team_attendance"],
         # Tenant-wide figures and the edit trail.
