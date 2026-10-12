@@ -17,7 +17,7 @@ from apps.core.pagination import envelope
 from apps.core.permissions import HasModulePermission, has_permission
 from apps.core.viewsets import BulkDeleteMixin, ReadOnlyTenantViewSet, TenantModelViewSet
 
-from . import services
+from . import access, services
 from .models import (
     Contract,
     CrmProject,
@@ -111,7 +111,8 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
     # open. Sub-resources (notes, calls, files, threads, ...) fall to the
     # read/write buckets.
     permission_map = {
-        "read": ["view_lead"],
+        # Open to anyone with a role: ``get_queryset`` decides which leads.
+        "read": [],
         "create": ["create_lead"],
         "bulk_import": ["create_lead"],
         "export": ["view_lead", "export_excel"],
@@ -120,6 +121,12 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
         "bulk_assign": ["edit_lead"],
         "write": ["edit_lead"],
     }
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if access.sees_all(self.request.user):
+            return queryset
+        return queryset.filter(pk__in=access.lead_ids(self.request.user))
 
     def filter_queryset(self, queryset):
         queryset = super().filter_queryset(queryset)
@@ -666,7 +673,8 @@ class StageViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = None
     ordering = ["sequence"]
-    permission_map = {"read": ["view_lead"], "write": ["manage_pipeline"]}
+    # Lookup data a lead or deal page renders; any employee assigned one reads it.
+    permission_map = {"read": [], "write": ["manage_pipeline"]}
 
     def get_queryset(self):
         return super().get_queryset().annotate(
@@ -704,7 +712,8 @@ class DealStageViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = None
     ordering = ["sequence"]
-    permission_map = {"read": ["view_lead"], "write": ["manage_pipeline"]}
+    # Lookup data a lead or deal page renders; any employee assigned one reads it.
+    permission_map = {"read": [], "write": ["manage_pipeline"]}
 
 
 class MasterTaskViewSet(TenantModelViewSet):
@@ -756,22 +765,21 @@ class TaskViewSet(TenantModelViewSet):
         "source": "source",
     }
     permission_map = {
-        "list": ["view_task"],
-        "retrieve": ["view_task"],
+        # Every employee reads and completes the tasks assigned to them;
+        # ``get_queryset`` keeps everyone else's out.
+        "list": [],
+        "retrieve": [],
         "create": ["create_task"],
         "update": ["edit_task"],
         "partial_update": ["edit_task"],
         "destroy": ["delete_task"],
-        "complete": ["view_task"],
+        "complete": [],
     }
-
-    #: Holders of this see the whole team's tasks; everyone else sees the
-    #: tasks assigned to them (the record-level half of `view_task`).
-    TEAM_SCOPE_PERMISSION = "assign_task"
 
     def get_queryset(self):
         queryset = super().get_queryset()
-        if not has_permission(self.request.user, self.TEAM_SCOPE_PERMISSION):
+        # Managers see the whole team's tasks; everyone else their own.
+        if not access.sees_all(self.request.user):
             queryset = queryset.filter(assignee=self.request.user)
         return queryset
 
@@ -849,13 +857,15 @@ class TaskAllocationViewSet(TenantModelViewSet):
     ASSIGNEE_WRITABLE = {"status", "note"}
 
     permission_map = {
-        "list": ["view_task"],
-        "retrieve": ["view_task"],
+        # Every employee reads and moves along the work allocated to them;
+        # ``get_queryset`` keeps everyone else's out.
+        "list": [],
+        "retrieve": [],
         "create": [MANAGE_PERMISSIONS],
         "assign": [MANAGE_PERMISSIONS],
         "update": [MANAGE_PERMISSIONS],
         # An assignee may move their own allocation along; see perform_update.
-        "partial_update": ["view_task"],
+        "partial_update": [],
         "destroy": [MANAGE_PERMISSIONS],
     }
 
@@ -958,7 +968,14 @@ class DealViewSet(TenantModelViewSet):
     ordering = ["-created_at"]
     filter_map = {"ownerId": "owner_id", "customerId": "party_id", "stage": "stage"}
     default_date_field = "expected_close_date"
-    permission_map = {"read": ["view_lead"], "write": ["manage_deals"]}
+    # Read is scoped by ``get_queryset``: owners and assignees see their deals.
+    permission_map = {"read": [], "write": ["manage_deals"]}
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if access.sees_all(self.request.user):
+            return queryset
+        return queryset.filter(pk__in=access.deal_ids(self.request.user))
 
     def get_aggregates(self, queryset):
         return queryset.aggregate(
@@ -1217,7 +1234,14 @@ class ContractViewSet(TenantModelViewSet):
     search_fields = ["contract_number", "title", "party__name"]
     ordering = ["-start_date"]
     filter_map = {"customerId": "party_id", "dealId": "deal_id"}
-    permission_map = {"read": ["view_lead"], "write": ["manage_deals"]}
+    # Read is scoped by ``get_queryset``: the contracts of deals the user sees.
+    permission_map = {"read": [], "write": ["manage_deals"]}
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if access.sees_all(self.request.user):
+            return queryset
+        return queryset.filter(pk__in=access.contract_ids(self.request.user))
 
     def perform_create(self, serializer):
         data = serializer.validated_data
@@ -1457,7 +1481,14 @@ class CrmProjectViewSet(TenantModelViewSet):
     status_field = "status"
     search_fields = ["name", "code", "party__name", "customer_name"]
     ordering = ["-created_at"]
-    permission_map = {"read": ["view_projects"], "write": ["create_project"]}
+    # Read is scoped by ``get_queryset``: owners and the people on its deal.
+    permission_map = {"read": [], "write": ["create_project"]}
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if access.sees_all_projects(self.request.user):
+            return queryset
+        return queryset.filter(pk__in=access.project_ids(self.request.user))
 
     def perform_create(self, serializer):
         serializer.validated_data["code"] = allocate_number(self.request.user.client, "CPRJ")
@@ -1492,7 +1523,8 @@ class SourceViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = None
     ordering = ["name"]
-    permission_map = {"read": ["view_lead"], "write": ["manage_pipeline"]}
+    # Lookup data a lead or deal page renders; any employee assigned one reads it.
+    permission_map = {"read": [], "write": ["manage_pipeline"]}
 
 
 class IndustryViewSet(TenantModelViewSet):
@@ -1502,7 +1534,8 @@ class IndustryViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = None
     ordering = ["name"]
-    permission_map = {"read": ["view_lead"], "write": ["manage_pipeline"]}
+    # Lookup data a lead or deal page renders; any employee assigned one reads it.
+    permission_map = {"read": [], "write": ["manage_pipeline"]}
 
 
 class LostReasonViewSet(TenantModelViewSet):
@@ -1512,7 +1545,8 @@ class LostReasonViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = None
     ordering = ["name"]
-    permission_map = {"read": ["view_lead"], "write": ["manage_pipeline"]}
+    # Lookup data a lead or deal page renders; any employee assigned one reads it.
+    permission_map = {"read": [], "write": ["manage_pipeline"]}
 
 
 # Hidden: User Tracking out of scope (Sweven spec) -- restore by uncommenting this block.
@@ -1568,7 +1602,8 @@ class FormViewSet(TenantModelViewSet):
     search_fields = ["name", "slug"]
     ordering = ["name"]
     filter_map = {"kind": "kind", "isPublished": "is_published"}
-    permission_map = {"read": ["view_lead"], "write": ["manage_pipeline"]}
+    # Lookup data a lead or deal page renders; any employee assigned one reads it.
+    permission_map = {"read": [], "write": ["manage_pipeline"]}
 
     @action(detail=False, methods=["get"], url_path="field-library")
     def field_library(self, request):

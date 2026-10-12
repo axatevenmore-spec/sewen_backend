@@ -110,6 +110,10 @@ CATALOGUE = [
             ("view_ledger", "View ledger"),
             ("view_financial_reports", "View financial reports"),
             ("reconcile_bank", "Reconcile bank"),
+            ("manage_bank_accounts", "Manage bank accounts"),
+            ("close_financial_period", "Close financial period"),
+            ("manage_chart_of_accounts", "Manage chart of accounts"),
+            ("manage_taxes", "Manage taxes and tax rates"),
         ],
     ),
     (
@@ -136,6 +140,7 @@ CATALOGUE = [
             ("menu_admin", "Administration menu"),
             ("menu_pms", "PMS menu"),
             ("menu_organization", "Organization menu"),
+            ("menu_masters", "Masters menu"),
         ],
     ),
     (
@@ -161,6 +166,7 @@ CATALOGUE = [
             ("cancel_invoice", "Cancel invoice"),
             ("record_payment_in", "Record payment in"),
             ("override_credit_limit", "Override credit limit"),
+            ("create_credit_note", "Create credit note"),
         ],
     ),
     (
@@ -174,6 +180,9 @@ CATALOGUE = [
             ("create_bill", "Create bill"),
             ("record_payment_out", "Record payment out"),
             ("cancel_purchase_document", "Cancel purchase document"),
+            ("create_payment", "Create payment / advance"),
+            ("edit_purchase", "Edit purchase / ASN documents"),
+            ("create_debit_note", "Create debit note"),
         ],
     ),
     (
@@ -185,6 +194,18 @@ CATALOGUE = [
             ("create_transfer", "Create transfer"),
             ("approve_zone_request", "Approve zone request"),
             ("perform_audit", "Perform audit"),
+            ("edit_inventory", "Edit inventory, demo & rework units"),
+        ],
+    ),
+    (
+        "Masters",
+        "Master Records",
+        [
+            ("view_masters", "View master records"),
+            ("manage_items", "Manage items and products"),
+            ("manage_parties", "Manage customers and vendors"),
+            ("manage_warehouses", "Manage warehouses and locations"),
+            ("manage_price_lists", "Manage price lists"),
         ],
     ),
     (
@@ -296,9 +317,10 @@ DEFAULT_ROLES = [
         "Sales Manager",
         "Owns the sales pipeline and the CRM.",
         [
-            "menu_sales", "menu_crm", "menu_inventory",
+            "menu_sales", "menu_crm", "menu_inventory", "menu_masters",
             "view_sales", "create_quotation", "create_sales_order", "create_invoice",
-            "finalize_invoice", "cancel_invoice", "record_payment_in",
+            "finalize_invoice", "cancel_invoice", "record_payment_in", "override_credit_limit",
+            "process_returns", "create_credit_note", "view_masters", "manage_parties",
             "view_lead", "create_lead", "edit_lead", "move_lead", "manage_pipeline",
             "view_task", "create_task", "edit_task", "assign_task", "manage_deals",
             "view_inventory", "show_crm_dashboard", "export_excel",
@@ -310,9 +332,11 @@ DEFAULT_ROLES = [
         "Ledgers, payments and financial reporting.",
         [
             "menu_accounts", "menu_sales", "menu_purchase",
-            "view_bank_accounts", "manage_journal_entries", "view_ledger",
-            "view_financial_reports", "reconcile_bank",
+            "view_bank_accounts", "manage_bank_accounts", "manage_journal_entries", "view_ledger",
+            "view_financial_reports", "reconcile_bank", "close_financial_period",
+            "manage_chart_of_accounts", "manage_taxes",
             "view_sales", "view_purchase", "record_payment_in", "record_payment_out",
+            "create_credit_note", "create_debit_note", "view_masters",
             "finalize_invoice", "show_account_dashboard", "export_excel",
         ],
     ),
@@ -321,9 +345,10 @@ DEFAULT_ROLES = [
         "Purchase Officer",
         "Procurement, goods receipt and QC.",
         [
-            "menu_purchase", "menu_inventory",
+            "menu_purchase", "menu_inventory", "menu_masters",
             "view_purchase", "create_purchase_order", "create_bill", "receive_goods",
-            "approve_qc", "record_payment_out", "cancel_purchase_document",
+            "approve_qc", "record_payment_out", "create_payment", "edit_purchase",
+            "create_debit_note", "cancel_purchase_document", "view_masters", "manage_parties",
             "view_inventory", "adjust_stock", "create_transfer",
         ],
     ),
@@ -332,8 +357,9 @@ DEFAULT_ROLES = [
         "Store Keeper",
         "Stock position, transfers and audits.",
         [
-            "menu_inventory", "view_inventory", "adjust_stock", "create_transfer",
-            "approve_zone_request", "perform_audit", "receive_goods",
+            "menu_inventory", "menu_masters", "view_inventory", "adjust_stock", "create_transfer",
+            "approve_zone_request", "perform_audit", "receive_goods", "edit_inventory",
+            "view_masters", "manage_items", "manage_warehouses",
         ],
     ),
     (

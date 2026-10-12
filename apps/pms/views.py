@@ -29,9 +29,18 @@ from apps.core.viewsets import TenantModelViewSet
 
 from . import chat, services
 from .chat_views import CHAT_PERMISSIONS, ProjectChatMixin
+from .team import oversees_all_projects, participant_project_ids
 
 #: Who runs projects: approves timesheets, manages defects.
 PMS_MANAGERS = ("create_pms_project", "assign_stage")
+#: Who sees every project: the PMS module's own users and the people who run
+#: projects. ``view_pms`` alone is the Employee role's self-service grant, so it
+#: only reaches the projects that user works on.
+ALL_PROJECTS_ACCESS = ("menu_pms",) + PMS_MANAGERS
+
+
+def sees_all_projects(user):
+    return oversees_all_projects(user) or has_permission(user, ALL_PROJECTS_ACCESS)
 from django.db.models import Count, Q, Sum
 from apps.core.money import round2, ZERO
 from .models import (
@@ -475,7 +484,11 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
         "priority": "priority",
     }
     permission_map = {
-        "read": ["view_pms"],
+        # Open to anyone with a role: ``get_queryset`` decides which projects.
+        # Whoever is assigned to a project (PM, stage, task, team list) reads
+        # it and its details, PMS access or not.
+        "read": [],
+        "profitability": ["view_pms"],
         "write": ["create_pms_project"],
         "complete": ["complete_project"],
         "apply_stage_template": ["assign_stage"],
@@ -483,11 +496,20 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
         # Anyone who can see the project can take part in its proof review.
         "document_comments": ["view_pms"],
         "stage_tasks": [("view_pms", "create_pms_project")],
-        "stage_task_detail": [("view_pms", "create_pms_project")],
+        # Also the assignee updating their own task (checked in the action).
+        "stage_task_detail": [],
         **CHAT_PERMISSIONS,
     }
     #: The UI uses ``code`` in URLs, so both a uuid and a code resolve.
     lookup_value_regex = "[^/]+"
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        # Customer tracking applies its own party rules
+        # (``check_customer_tracking_permission``).
+        if self.action == "customer_tracking" or sees_all_projects(self.request.user):
+            return queryset
+        return queryset.filter(pk__in=participant_project_ids(self.request.user))
 
     def get_object(self):
         queryset = self.filter_queryset(self.get_queryset())
@@ -1283,6 +1305,10 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
         task = stage.tasks.filter(pk=task_id, deleted_at__isnull=True).first()
         if task is None:
             raise NotFound("That task no longer exists.")
+        if not has_permission(request.user, ("view_pms", "create_pms_project")) and not (
+            request.method == "PATCH" and task.assigned_user_id == request.user.id
+        ):
+            raise PermissionDenied("You can only update tasks assigned to you.", code="view_pms")
 
         if request.method == "DELETE":
             task.soft_delete(request.user)
@@ -1762,8 +1788,10 @@ def apply_document_decision(*, document, decision, comments=None, revision_reaso
 # Cross-project reads (api.md §10.4, §10.7, §10.8)
 # ---------------------------------------------------------------------------
 class MyTasksView(APIView):
+    """The caller's own tasks -- open to every employee, PMS access or not."""
+
     permission_classes = [HasModulePermission]
-    required_permissions = [("view_pms", "view_task")]
+    required_permissions = []
 
     def get(self, request):
         queryset = Task.objects.filter(
@@ -1822,17 +1850,18 @@ class AllTasksView(APIView):
 
 
 class MyProjectsView(APIView):
-    """Projects where the caller is PM or a stage assignee (api.md §10.2)."""
+    """Projects the caller works on: as PM, stage or task assignee, or team
+    member (api.md §10.2). Open to every employee, PMS access or not."""
 
     permission_classes = [HasModulePermission]
-    required_permissions = ["view_pms"]
+    required_permissions = []
 
     def get(self, request):
         queryset = Project.objects.filter(
-            client_id=request.client_id, deleted_at__isnull=True
-        ).filter(
-            Q(project_manager=request.user) | Q(stages__assigned_user=request.user)
-        ).distinct().select_related("project_manager", "current_stage", "current_department")
+            client_id=request.client_id,
+            deleted_at__isnull=True,
+            pk__in=participant_project_ids(request.user),
+        ).select_related("project_manager", "current_stage", "current_department")
         return Response(envelope(ProjectListSerializer(queryset, many=True).data))
 
 
@@ -2076,7 +2105,9 @@ def check_customer_tracking_permission(user, project=None):
     """Enforce role-based access & customer data isolation.
     - Superuser: Full access.
     - Admin (AD) / Project Manager (PM): Full access.
-    - User holding view_pms: Full access.
+    - Project managers / PMS module users (``sees_all_projects``): full access.
+      ``view_pms`` alone (the Employee role) is not enough: customer tracking
+      is the customer's view, not an employee's.
     - Customer role (CU / is_customer) or view_projects:
       - If project provided: project.party_id must match user's linked customer party.
       - If no match: PermissionDenied('You do not have access to this project.', code='CUSTOMER_PROJECT_DENIED').
@@ -2109,7 +2140,7 @@ def check_customer_tracking_permission(user, project=None):
 
     from apps.core.permissions import granted_permissions
     granted = granted_permissions(user)
-    if "view_pms" in granted:
+    if sees_all_projects(user):
         return True
 
     if "view_projects" in granted:
@@ -2204,7 +2235,7 @@ class CustomerTrackingView(APIView):
                 or role_code in ("AD", "PM")
                 or "admin" in role_name
                 or "project manager" in role_name
-                or "view_pms" in granted
+                or sees_all_projects(user)
             )
         )
 
