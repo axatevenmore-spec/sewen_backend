@@ -436,3 +436,32 @@ class LeadSectionLinkTests(TestCase):
         self.post(f"/leads/{lead['id']}/convert/", {"createCustomer": True})
         row = self.api.get(f"{API}/leads/{lead['id']}/").json()
         self.assertEqual(row["customerName"], "Papa Ltd")
+
+    def test_an_accepted_estimate_generates_a_contract(self):
+        from datetime import date
+
+        from apps.crm.models import Contract
+        from apps.sales.models import Estimate
+
+        with self.captureOnCommitCallbacks(execute=True):
+            lead = self.post("/leads/", {"name": "Quebec", "company": "Quebec Co",
+                                         "phone": "9000000001", "stageId": str(self.new.id)}).json()
+        estimate = Estimate.objects.create(
+            client=self.tenant, doc_date=date.today(), crm_lead_id=lead["id"], status="Sent",
+            estimate_number="EST-9", is_one_time_party=True, party_name="Quebec",
+            subtotal=1500, taxable_value=1500, total=1500,
+        )
+        self.assertFalse(Contract.objects.filter(deal__lead_id=lead["id"]).exists())
+
+        estimate.status = "Accepted"
+        estimate.save(update_fields=["status", "updated_at"])
+        contract = Contract.objects.get(deal__lead_id=lead["id"])
+        self.assertEqual((contract.status, contract.value, contract.party.name), ("Draft", 1500, "Quebec"))
+        self.assertEqual(Lead.objects.get(pk=lead["id"]).party_id, contract.party_id)
+
+        # Saving it again does not make a second one.
+        estimate.status = "Sent"
+        estimate.save(update_fields=["status", "updated_at"])
+        estimate.status = "Accepted"
+        estimate.save(update_fields=["status", "updated_at"])
+        self.assertEqual(Contract.objects.filter(deal__lead_id=lead["id"]).count(), 1)

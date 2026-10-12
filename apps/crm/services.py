@@ -939,6 +939,89 @@ def sync_deal_from_document(document, kind, *, user=None):
         sync_lead_after_deal_move(deal, previous, user=actor)
 
 
+#: How long an auto-generated contract runs from the day the estimate was accepted.
+AUTO_CONTRACT_DAYS = 365
+
+
+def _estimate_marker(estimate):
+    return f"Generated automatically from estimate {estimate.estimate_number or estimate.id}"
+
+
+@transaction.atomic
+def contract_from_estimate(estimate, *, user=None):
+    """The lead accepted an estimate: a Draft contract is generated from it.
+
+    The contract is for the estimate's customer (the lead's, when the estimate
+    was addressed to the lead itself -- created from the lead the way Convert
+    does, since a contract needs a customer record), worth the estimate's
+    total, linked to the lead's deal, and runs a year from today. One contract
+    per estimate.
+    """
+    from apps.masters.models import Party
+
+    from .models import Contract
+
+    lead = estimate.crm_lead
+    if lead is None or lead.deleted_at is not None:
+        return None
+    marker = _estimate_marker(estimate)
+    if Contract.objects.filter(
+        client_id=estimate.client_id, description__startswith=marker, deleted_at__isnull=True
+    ).exists():
+        return None
+
+    actor = _actor(user or estimate.created_by)
+    party = estimate.party or lead.party
+    if party is None:
+        party = Party.objects.create(
+            client_id=lead.client_id,
+            code=allocate_number(lead.client, "CUST"),
+            type="Customer",
+            name=estimate.party_name or lead.company or lead.name,
+            phone=estimate.party_phone or lead.phone,
+            email=estimate.party_email or lead.email,
+            place_of_supply=estimate.place_of_supply or lead.state,
+            created_by=actor,
+        )
+    if lead.party_id is None:
+        lead.party = party
+        lead.save(update_fields=["party", "updated_at"])
+
+    deal = lead_deals(lead).order_by("created_at").first()
+    today = timezone.localdate()
+    customer_name = party.name
+    contract = Contract.objects.create(
+        client_id=lead.client_id,
+        contract_number=allocate_number(lead.client, "CON", today),
+        title=f"Contract - {customer_name}",
+        party=party,
+        deal=deal,
+        contract_type="Other",
+        value=estimate.total,
+        start_date=today,
+        end_date=today + timedelta(days=AUTO_CONTRACT_DAYS),
+        status="Draft",
+        customer_name=customer_name,
+        description=f"{marker} accepted by {lead.name} on {today:%d-%m-%Y}.",
+        created_by=actor,
+    )
+    if deal is not None:
+        DealActivity.objects.create(
+            deal=deal, type="contract", actor=actor,
+            description=f"Contract {contract.contract_number} generated from the accepted estimate.",
+        )
+    record_audit(
+        client=lead.client_id,
+        actor=actor,
+        action="contract_generated",
+        entity_type="CrmLead",
+        entity_id=lead.id,
+        entity_label=lead.lead_number,
+        description=f"Contract {contract.contract_number} generated from estimate {estimate.estimate_number or ''}".strip(),
+    )
+    return contract
+
+
 @transaction.atomic
 def mark_lead_lost(lead, *, lost_reason=None, user=None):
     """The Leads list's "Mark as Lost": the lead moves to the Lost stage."""

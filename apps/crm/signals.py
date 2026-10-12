@@ -7,6 +7,7 @@ the public lead form, an import, the approval link):
     new lead                          -> a Draft deal
     estimate / quotation sent         -> the deal moves to Sent
     estimate / quotation accepted     -> the deal (and the lead) is Won
+    estimate accepted                 -> a Draft contract is generated from it
 """
 from django.db import transaction
 from django.db.models.signals import post_save, pre_save
@@ -40,6 +41,8 @@ def _follow_status(kind):
         if not created and getattr(instance, "_status_before_save", None) == instance.status:
             return
         services.sync_deal_from_document(instance, kind)
+        if kind == "estimate" and instance.status == "Accepted":
+            services.contract_from_estimate(instance)
 
     return handler
 
