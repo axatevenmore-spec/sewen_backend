@@ -88,13 +88,25 @@ class StageSerializer(BaseModelSerializer):
 
 class DealStageSerializer(BaseModelSerializer):
     order = serializers.IntegerField(source="sequence", required=False)
+    #: What System Setup's Deal Stages table shows: Active / Inactive and how
+    #: many deals sit in the stage (``Deal.stage`` holds the stage name).
+    status = serializers.SerializerMethodField()
+    count = serializers.SerializerMethodField()
 
     class Meta:
         model = DealStage
         fields = [
             "id", "name", "order", "sequence", "pipeline", "icon", "bg", "fg",
-            "is_won", "is_lost", "is_active",
+            "is_won", "is_lost", "is_active", "status", "count",
         ]
+
+    def get_status(self, stage):
+        return "Active" if stage.is_active else "Inactive"
+
+    def get_count(self, stage):
+        return Deal.objects.filter(
+            client_id=stage.client_id, stage__iexact=stage.name, deleted_at__isnull=True
+        ).count()
 
 
 class SourceSerializer(BaseModelSerializer):
@@ -155,6 +167,11 @@ class LeadSerializer(BaseModelSerializer):
     balance = serializers.SerializerMethodField()
     #: What to show for this lead: the company if it has one, else the contact.
     displayName = serializers.SerializerMethodField()
+    #: The Lead Create Form a new lead was entered with. Write-only: it has to
+    #: be an active lead form, and the lead keeps a submission row for it.
+    formId = TenantPrimaryKeyRelatedField(
+        model="crm.Form", write_only=True, required=False, allow_null=True
+    )
 
     class Meta:
         model = Lead
@@ -163,7 +180,7 @@ class LeadSerializer(BaseModelSerializer):
             "stageId", "owner", "ownerId", "createdOn", "source", "sourceId",
             "city", "state", "country", "amount", "job_title", "industry",
             "avatarColor", "latitude", "longitude", "is_pinned", "party", "customerName",
-            "lost_reason", "custom_values",
+            "lost_reason", "custom_values", "formId",
             "balance", "displayName",
             "productsCount", "sourcesCount", "filesCount", "openTasksCount",
             "callsCount", "estimatesCount", "deliveryChallansCount",
@@ -171,6 +188,19 @@ class LeadSerializer(BaseModelSerializer):
             "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
+
+    def validate(self, attrs):
+        form = attrs.pop("formId", None)
+        self.lead_form = None
+        if form is not None and self.instance is None:
+            if form.kind != "lead" or form.deleted_at is not None:
+                raise serializers.ValidationError({"formId": "Pick a lead create form."})
+            if not form.is_active:
+                raise serializers.ValidationError(
+                    {"formId": "This lead form is inactive. Activate it in Lead Create Form first."}
+                )
+            self.lead_form = form
+        return super().validate(attrs)
 
     def get_balance(self, lead):
         party = lead.party
@@ -675,7 +705,7 @@ class FormSerializer(BaseModelSerializer):
         model = Form
         fields = [
             "id", "name", "slug", "schema", "kind", "is_published",
-            "published_at", "created_at", "updated_at",
+            "published_at", "is_active", "created_at", "updated_at",
         ]
         read_only_fields = ["published_at", "created_at", "updated_at"]
 

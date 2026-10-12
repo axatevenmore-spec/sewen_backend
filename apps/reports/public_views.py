@@ -438,7 +438,7 @@ class PublicFormView(PublicView):
         from apps.crm.models import Form
 
         form = Form.objects.filter(
-            slug=slug, is_published=True, deleted_at__isnull=True
+            slug=slug, is_published=True, is_active=True, deleted_at__isnull=True
         ).first()
         if form is None:
             raise NotFound("This form is not available.")
@@ -455,7 +455,7 @@ class PublicFormSubmitView(PublicWriteView):
         from apps.crm.services import run_stage_automation
 
         form = Form.objects.filter(
-            slug=slug, is_published=True, deleted_at__isnull=True
+            slug=slug, is_published=True, is_active=True, deleted_at__isnull=True
         ).select_related("client").first()
         if form is None:
             raise NotFound("This form is not available.")

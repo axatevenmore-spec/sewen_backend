@@ -328,11 +328,14 @@ def previous_id_equals(previous, target):
 
 
 def next_stage_after(client_id, stage):
+    """The stage a lead moves on to. Never the Lost stage: losing a lead is its
+    own action (Mark as Lost), not the next step of the pipeline."""
     return (
         Stage.objects.filter(
             client_id=client_id,
             deleted_at__isnull=True,
             is_active=True,
+            is_lost=False,
             sequence__gt=stage.sequence,
         )
         .order_by("sequence")
