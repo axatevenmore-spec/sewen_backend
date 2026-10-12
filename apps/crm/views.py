@@ -185,9 +185,19 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
         partial = kwargs.pop("partial", False)
         lead = self.get_object()
         previous_stage_id = lead.stage_id
+        previous_stage = lead.stage
 
         serializer = self.get_serializer(lead, data=request.data, partial=partial)
         serializer.is_valid(raise_exception=True)
+        target = serializer.validated_data.get("stage")
+        if (
+            target is not None
+            and previous_stage is not None
+            and previous_stage.is_lost
+            and not target.is_lost
+            and not services.is_crm_admin(request.user)
+        ):
+            raise PermissionDenied("Only an admin can reopen a lost lead.")
         self.perform_update(serializer)
 
         lead.refresh_from_db()
@@ -199,6 +209,9 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
             created_tasks = services.run_stage_automation(
                 lead, lead.stage, user=request.user
             )
+            # Lost / Won / reopened: the lead's deals follow.
+            services.sync_deals_after_lead_move(lead, previous_stage, user=request.user)
+            lead.refresh_from_db()
 
         services.annotate_lead_counters(request.client_id, [lead])
         return Response(
@@ -215,6 +228,29 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
     @action(detail=False, methods=["post"], url_path="bulk-delete")
     def bulk_delete_action(self, request):
         return self.bulk_delete(request)
+
+    @action(detail=False, methods=["post"], url_path="mark-lost")
+    def mark_lost(self, request):
+        """``POST /crm/leads/mark-lost/ {ids, lostReasonId?}`` -- what the Leads
+        list offers instead of Delete. Each lead moves to the Lost stage and
+        its deal to the pipeline's Lost column, where an admin can reopen it."""
+        from apps.core.permissions import require_permission
+
+        require_permission(request.user, "move_lead")
+        ids = request.data.get("ids") or []
+        if not isinstance(ids, list) or not ids:
+            raise ValidationFailed("Pick at least one lead.", field_errors={"ids": ["Required."]})
+        reason = None
+        reason_id = request.data.get("lostReasonId")
+        if reason_id:
+            reason = LostReason.objects.filter(
+                client_id=request.client_id, pk=reason_id, deleted_at__isnull=True
+            ).first()
+        leads = list(self.get_queryset().filter(pk__in=ids))
+        for lead in leads:
+            services.mark_lead_lost(lead, lost_reason=reason, user=request.user)
+        services.annotate_lead_counters(request.client_id, leads)
+        return Response(envelope(self.get_serializer(leads, many=True).data))
 
     @action(detail=True, methods=["post"])
     def pin(self, request, pk=None):
@@ -309,17 +345,27 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
             )
             lead.party = party
 
-        deal = Deal.objects.create(
-            client_id=request.client_id,
-            deal_number=allocate_number(request.user.client, "DEAL"),
-            title=request.data.get("title") or f"{lead.company or lead.name} opportunity",
-            lead=lead,
-            party=party,
-            owner=lead.owner or request.user,
-            stage="Open",
-            value=lead.amount or ZERO,
-            created_by=request.user,
-        )
+        # Every lead already has its deal in the pipeline (a Draft from the day
+        # it came in); converting links that one to the customer rather than
+        # opening a second.
+        deal = services.lead_deals(lead).exclude(stage__in=services.CLOSED_DEAL_STAGES).order_by("created_at").first()
+        if deal is not None:
+            deal.party = party
+            if request.data.get("title"):
+                deal.title = request.data["title"]
+            deal.save(update_fields=["party", "title", "updated_at"])
+        else:
+            deal = Deal.objects.create(
+                client_id=request.client_id,
+                deal_number=allocate_number(request.user.client, "DEAL"),
+                title=request.data.get("title") or f"{lead.company or lead.name} opportunity",
+                lead=lead,
+                party=party,
+                owner=lead.owner or request.user,
+                stage="Open",
+                value=lead.amount or ZERO,
+                created_by=request.user,
+            )
         lead.converted_deal = deal
         lead.save(update_fields=["party", "converted_deal", "updated_at"])
         self.write_audit("convert", lead, description=f"Converted to deal {deal.deal_number}")
@@ -789,7 +835,7 @@ class StageTaskViewSet(TenantModelViewSet):
 
 
 class TaskViewSet(TenantModelViewSet):
-    queryset = Task.objects.select_related("lead", "deal", "assignee")
+    queryset = Task.objects.select_related("lead", "deal", "assignee", "created_by")
     serializer_class = TaskSerializer
     audit_entity_type = "CrmTask"
     audit_label_field = "title"
@@ -818,9 +864,12 @@ class TaskViewSet(TenantModelViewSet):
 
     def get_queryset(self):
         queryset = super().get_queryset()
-        # Managers see the whole team's tasks; everyone else their own.
-        if not access.sees_all(self.request.user):
-            queryset = queryset.filter(assignee=self.request.user)
+        # A task is seen by the person it is assigned to and the one who
+        # assigned (created) it; admins see every task.
+        if not access.is_admin(self.request.user):
+            queryset = queryset.filter(
+                Q(assignee=self.request.user) | Q(created_by=self.request.user)
+            )
         return queryset
 
     def filter_queryset(self, queryset):
@@ -853,8 +902,10 @@ class TaskViewSet(TenantModelViewSet):
 
     @action(detail=True, methods=["post"])
     def complete(self, request, pk=None):
-        """``{ outcome, nextAction, note, completedBy }`` (api.md §9.3)."""
-        serializer = CompleteTaskSerializer(data=request.data)
+        """``{ outcome, nextAction, note, completedBy, targetStageId }`` (api.md §9.3)."""
+        serializer = CompleteTaskSerializer(
+            data=request.data, context=self.get_serializer_context()
+        )
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
@@ -864,6 +915,11 @@ class TaskViewSet(TenantModelViewSet):
             next_action=data.get("nextAction"),
             note=data.get("note"),
             user=request.user,
+            follow_up_at=data.get("followUpAt"),
+            close_open_tasks=data.get("closeOpenTasks", False),
+            # ``targetStageId`` is declared with source="target_stage", so that
+            # is the key DRF stores it under -- the camelCase name is the wire.
+            target_stage=data.get("target_stage"),
         )
         return Response(
             {
@@ -875,6 +931,7 @@ class TaskViewSet(TenantModelViewSet):
                 ),
                 "createdTasks": TaskSerializer(result["createdTasks"], many=True).data,
                 "stageChanged": result["stageChanged"],
+                "movedToStage": result["movedToStage"],
             }
         )
 
@@ -914,8 +971,12 @@ class TaskAllocationViewSet(TenantModelViewSet):
 
     def get_queryset(self):
         queryset = super().get_queryset()
-        if not self._can_manage():
-            queryset = queryset.filter(assignee=self.request.user)
+        # Only the assignee and the person who assigned it see an allocation;
+        # admins see them all.
+        if not access.is_admin(self.request.user):
+            queryset = queryset.filter(
+                Q(assignee=self.request.user) | Q(assigned_by=self.request.user)
+            )
         return queryset
 
     def _append_audit(self, allocation, action_name, text, note=None):
@@ -1038,6 +1099,9 @@ class DealViewSet(TenantModelViewSet):
 
     def perform_update(self, serializer):
         previous = serializer.instance.stage
+        target = serializer.validated_data.get("stage", previous)
+        if previous == "Lost" and target != "Lost" and not services.is_crm_admin(self.request.user):
+            raise PermissionDenied("Only an admin can reopen a lost deal.")
         deal = super().perform_update(serializer)
         if deal.stage != previous:
             if deal.stage in ("Won", "Lost") and deal.closed_at is None:
@@ -1049,6 +1113,8 @@ class DealViewSet(TenantModelViewSet):
                 description=f"Stage moved from {previous} to {deal.stage}",
                 actor=self.request.user,
             )
+            # Lost / Won / reopened: the deal's lead follows.
+            services.sync_lead_after_deal_move(deal, previous, user=self.request.user)
         return deal
 
     @action(detail=True, methods=["get", "post"])
@@ -1634,7 +1700,9 @@ class LostReasonViewSet(TenantModelViewSet):
 
 
 class FormViewSet(TenantModelViewSet):
-    queryset = Form.objects.all()
+    # Lead Task Forms were removed; their rows stay in the table but the API
+    # no longer serves or creates them.
+    queryset = Form.objects.exclude(kind="task")
     serializer_class = FormSerializer
     audit_entity_type = "CrmForm"
     audit_label_field = "name"

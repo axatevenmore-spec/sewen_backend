@@ -6,3 +6,6 @@ class CrmConfig(AppConfig):
     name = "apps.crm"
     label = "crm"
     verbose_name = "CRM"
+
+    def ready(self):
+        from . import signals  # noqa: F401 -- connects the Deals pipeline hooks
