@@ -122,6 +122,9 @@ class LeadSerializer(BaseModelSerializer):
     """The lead row, including the eight counters computed server-side."""
 
     leadNumber = serializers.CharField(source="lead_number", read_only=True)
+    #: The customer the lead was converted to (``party``), for the lead's
+    #: estimate / quotation forms.
+    customerName = serializers.CharField(source="party.name", read_only=True, default=None)
     #: JSON ``status`` maps to the stage *name* -- stages are configurable.
     status = serializers.CharField(source="stage.name", read_only=True)
     stageId = TenantPrimaryKeyRelatedField(source="stage", model="crm.Stage")
@@ -159,7 +162,7 @@ class LeadSerializer(BaseModelSerializer):
             "id", "leadNumber", "name", "company", "phone", "email", "status",
             "stageId", "owner", "ownerId", "createdOn", "source", "sourceId",
             "city", "state", "country", "amount", "job_title", "industry",
-            "avatarColor", "latitude", "longitude", "is_pinned", "party",
+            "avatarColor", "latitude", "longitude", "is_pinned", "party", "customerName",
             "lost_reason", "custom_values",
             "balance", "displayName",
             "productsCount", "sourcesCount", "filesCount", "openTasksCount",

@@ -429,3 +429,10 @@ class LeadSectionLinkTests(TestCase):
         body = resp.json()
         self.assertEqual((body["partyName"], body["isOneTimeParty"], body["partyPhone"]),
                          ("Oscar", True, "9876543210"))
+
+    def test_a_converted_lead_carries_its_customer_name(self):
+        lead = self.post("/leads/", {"name": "Papa", "company": "Papa Ltd", "stageId": str(self.new.id)}).json()
+        self.assertIsNone(lead["customerName"])
+        self.post(f"/leads/{lead['id']}/convert/", {"createCustomer": True})
+        row = self.api.get(f"{API}/leads/{lead['id']}/").json()
+        self.assertEqual(row["customerName"], "Papa Ltd")
