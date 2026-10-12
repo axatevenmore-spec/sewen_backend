@@ -151,7 +151,30 @@ SalesInvoiceLineSerializer = line_serializer_for(
 # ---------------------------------------------------------------------------
 # Estimates (api.md §5.2)
 # ---------------------------------------------------------------------------
-class EstimateSerializer(DocumentSerializer):
+class LeadPartyMixin:
+    """An estimate / quotation raised from a lead is addressed to that lead.
+
+    With no customer account picked, the document takes the lead's customer
+    when it has been converted, else the lead itself as a one-time party (its
+    name, phone and email) -- so a new lead can be sent an estimate before it
+    is a customer.
+    """
+
+    def validate(self, attrs):
+        lead = attrs.get("crm_lead")
+        if lead is not None and not attrs.get("party"):
+            if lead.party_id:
+                attrs["party"] = lead.party
+            else:
+                attrs["is_one_time_party"] = True
+                attrs["party_name"] = (attrs.get("party_name") or "").strip() or lead.name
+                attrs.setdefault("party_type", "Customer")
+                attrs["party_phone"] = attrs.get("party_phone") or lead.phone
+                attrs["party_email"] = attrs.get("party_email") or lead.email
+        return super().validate(attrs)
+
+
+class EstimateSerializer(LeadPartyMixin, DocumentSerializer):
     line_model = EstimateLine
     line_serializer = EstimateLineSerializer
     line_fk_name = "estimate"
@@ -166,7 +189,7 @@ class EstimateSerializer(DocumentSerializer):
 # ---------------------------------------------------------------------------
 # Quotations (api.md §5.3)
 # ---------------------------------------------------------------------------
-class QuotationSerializer(DocumentSerializer):
+class QuotationSerializer(LeadPartyMixin, DocumentSerializer):
     line_model = QuotationLine
     line_serializer = QuotationLineSerializer
     line_fk_name = "quotation"

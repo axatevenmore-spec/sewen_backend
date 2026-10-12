@@ -171,6 +171,11 @@ class Lead(TenantModel, LegacyIdMixin):
     converted_deal = models.ForeignKey(
         "Deal", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
+    #: The stage the lead was in before it was closed as Lost or Won -- where
+    #: reopening it (from the Deals pipeline) puts it back.
+    reopen_stage = models.ForeignKey(
+        Stage, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
     created_on = models.DateField(auto_now_add=True)
     #: Values captured by a dynamic form (db.md §9.1).
     custom_values = models.JSONField(default=dict, blank=True)
@@ -359,6 +364,9 @@ class MasterTask(TenantModel):
         "Form", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     is_active = models.BooleanField(default=True)
+    #: Picked into Lead Stage Tasks' "Task Roles" with its Add Task. A new
+    #: master joins the library only; it is never listed there on its own.
+    in_task_roles = models.BooleanField(default=False)
 
     class Meta:
         db_table = "crm_master_tasks"
