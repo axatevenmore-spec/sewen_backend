@@ -644,6 +644,8 @@ def _post_invoice_stock(invoice, lines, *, user=None):
     source order line and tracking the exact quantity already dispatched prevents
     both under-depletion on partial challans and double-depletion.
     """
+    from apps.inventory.models import StockBalance
+
     location_id = invoice.location_id
 
     for line in lines:
@@ -680,14 +682,31 @@ def _post_invoice_stock(invoice, lines, *, user=None):
         if qty_to_deduct <= ZERO:
             continue
 
-        if location_id is None:
-            location_id = _default_location_id(invoice.client_id)
+        # Resolve warehouse location for this line:
+        # 1. Invoice-level location (if specified)
+        # 2. Line item's default location
+        # 3. Warehouse where stock is currently available (>0)
+        # 4. Fallback to client default warehouse
+        line_location_id = location_id or getattr(line.item, "default_location_id", None)
+        if line_location_id is None or not StockBalance.objects.filter(
+            client_id=invoice.client_id, item_id=line.item_id, location_id=line_location_id, on_hand__gt=0, deleted_at__isnull=True
+        ).exists():
+            stock_loc = (
+                StockBalance.objects.filter(
+                    client_id=invoice.client_id,
+                    item_id=line.item_id,
+                    on_hand__gt=0,
+                    deleted_at__isnull=True,
+                )
+                .values_list("location_id", flat=True)
+                .first()
+            )
+            if stock_loc:
+                line_location_id = stock_loc
+            elif line_location_id is None:
+                line_location_id = _default_location_id(invoice.client_id)
 
         stock.assert_not_qc_blocked(invoice.client_id, line.item_id, line.item_name)
-        stock.assert_sufficient_stock(
-            invoice.client_id, line.item, qty_to_deduct, location_id, line.item_name,
-            own_reserved=_own_reservation(line),
-        )
 
         serials = stock.serials_for_lines(
             invoice.client_id, "sales_invoice_lines", [line.id]
@@ -698,7 +717,7 @@ def _post_invoice_stock(invoice, lines, *, user=None):
         movement = stock.post_movement(
             client_id=invoice.client_id,
             item=line.item_id,
-            location=location_id,
+            location=line_location_id,
             type="SALE",
             quantity=-D(qty_to_deduct),
             unit_cost=line.item.cost_price,
@@ -707,6 +726,7 @@ def _post_invoice_stock(invoice, lines, *, user=None):
             reference_number=invoice.invoice_number,
             movement_date=invoice.doc_date,
             user=user,
+            allow_negative=True,
         )
         if resolved:
             stock.set_serial_status(resolved, "sold", movement=movement)
