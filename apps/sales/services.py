@@ -443,9 +443,17 @@ def update_sales_allocation(
         invoice.round_off = round_diff
         recalculate_document(invoice, lines=lines, save=True)
     else:
+        charges = round2(
+            (invoice.freight_charges or ZERO)
+            + (invoice.other_charges or ZERO)
+            + (invoice.round_off or ZERO)
+            - (invoice.total_discount or ZERO)
+            + (invoice.total_tax or ZERO)
+        )
+        invoice.subtotal = round2(formal_inv - charges)
+        invoice.taxable_value = invoice.subtotal
         invoice.total = formal_inv
-        invoice.taxable_value = formal_inv
-        invoice.save(update_fields=["total", "taxable_value", "updated_at"])
+        invoice.save(update_fields=["subtotal", "taxable_value", "total", "updated_at"])
 
     invoice.total_sales_value = total_sales
     invoice.cash_amount = cash

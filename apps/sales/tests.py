@@ -591,6 +591,39 @@ class SalesInvoiceCashAllocationTests(TestCase):
         self.assertEqual(len(data["revisions"]), 1)
         self.assertEqual(data["revisions"][0]["revisionNumber"], 1)
 
+    def test_allocate_split_draft_without_lines(self):
+        """Test allocate-split on a draft invoice without line items does not violate ck_sales_invoices_total."""
+        from datetime import date
+        draft_inv = SalesInvoice.objects.create(
+            client=self.client_obj,
+            party=self.party,
+            doc_date=date.today(),
+            status="Draft",
+            subtotal=Decimal("0.00"),
+            total=Decimal("0.00"),
+            taxable_value=Decimal("0.00"),
+        )
+        api_client = APIClient()
+        tokens = build_tokens(self.user)
+        api_client.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['access']}")
+
+        resp = api_client.post(
+            f"/api/v1/sales/invoices/{draft_inv.id}/allocate-split/",
+            {
+                "formalInvoiceAmount": "471900.00",
+                "cashAmount": "100.00",
+                "totalSalesValue": "472000.00",
+                "reason": "Test draft allocation split without lines",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        draft_inv.refresh_from_db()
+        self.assertEqual(draft_inv.total, Decimal("471900.00"))
+        self.assertEqual(draft_inv.subtotal, Decimal("471900.00"))
+        self.assertEqual(draft_inv.cash_amount, Decimal("100.00"))
+        self.assertEqual(draft_inv.total_sales_value, Decimal("472000.00"))
+
 
 class SalesPipelineLinkTests(TestCase):
     """The document chain the UI walks: every hop is linked and reaches the API."""
