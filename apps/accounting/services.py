@@ -332,6 +332,31 @@ def post_payment_out(payment, *, user=None):
     )
 
 
+def post_vendor_advance(advance, *, user=None):
+    """Dr Creditors | Cr Bank/Cash.
+    Vendor advances increase the party debit balance (making balance positive/advance)."""
+    client_id = advance.client_id
+    account = (
+        advance.bank_account.account
+        if advance.bank_account_id
+        else system_account(client_id, "cash")
+    )
+    po_desc = f" against {advance.purchase_order.po_number}" if advance.purchase_order_id and advance.purchase_order else ""
+    return post_entry(
+        client=advance.client,
+        postings=[
+            debit(system_account(client_id, "creditors"), advance.amount, party=advance.party),
+            credit(account, advance.amount, description=f"Vendor Advance {advance.advance_number}{po_desc}"),
+        ],
+        entry_date=advance.advance_date,
+        narration=f"Vendor advance {advance.advance_number} - {advance.party.name}{po_desc}",
+        source_document_type="VendorAdvance",
+        source_document_id=advance.id,
+        user=user,
+    )
+
+
+
 def post_purchase_return(purchase_return, *, user=None):
     """Dr Creditors | Cr Purchase Return, Cr GST Input."""
     client_id = purchase_return.client_id

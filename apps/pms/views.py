@@ -2575,6 +2575,12 @@ class TimesheetEntryViewSet(TenantModelViewSet):
             r.is_running = False
             r.save(update_fields=["duration_hours", "end_time", "is_running", "updated_at"])
 
+        rate = request.data.get("hourlyRate") or request.data.get("hourly_rate")
+        try:
+            rate = Decimal(str(rate)) if rate not in (None, "") else None
+        except Exception:
+            rate = None
+
         entry = TimesheetEntry.objects.create(
             client_id=request.client_id,
             timesheet=week_timesheet(request.user, timezone.localdate()),
@@ -2583,6 +2589,7 @@ class TimesheetEntryViewSet(TenantModelViewSet):
             task_id=request.data.get("taskId") or request.data.get("task_id"),
             date=timezone.localdate(),
             start_time=now,
+            hourly_rate=rate,
             is_running=True,
             is_billable=request.data.get("isBillable", True),
             description=request.data.get("description", "Working..."),

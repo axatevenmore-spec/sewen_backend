@@ -89,6 +89,66 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
         )
         return super().perform_create(serializer)
 
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        old_status = instance.status
+        order = serializer.save()
+        if old_status != "Issued" and order.status == "Issued":
+            self._intake_issued_po_stock(order)
+        return order
+
+    def _intake_issued_po_stock(self, order):
+        from apps.masters.models import Location
+        location_id = order.location_id
+        if not location_id:
+            loc = Location.objects.filter(client=order.client, deleted_at__isnull=True).first()
+            location_id = loc.id if loc else None
+        if not location_id:
+            return
+
+        for line in order.line_items.select_related("item").all():
+            if not line.item_id or not line.item.holds_stock:
+                continue
+            qty = D(line.qty)
+            if qty <= ZERO:
+                continue
+            if stock.has_document_posted_stock(order.client_id, "PurchaseOrder", order.id):
+                continue
+            stock.post_movement(
+                client_id=order.client_id,
+                item=line.item_id,
+                location=location_id,
+                type="PURCHASE",
+                quantity=qty,
+                weighed_qty=line.weighed_qty if getattr(line.item, "is_weight_item", False) else None,
+                uom=line.uom or getattr(line.item, "uom", "Nos"),
+                unit_cost=line.rate or line.item.cost_price,
+                reference_type="PurchaseOrder",
+                reference_id=order.id,
+                reference_number=order.po_number,
+                source_document_type="PurchaseOrder",
+                source_document_id=order.id,
+                movement_date=order.doc_date or timezone.localdate(),
+                prevent_duplicate=True,
+                user=self.request.user,
+            )
+            line.received_qty = qty
+            line.save(update_fields=["received_qty", "updated_at"])
+
+    @action(detail=True, methods=["post"], url_path="issue")
+    @transaction.atomic
+    def issue(self, request, pk=None):
+        order = self.get_object()
+        if order.status == "Cancelled":
+            raise Conflict("Cannot issue a cancelled Purchase Order.", code=Codes.ALREADY_CANCELLED)
+        old_status = order.status
+        order.status = "Issued"
+        order.save(update_fields=["status", "updated_at"])
+        if old_status != "Issued":
+            self._intake_issued_po_stock(order)
+        self.write_audit("issue", order, description=f"PO {order.po_number} issued to vendor")
+        return Response(self.get_serializer(order).data)
+
     @action(detail=True, methods=["get"], url_path="billed-status")
     def billed_status(self, request, pk=None):
         """``getPoBilledStatus`` moved server-side (api.md §6.2)."""
@@ -136,6 +196,13 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
         order.cancelled_by = request.user
         order.cancellation_reason = reason
         order.save()
+        stock.reverse_movements(
+            reference_type="PurchaseOrder",
+            reference_id=order.id,
+            client_id=order.client_id,
+            user=request.user,
+            notes=f"Cancelled PO {order.po_number}: {reason or ''}",
+        )
         self.write_audit("cancel", order, description=reason)
         return Response(self.get_serializer(order).data)
 
@@ -205,7 +272,18 @@ class PurchaseBillViewSet(SalesDocumentViewSet):
             self.request.user.client, "BILL", serializer.validated_data.get("doc_date")
         )
         bill = super().perform_create(serializer)
+        if bill.status in ("Unpaid", "Partially Paid") and bill.journal_entry_id is None:
+            try:
+                from apps.accounting import services as ledger
+                entry = ledger.post_purchase_bill(bill, user=self.request.user)
+                if entry is not None:
+                    bill.journal_entry = entry
+                    bill.save(update_fields=["journal_entry", "updated_at"])
+                ledger.recalculate_party_balance(bill.client_id, bill.party_id)
+            except Exception:
+                pass
         return bill
+
 
     def check_draft_only(self, instance, verb):
         if instance.goods_received:
@@ -904,14 +982,28 @@ class VendorAdvanceViewSet(TenantModelViewSet):
         serializer.validated_data["advance_number"] = allocate_number(
             self.request.user.client, "VADV", serializer.validated_data.get("advance_date")
         )
-        return super().perform_create(serializer)
+        advance = super().perform_create(serializer)
+        try:
+            from apps.accounting import services as ledger
+            ledger.post_vendor_advance(advance, user=self.request.user)
+            ledger.recalculate_party_balance(advance.client_id, advance.party_id)
+        except Exception:
+            pass
+        return advance
+
 
     @action(detail=True, methods=["post"], url_path="reconcile")
     @transaction.atomic
     def reconcile(self, request, pk=None):
         advance = self.get_object()
-        bill_id = request.data.get("bill_id")
-        amount = Decimal(str(request.data.get("amount") or advance.unallocated_amount))
+        bill_id = (
+            request.data.get("bill_id")
+            or request.data.get("purchaseBillId")
+            or request.data.get("billId")
+            or request.data.get("purchase_bill_id")
+        )
+        amt_val = request.data.get("amount")
+        amount = Decimal(str(amt_val if amt_val not in (None, "") else advance.unallocated_amount))
 
         if amount <= 0:
             raise ValidationFailed("Reconciliation amount must be greater than zero.")

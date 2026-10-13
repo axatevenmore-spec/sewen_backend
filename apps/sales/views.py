@@ -244,6 +244,7 @@ class EstimateViewSet(ApprovalLinkActions, SalesDocumentViewSet):
     print_title = "Estimate"
     # An estimate is the draft of a quotation; writing one needs the quotation id.
     permission_map = {"read": ["view_sales"], "write": ["create_quotation"]}
+    draft_values = ("Draft", "Sent", "Rejected")
 
     def perform_create(self, serializer):
         # An estimate is numbered on creation: it is a quoting artefact, not a
@@ -536,7 +537,7 @@ class QuotationViewSet(ApprovalLinkActions, SalesDocumentViewSet):
     print_title = "Quotation"
     filter_map = {"customerId": "party_id", "customer_id": "party_id"}
     permission_map = {"read": ["view_sales"], "write": ["create_quotation"]}
-    draft_values = ("Draft", "Sent")
+    draft_values = ("Draft", "Sent", "Rejected")
 
     def perform_create(self, serializer):
         serializer.validated_data["quotation_number"] = allocate_number(

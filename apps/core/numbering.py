@@ -35,6 +35,8 @@ SERIES_DEFAULTS = {
     "PAY-OUT": ("PAY-OUT", "fy", 4, "-"),
     "PR": ("PR", "fy", 4, "-"),
     "EXP": ("EXP", "fy", 4, "-"),
+    "VADV": ("VADV", "fy", 4, "-"),
+    "ASN": ("ASN", "fy", 4, "-"),
     # Inventory
     "RMA": ("RMA", "fy", 4, "-"),
     "TR": ("TR", "fy", 4, "-"),

@@ -197,6 +197,23 @@ class TenantPrimaryKeyRelatedField(serializers.PrimaryKeyRelatedField):
             queryset = queryset.filter(deleted_at__isnull=True)
         return queryset
 
+    def to_internal_value(self, data):
+        if self.pk_field is not None:
+            data = self.pk_field.to_internal_value(data)
+        qs = self.get_queryset()
+        try:
+            return qs.get(pk=data)
+        except Exception:
+            if hasattr(qs.model, "legacy_id"):
+                obj = qs.filter(legacy_id=data).first()
+                if obj:
+                    return obj
+            if hasattr(qs.model, "code"):
+                obj = qs.filter(code=data).first()
+                if obj:
+                    return obj
+            self.fail("does_not_exist", pk_value=data)
+
 
 class DisplayField(serializers.ReadOnlyField):
     """A frozen or joined display value (``partyName``, ``itemName``, ``locationName``).
