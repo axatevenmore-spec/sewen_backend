@@ -32,6 +32,12 @@ ORDER_STAGES = [
 ]
 #: Stages whose open lines no longer reserve stock (api.md §5.4, db.md §5.2).
 NON_RESERVING_STAGES = ["Delivered", "Invoiced", "Cancelled"]
+#: Where a sales order was raised. Set by the server only -- staff writes go
+#: through ``SalesOrderSerializer`` (read-only there) and stay "Direct"; the
+#: client portal's place-order endpoint is the one writer of "Client Portal".
+ORDER_SOURCE_DIRECT = "Direct"
+ORDER_SOURCE_CLIENT_PORTAL = "Client Portal"
+ORDER_SOURCES = [ORDER_SOURCE_DIRECT, ORDER_SOURCE_CLIENT_PORTAL]
 PAYMENT_STATUSES = ["Unpaid", "Partially Paid", "Paid"]
 PROFORMA_STATUSES = ["Draft", "Sent", "Accepted", "Converted", "Expired", "Cancelled"]
 CHALLAN_STATUSES = [
@@ -335,6 +341,18 @@ class SalesOrder(DocumentHeader):
     total_sales_value = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
     formal_invoice_amount = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
     cash_amount = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
+    # -- client portal reorder ----------------------------------------------
+    # db_default as well: a row inserted outside the ORM (a restore, raw SQL)
+    # still lands as a Direct order rather than failing NOT NULL.
+    order_source = models.TextField(
+        choices=choices(ORDER_SOURCES),
+        default=ORDER_SOURCE_DIRECT,
+        db_default=ORDER_SOURCE_DIRECT,
+    )
+    is_portal_order = models.BooleanField(default=False, db_default=False, db_index=True)
+    #: What the customer typed when placing the order -- kept apart from
+    #: ``notes``, which is staff text and prints on the document.
+    portal_client_notes = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "sales_orders"
@@ -342,6 +360,14 @@ class SalesOrder(DocumentHeader):
         constraints = [
             number_unique_constraint("sales_orders", "order_number"),
             total_check_constraint("sales_orders"),
+            # The flag and the source always say the same thing.
+            models.CheckConstraint(
+                condition=(
+                    models.Q(is_portal_order=True, order_source=ORDER_SOURCE_CLIENT_PORTAL)
+                    | models.Q(is_portal_order=False, order_source=ORDER_SOURCE_DIRECT)
+                ),
+                name="ck_sales_orders_source",
+            ),
         ]
         indexes = [models.Index(fields=["client", "stage"], name="ix_sales_orders_stage")]
 

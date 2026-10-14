@@ -299,6 +299,22 @@ class SensitiveActionThrottle(ProductionRateThrottle):
         return self.cache_format % {"scope": self.scope, "ident": ident}
 
 
+class PortalOrderThrottle(ProductionRateThrottle):
+    """Orders placed from the client portal, per user.
+
+    Every portal order is a Draft that reserves stock until staff act on it,
+    so a runaway client must not be able to flood the order book.
+    """
+    scope = "portal_order"
+    setting_name = "PORTAL_ORDER_RATE_LIMIT"
+    default_rate = "30/hour"
+
+    def get_cache_key(self, request, view):
+        if request.user and request.user.is_authenticated:
+            return self.cache_format % {"scope": self.scope, "ident": str(request.user.pk)}
+        return None
+
+
 class PublicEndpointThrottle(ProductionRateThrottle):
     """Reads of a public token page (quotation, proof, careers, lead forms)."""
     scope = "public"

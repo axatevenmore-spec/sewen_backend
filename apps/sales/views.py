@@ -851,6 +851,11 @@ class SalesOrderViewSet(SalesDocumentViewSet):
         "customerId": "party_id",
         "stage": "stage",
         "paymentStatus": "payment_status",
+        # Client portal reorder: ?orderSource=Client%20Portal, ?isPortalOrder=true.
+        "orderSource": "order_source",
+        "order_source": "order_source",
+        "isPortalOrder": "is_portal_order",
+        "is_portal_order": "is_portal_order",
     }
     permission_map = {"read": ["view_sales"], "write": ["create_sales_order"]}
     draft_values = ("Draft",)
@@ -861,6 +866,10 @@ class SalesOrderViewSet(SalesDocumentViewSet):
         )
         return super().perform_create(serializer)
 
+    # Atomic as a whole (client portal reorder fix): the base save commits in
+    # its own atomic block, so without this a refused credit check answered 422
+    # but left the order Confirmed. Now the refusal rolls the stage change back.
+    @transaction.atomic
     def perform_update(self, serializer):
         """Confirming an order reserves stock (api.md §5.4).
 

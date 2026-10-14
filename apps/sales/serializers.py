@@ -268,8 +268,15 @@ class SalesOrderSerializer(DocumentSerializer):
             "total_sales_value", "formal_invoice_amount", "cash_amount",
             "totalSalesValue", "formalInvoiceAmount", "cashAmount",
             "invoice", "cashReceipt",
+            "order_source", "is_portal_order", "portal_client_notes",
         ]
-        read_only_fields = READ_ONLY_HEADER_FIELDS + ["order_number", "payment_status"]
+        # Replaced (client portal reorder): the source fields are written only
+        # by the portal's place-order endpoint, never by a staff create / PATCH.
+        # read_only_fields = READ_ONLY_HEADER_FIELDS + ["order_number", "payment_status"]
+        read_only_fields = READ_ONLY_HEADER_FIELDS + [
+            "order_number", "payment_status",
+            "order_source", "is_portal_order", "portal_client_notes",
+        ]
 
     def get_invoice(self, order):
         inv = order.invoices.filter(deleted_at__isnull=True).exclude(status="Cancelled").first()
@@ -738,3 +745,45 @@ class SalesReturnSerializer(DocumentSerializer):
 
 class ReasonSerializer(BaseSerializer):
     reason = serializers.CharField(required=False, allow_blank=True)
+
+
+# ---------------------------------------------------------------------------
+# Client portal reorder (apps/sales/portal.py)
+# ---------------------------------------------------------------------------
+#: A portal order is a reorder, not a bulk upload.
+PORTAL_MAX_LINES = 100
+
+
+class PortalOrderLineSerializer(BaseSerializer):
+    """One requested line. Only the item and the quantity come from the
+    customer -- rate, discount and tax are the server's."""
+
+    item_id = serializers.UUIDField()
+    quantity = QuantityField(min_value=Decimal("0.0001"))
+    #: Optional; when sent it must be the item's unit.
+    uom = serializers.CharField(required=False, allow_blank=True, max_length=40)
+    notes = serializers.CharField(
+        required=False, allow_blank=True, allow_null=True, max_length=500
+    )
+
+
+class PortalPlaceOrderSerializer(BaseSerializer):
+    delivery_date = serializers.DateField(required=False, allow_null=True)
+    notes = serializers.CharField(
+        required=False, allow_blank=True, allow_null=True, max_length=2000
+    )
+    lines = PortalOrderLineSerializer(many=True, allow_empty=False)
+
+    def validate_lines(self, lines):
+        if len(lines) > PORTAL_MAX_LINES:
+            raise serializers.ValidationError(
+                f"An order can carry at most {PORTAL_MAX_LINES} lines."
+            )
+        seen = set()
+        for line in lines:
+            if line["item_id"] in seen:
+                raise serializers.ValidationError(
+                    "Each item can appear only once. Combine the quantities on one line."
+                )
+            seen.add(line["item_id"])
+        return lines

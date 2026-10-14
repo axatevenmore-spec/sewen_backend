@@ -2,7 +2,7 @@
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
-from . import views
+from . import portal, views
 
 router = DefaultRouter(trailing_slash=True)
 router.register("estimates", views.EstimateViewSet, basename="sales-estimates")
@@ -20,3 +20,17 @@ router.register("returns", views.SalesReturnViewSet, basename="sales-returns")
 # router.register("warranties", views.WarrantyCardViewSet, basename="sales-warranties")
 
 urlpatterns = [path("", include(router.urls))]
+
+# Client portal reorder (apps/sales/portal.py), mounted at /portal/client/.
+portal_urlpatterns = [
+    path(
+        "orderable-items/",
+        portal.PortalOrderableItemsView.as_view(),
+        name="portal-client-orderable-items",
+    ),
+    path(
+        "place-order/",
+        portal.PortalPlaceOrderView.as_view(),
+        name="portal-client-place-order",
+    ),
+]
