@@ -2431,9 +2431,19 @@ def is_pms_manager(user):
     return has_permission(user, PMS_MANAGERS)
 
 
+#: A timesheet still taking hours. Submitted / Approved sheets are closed.
+OPEN_TIMESHEET_STATUSES = ("Draft", "Rejected")
+
+
 def week_timesheet(user, day):
-    """The signed-in user's timesheet for the week of ``day`` (Mon-Sun), made
-    on first use. Hours can only be added while it is still open."""
+    """The signed-in user's open timesheet for the week of ``day`` (Mon-Sun),
+    made on first use.
+
+    Hours only ever join an open sheet. When the week's sheet is already
+    Submitted or Approved, the new hours start a second sheet for the same
+    week that is submitted and approved on its own -- the hours (and labour
+    cost) already approved are never reopened or changed.
+    """
     employee_id = getattr(user, "employee_id", None)
     if not employee_id:
         raise ValidationFailed(
@@ -2441,10 +2451,28 @@ def week_timesheet(user, day):
             code="NO_EMPLOYEE",
         )
     week_start = day - timedelta(days=day.weekday())
-    sheet = Timesheet.objects.filter(
-        client_id=user.client_id, employee_id=employee_id,
-        week_start=week_start, deleted_at__isnull=True,
-    ).first()
+    # Replaced (extra sheet per closed week): a closed week no longer refuses
+    # new hours with 400 TIMESHEET_CLOSED.
+    # sheet = Timesheet.objects.filter(
+    #     client_id=user.client_id, employee_id=employee_id,
+    #     week_start=week_start, deleted_at__isnull=True,
+    # ).first()
+    # if sheet is None:
+    #     sheet = Timesheet.objects.create(...)
+    # elif sheet.status not in ("Draft", "Rejected"):
+    #     raise ValidationFailed(
+    #         f"Your timesheet for the week of {week_start:%d-%m-%Y} is already {sheet.status.lower()}.",
+    #         code="TIMESHEET_CLOSED",
+    #     )
+    sheet = (
+        Timesheet.objects.filter(
+            client_id=user.client_id, employee_id=employee_id,
+            week_start=week_start, deleted_at__isnull=True,
+            status__in=OPEN_TIMESHEET_STATUSES,
+        )
+        .order_by("-created_at")
+        .first()
+    )
     if sheet is None:
         sheet = Timesheet.objects.create(
             client_id=user.client_id,
@@ -2453,12 +2481,29 @@ def week_timesheet(user, day):
             week_start=week_start,
             week_end=week_start + timedelta(days=6),
         )
-    elif sheet.status not in ("Draft", "Rejected"):
-        raise ValidationFailed(
-            f"Your timesheet for the week of {week_start:%d-%m-%Y} is already {sheet.status.lower()}.",
-            code="TIMESHEET_CLOSED",
-        )
     return sheet
+
+
+def finish_timer(entry, now, *, minimum=None):
+    """Stop a running timer and book its hours.
+
+    The hours join the week's *open* sheet: if the sheet the timer started on
+    was submitted or approved while it ran, that sheet is left as approved and
+    the entry moves to the week's open (or a new) sheet instead.
+    """
+    delta = now - entry.start_time if entry.start_time else timedelta(seconds=0)
+    hours = Decimal(str(round(delta.total_seconds() / 3600, 2)))
+    if minimum is not None:
+        hours = max(minimum, hours)
+    entry.duration_hours = hours
+    entry.end_time = now
+    entry.is_running = False
+    fields = ["duration_hours", "end_time", "is_running", "updated_at"]
+    if entry.timesheet is not None and entry.timesheet.status not in OPEN_TIMESHEET_STATUSES:
+        entry.timesheet = week_timesheet(entry.user, entry.date)
+        fields.append("timesheet")
+    entry.save(update_fields=fields)
+    recount_timesheet(entry.timesheet)
 
 
 def recount_timesheet(sheet):
@@ -2597,8 +2642,12 @@ class TimesheetEntryViewSet(TenantModelViewSet):
         return Response(self.get_serializer(entry).data, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=["post"], url_path="start-timer")
+    @transaction.atomic
     def start_timer(self, request):
         """Starts a live timer for a task/project."""
+        # Resolve the week's open sheet first (and in the same transaction), so
+        # a refusal (no employee link) cannot leave a running timer stopped.
+        sheet = week_timesheet(request.user, timezone.localdate())
         # Stop any existing running timer for this user
         now = timezone.now()
         running = TimesheetEntry.objects.filter(
@@ -2608,12 +2657,15 @@ class TimesheetEntryViewSet(TenantModelViewSet):
             deleted_at__isnull=True,
         )
         for r in running:
-            delta = now - r.start_time if r.start_time else timedelta(seconds=0)
-            hours = Decimal(str(round(delta.total_seconds() / 3600, 2)))
-            r.duration_hours = hours
-            r.end_time = now
-            r.is_running = False
-            r.save(update_fields=["duration_hours", "end_time", "is_running", "updated_at"])
+            # Replaced (extra sheet per closed week): finish_timer also moves the
+            # hours off a sheet that closed while the timer ran, and recounts.
+            # delta = now - r.start_time if r.start_time else timedelta(seconds=0)
+            # hours = Decimal(str(round(delta.total_seconds() / 3600, 2)))
+            # r.duration_hours = hours
+            # r.end_time = now
+            # r.is_running = False
+            # r.save(update_fields=["duration_hours", "end_time", "is_running", "updated_at"])
+            finish_timer(r, now)
 
         rate = request.data.get("hourlyRate") or request.data.get("hourly_rate")
         try:
@@ -2623,7 +2675,9 @@ class TimesheetEntryViewSet(TenantModelViewSet):
 
         entry = TimesheetEntry.objects.create(
             client_id=request.client_id,
-            timesheet=week_timesheet(request.user, timezone.localdate()),
+            # Replaced: resolved once above, before any running timer is stopped.
+            # timesheet=week_timesheet(request.user, timezone.localdate()),
+            timesheet=sheet,
             user=request.user,
             project_id=request.data.get("projectId") or request.data.get("project_id"),
             task_id=request.data.get("taskId") or request.data.get("task_id"),
@@ -2637,20 +2691,23 @@ class TimesheetEntryViewSet(TenantModelViewSet):
         return Response(self.get_serializer(entry).data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["post"], url_path="stop-timer")
+    @transaction.atomic
     def stop_timer(self, request, pk=None):
         """Stops the specified live timer and finalizes duration."""
         entry = self.get_object()
         if not entry.is_running:
             return Response(self.get_serializer(entry).data)
 
-        now = timezone.now()
-        delta = now - entry.start_time if entry.start_time else timedelta(seconds=0)
-        hours = Decimal(str(round(delta.total_seconds() / 3600, 2)))
-        entry.duration_hours = max(Decimal("0.01"), hours)
-        entry.end_time = now
-        entry.is_running = False
-        entry.save(update_fields=["duration_hours", "end_time", "is_running", "updated_at"])
-        recount_timesheet(entry.timesheet)
+        # Replaced (extra sheet per closed week): see finish_timer.
+        # now = timezone.now()
+        # delta = now - entry.start_time if entry.start_time else timedelta(seconds=0)
+        # hours = Decimal(str(round(delta.total_seconds() / 3600, 2)))
+        # entry.duration_hours = max(Decimal("0.01"), hours)
+        # entry.end_time = now
+        # entry.is_running = False
+        # entry.save(update_fields=["duration_hours", "end_time", "is_running", "updated_at"])
+        # recount_timesheet(entry.timesheet)
+        finish_timer(entry, timezone.now(), minimum=Decimal("0.01"))
         return Response(self.get_serializer(entry).data)
 
     @action(detail=False, methods=["get"], url_path="active-timer")
