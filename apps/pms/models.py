@@ -198,6 +198,20 @@ class Project(TenantModel, LegacyIdMixin):
         serializers read ``project.name``."""
         return self.product_name or self.customer_name or self.code
 
+    def soft_delete(self, user=None):
+        from apps.sales.models import SalesOrder
+        SalesOrder.objects.filter(pms_project=self).update(pms_project=None)
+        if self.sales_order_id:
+            SalesOrder.objects.filter(pk=self.sales_order_id).update(pms_project=None)
+        super().soft_delete(user=user)
+
+    def delete(self, *args, **kwargs):
+        from apps.sales.models import SalesOrder
+        SalesOrder.objects.filter(pms_project=self).update(pms_project=None)
+        if self.sales_order_id:
+            SalesOrder.objects.filter(pk=self.sales_order_id).update(pms_project=None)
+        return super().delete(*args, **kwargs)
+
 
 class ProjectMember(TenantModel):
     """Someone working on a project without owning a stage or a task.

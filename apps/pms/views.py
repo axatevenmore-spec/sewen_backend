@@ -441,7 +441,7 @@ def apply_stage_template(project, config_ids, *, stage_weights=None, user=None):
             created_by=user if getattr(user, "is_authenticated", False) else None,
         )
         created.append(stage_obj)
-        services.populate_default_stage_tasks(stage_obj, project.client_id, user=user)
+        # Tasks are project-specific and only added when explicitly created by users for this project.
 
     if project.current_stage_id is None and created:
         project.current_stage = created[0]
@@ -529,6 +529,14 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
     #: Writes that do not change what a project screen shows. Chat announces
     #: its own events (``chat.py``).
     REALTIME_QUIET_ACTIONS = frozenset(CHAT_PERMISSIONS) | {"document_comments"}
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        from apps.sales.models import SalesOrder
+        SalesOrder.objects.filter(pms_project=instance).update(pms_project=None)
+        if instance.sales_order_id:
+            SalesOrder.objects.filter(pk=instance.sales_order_id).update(pms_project=None)
+        super().perform_destroy(instance)
 
     def finalize_response(self, request, response, *args, **kwargs):
         """Tell every PMS screen in the tenant that this project changed.
@@ -667,10 +675,27 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
         if order is None:
             raise NotFound("That sales order no longer exists.")
         if order.pms_project_id:
+            active_project = Project.objects.filter(
+                pk=order.pms_project_id, deleted_at__isnull=True
+            ).first()
+            if active_project:
+                raise Conflict(
+                    "That order already has a project.",
+                    code=Codes.ALREADY_DONE,
+                    payload={"projectId": str(order.pms_project_id)},
+                )
+            else:
+                order.pms_project = None
+                order.save(update_fields=["pms_project", "updated_at"])
+
+        existing_active = Project.objects.filter(
+            sales_order=order, deleted_at__isnull=True
+        ).first()
+        if existing_active:
             raise Conflict(
                 "That order already has a project.",
                 code=Codes.ALREADY_DONE,
-                payload={"projectId": str(order.pms_project_id)},
+                payload={"projectId": str(existing_active.id)},
             )
 
         stage_weights = data.get("stageWeights") or {}
@@ -1153,7 +1178,19 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
 
         previous = stage.status
         stage.status = serializer.validated_data["status"]
-        stage.save(update_fields=["status", "updated_at"])
+        update_fields = ["status", "updated_at"]
+        if stage.status in ("Submitted", "Completed"):
+            now = timezone.now()
+            Task.objects.filter(stage=stage, deleted_at__isnull=True).update(
+                status="Completed", completion_pct=100, actual_completion_datetime=now, updated_at=now
+            )
+            stage.completion_pct = 100
+            update_fields.append("completion_pct")
+            if not stage.actual_completion_datetime:
+                stage.actual_completion_datetime = now
+                update_fields.append("actual_completion_datetime")
+
+        stage.save(update_fields=update_fields)
         services.recalculate_project(project)
 
         record_audit(
@@ -1537,7 +1574,10 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
                 raise NotFound("There is no open delay on this stage.")
             open_delay.recovery_plan = request.data.get("recoveryPlan", open_delay.recovery_plan)
             if request.data.get("expectedRecoveryDate"):
-                open_delay.expected_recovery_date = request.data["expectedRecoveryDate"]
+                rec_date = request.data["expectedRecoveryDate"]
+                if isinstance(rec_date, str) and "T" in rec_date:
+                    rec_date = rec_date.split("T")[0]
+                open_delay.expected_recovery_date = rec_date
             open_delay.save()
             record_audit(
                 client=request.client_id, actor=request.user,
@@ -1564,9 +1604,9 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
             stage=stage,
             reason=data["reason"],
             category=data["category"],
-            responsible_user_id=data.get("responsibleUserId"),
+            responsible_user_id=data.get("responsibleUserId") or None,
             expected_recovery_date=data["expectedRecoveryDate"],
-            recovery_plan=data.get("recoveryPlan"),
+            recovery_plan=data.get("recoveryPlan") or "",
             created_by=request.user,
         )
         stage.status = "Delayed"

@@ -220,9 +220,19 @@ def handoff_blockers(stage, *, settings=None):
             }
         )
 
-    if Task.objects.filter(
-        stage=stage, status="Blocked", deleted_at__isnull=True
-    ).exists():
+    tasks_query = Task.objects.filter(stage=stage, deleted_at__isnull=True)
+    if tasks_query.exists():
+        incomplete_tasks = tasks_query.exclude(status="Completed").count()
+        if incomplete_tasks > 0:
+            blockers.append(
+                {
+                    "code": "INCOMPLETE_TASKS",
+                    "label": f"All tasks must be completed before handoff ({incomplete_tasks} task{'s' if incomplete_tasks > 1 else ''} remaining).",
+                    "hard": True,
+                }
+            )
+
+    if tasks_query.filter(status="Blocked").exists():
         blockers.append(
             {"code": Codes.BLOCKED_TASKS, "label": "A task on this stage is blocked.", "hard": True}
         )

@@ -488,7 +488,9 @@ class LogDelaySerializer(BaseSerializer):
     reason = serializers.CharField()
     category = serializers.CharField()
     responsibleUserId = serializers.CharField(required=False, allow_null=True)
-    expectedRecoveryDate = serializers.DateField()
+    expectedRecoveryDate = serializers.DateField(
+        input_formats=["%Y-%m-%d", "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "iso-8601"]
+    )
     recoveryPlan = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
 

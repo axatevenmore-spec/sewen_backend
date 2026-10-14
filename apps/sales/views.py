@@ -1084,11 +1084,19 @@ class SalesOrderViewSet(SalesDocumentViewSet):
 
         order = self.get_object()
         if order.pms_project_id:
-            raise Conflict(
-                f"This order already has project {order.pms_project.code}.",
-                code=Codes.ALREADY_DONE,
-                payload={"projectId": str(order.pms_project_id)},
-            )
+            from apps.pms.models import Project
+            active_project = Project.objects.filter(
+                pk=order.pms_project_id, deleted_at__isnull=True
+            ).first()
+            if active_project:
+                raise Conflict(
+                    f"This order already has project {active_project.code}.",
+                    code=Codes.ALREADY_DONE,
+                    payload={"projectId": str(order.pms_project_id)},
+                )
+            else:
+                order.pms_project = None
+                order.save(update_fields=["pms_project", "updated_at"])
         project = create_project_from_order(
             order,
             project_manager_id=request.data.get("projectManagerId"),
