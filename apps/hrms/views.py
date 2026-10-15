@@ -1622,6 +1622,107 @@ class CandidateViewSet(TenantModelViewSet):
     filter_map = {"stage": "stage", "source": "source"}
     permission_map = {"read": ["view_staff"], "write": ["create_staff"]}
 
+    def _hire_candidate_to_employee(self, candidate):
+        if candidate.employee_id:
+            return candidate.employee
+        client_id = candidate.client_id
+        existing_emp = None
+        if candidate.email:
+            existing_emp = Employee.objects.filter(
+                client_id=client_id, email__iexact=candidate.email.strip(), deleted_at__isnull=True
+            ).first()
+        if existing_emp:
+            candidate.employee = existing_emp
+            candidate.stage = "Hired"
+            candidate.save(update_fields=["employee", "stage", "updated_at"])
+            return existing_emp
+
+        offer = (
+            Offer.objects.filter(
+                application__candidate=candidate, status="Accepted", deleted_at__isnull=True
+            )
+            .order_by("-created_at")
+            .first()
+        )
+        if not offer:
+            offer = (
+                Offer.objects.filter(
+                    application__candidate=candidate, deleted_at__isnull=True
+                )
+                .order_by("-created_at")
+                .first()
+            )
+        application = (
+            Application.objects.filter(candidate=candidate, deleted_at__isnull=True)
+            .select_related("job")
+            .order_by("-applied_at")
+            .first()
+        )
+
+        employee = Employee.objects.create(
+            client_id=client_id,
+            employee_code=allocate_number(self.request.user.client, "EMP"),
+            name=candidate.name,
+            email=candidate.email,
+            phone=candidate.phone,
+            joining_date=(
+                offer.joining_date if offer and offer.joining_date else timezone.localdate()
+            ),
+            department=application.job.department if application and application.job else None,
+            designation=application.job.designation if application and application.job else None,
+            location=application.job.location if application and application.job else None,
+            employment_type=application.job.employment_type if application and application.job else None,
+            standard_salary=(offer.offered_ctc / 12) if offer and offer.offered_ctc else ZERO,
+            status="Probation",
+            created_by=getattr(self.request, "user", None),
+        )
+        candidate.employee = employee
+        candidate.stage = "Hired"
+        candidate.save(update_fields=["employee", "stage", "updated_at"])
+
+        if employee.email:
+            from apps.accounts.models import User
+            login = User.objects.filter(
+                client_id=client_id, email=employee.email.strip().lower(),
+                deleted_at__isnull=True,
+            ).first()
+            if login is not None and not user_link.linked_employee(login):
+                login.employee = employee
+                login.save(update_fields=["employee", "updated_at"])
+                user_link.reconcile(login, employee)
+
+        record_audit(
+            client=client_id,
+            actor=getattr(self.request, "user", None),
+            action="onboard",
+            entity_type="Employee",
+            entity_id=employee.id,
+            entity_label=employee.employee_code,
+            description=f"Hired from candidate {candidate.name}",
+        )
+        return employee
+
+    @transaction.atomic
+    def perform_create(self, serializer):
+        candidate = super().perform_create(serializer)
+        if candidate.stage == "Hired" and not candidate.employee_id:
+            self._hire_candidate_to_employee(candidate)
+        return candidate
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        candidate = super().perform_update(serializer)
+        if candidate.stage == "Hired" and not candidate.employee_id:
+            self._hire_candidate_to_employee(candidate)
+        return candidate
+
+    @action(detail=True, methods=["post"])
+    @transaction.atomic
+    def hire(self, request, pk=None):
+        candidate = self.get_object()
+        employee = self._hire_candidate_to_employee(candidate)
+        return Response(EmployeeSerializer(employee).data, status=status.HTTP_201_CREATED)
+
 
 class ApplicationViewSet(TenantModelViewSet):
     queryset = Application.objects.select_related("candidate", "job")
@@ -2640,9 +2741,50 @@ class EmployeeTransferViewSet(TenantModelViewSet):
     filter_map = {"employeeId": "employee_id", "status": "status"}
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
 
+    @transaction.atomic
     def perform_create(self, serializer):
         serializer.validated_data["transfer_number"] = allocate_number(self.request.user.client, "TRF")
-        return super().perform_create(serializer)
+        transfer = super().perform_create(serializer)
+        emp = transfer.employee
+        if transfer.to_department:
+            emp.department = transfer.to_department
+        if transfer.to_location:
+            emp.location = transfer.to_location
+        emp.save(update_fields=["department", "location", "updated_at"])
+        try:
+            from . import user_link
+            user_link.push_to_user(emp)
+        except Exception:
+            pass
+
+        # Notify the employee
+        try:
+            from apps.core.models import Notification
+            from apps.accounts.models import User
+            from .user_link import linked_user
+            user = linked_user(emp)
+            if not user and emp.email:
+                user = User.objects.filter(
+                    client=transfer.client, email__iexact=emp.email.strip(), deleted_at__isnull=True
+                ).exclude(status="Deleted").first()
+            if user:
+                dept_name = transfer.to_department.name if transfer.to_department else "New Department"
+                Notification.objects.create(
+                    client=transfer.client,
+                    recipient=user,
+                    actor=getattr(self.request, "user", None),
+                    type="hrms.transfer",
+                    category="hrms",
+                    entity_type="EmployeeTransfer",
+                    entity_id=transfer.id,
+                    title="Department Transfer Notice",
+                    body=f"You have been transferred to {dept_name} effective {transfer.effective_date}. {transfer.reason or ''}".strip(),
+                    channels=["in_app"],
+                    payload={"path": "/portal/employee", "type": "transfer", "transferId": str(transfer.id)},
+                )
+        except Exception:
+            pass
+        return transfer
 
 
 class EmployeePromotionViewSet(TenantModelViewSet):
@@ -2656,9 +2798,51 @@ class EmployeePromotionViewSet(TenantModelViewSet):
     filter_map = {"employeeId": "employee_id", "status": "status"}
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
 
+    @transaction.atomic
     def perform_create(self, serializer):
         serializer.validated_data["promotion_number"] = allocate_number(self.request.user.client, "PRM")
-        return super().perform_create(serializer)
+        promotion = super().perform_create(serializer)
+        emp = promotion.employee
+        if promotion.to_designation:
+            emp.designation = promotion.to_designation
+        if promotion.new_salary:
+            emp.standard_salary = promotion.new_salary
+        emp.save(update_fields=["designation", "standard_salary", "updated_at"])
+        try:
+            from . import user_link
+            user_link.push_to_user(emp)
+        except Exception:
+            pass
+
+        # Notify the employee
+        try:
+            from apps.core.models import Notification
+            from apps.accounts.models import User
+            from .user_link import linked_user
+            user = linked_user(emp)
+            if not user and emp.email:
+                user = User.objects.filter(
+                    client=promotion.client, email__iexact=emp.email.strip(), deleted_at__isnull=True
+                ).exclude(status="Deleted").first()
+            if user:
+                desig_name = promotion.to_designation.title if promotion.to_designation else "New Role"
+                salary_text = f" with revised CTC Rs {promotion.new_salary}" if promotion.new_salary else ""
+                Notification.objects.create(
+                    client=promotion.client,
+                    recipient=user,
+                    actor=getattr(self.request, "user", None),
+                    type="hrms.promotion",
+                    category="hrms",
+                    entity_type="EmployeePromotion",
+                    entity_id=promotion.id,
+                    title=f"Congratulations on Your Promotion to {desig_name}!",
+                    body=f"Your promotion to {desig_name} is effective {promotion.effective_date}{salary_text}.",
+                    channels=["in_app"],
+                    payload={"path": "/portal/employee", "type": "promotion", "promotionId": str(promotion.id)},
+                )
+        except Exception:
+            pass
+        return promotion
 
 
 class EmployeeWarningViewSet(TenantModelViewSet):
@@ -2672,9 +2856,39 @@ class EmployeeWarningViewSet(TenantModelViewSet):
     filter_map = {"employeeId": "employee_id", "status": "status", "severity": "severity"}
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
 
+    @transaction.atomic
     def perform_create(self, serializer):
         serializer.validated_data["warning_number"] = allocate_number(self.request.user.client, "WRN")
-        return super().perform_create(serializer)
+        warning = super().perform_create(serializer)
+
+        # Notify the employee
+        try:
+            from apps.core.models import Notification
+            from apps.accounts.models import User
+            from .user_link import linked_user
+            emp = warning.employee
+            user = linked_user(emp)
+            if not user and emp.email:
+                user = User.objects.filter(
+                    client=warning.client, email__iexact=emp.email.strip(), deleted_at__isnull=True
+                ).exclude(status="Deleted").first()
+            if user:
+                Notification.objects.create(
+                    client=warning.client,
+                    recipient=user,
+                    actor=getattr(self.request, "user", None),
+                    type="hrms.warning",
+                    category="hrms",
+                    entity_type="EmployeeWarning",
+                    entity_id=warning.id,
+                    title=f"Disciplinary Notice ({warning.severity}): {warning.subject}",
+                    body=f"Notice issued on {warning.issue_date} regarding '{warning.subject}'. {warning.description or ''}".strip(),
+                    channels=["in_app"],
+                    payload={"path": "/portal/employee", "type": "warning", "warningId": str(warning.id)},
+                )
+        except Exception:
+            pass
+        return warning
 
 
 class EmployeeAwardViewSet(TenantModelViewSet):
@@ -2688,9 +2902,39 @@ class EmployeeAwardViewSet(TenantModelViewSet):
     filter_map = {"employeeId": "employee_id", "category": "category"}
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
 
+    @transaction.atomic
     def perform_create(self, serializer):
         serializer.validated_data["award_number"] = allocate_number(self.request.user.client, "AWD")
-        return super().perform_create(serializer)
+        award = super().perform_create(serializer)
+
+        # Notify the employee
+        try:
+            from apps.core.models import Notification
+            from apps.accounts.models import User
+            from .user_link import linked_user
+            emp = award.employee
+            user = linked_user(emp)
+            if not user and emp.email:
+                user = User.objects.filter(
+                    client=award.client, email__iexact=emp.email.strip(), deleted_at__isnull=True
+                ).exclude(status="Deleted").first()
+            if user:
+                Notification.objects.create(
+                    client=award.client,
+                    recipient=user,
+                    actor=getattr(self.request, "user", None),
+                    type="hrms.award",
+                    category="hrms",
+                    entity_type="EmployeeAward",
+                    entity_id=award.id,
+                    title=f"Award Received: {award.award_name}!",
+                    body=f"Congratulations! You were presented the {award.award_name} award on {award.award_date}. {award.citation or ''}".strip(),
+                    channels=["in_app"],
+                    payload={"path": "/portal/employee", "type": "award", "awardId": str(award.id)},
+                )
+        except Exception:
+            pass
+        return award
 
 
 class TravelRequestViewSet(TenantModelViewSet):

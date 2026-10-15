@@ -1457,6 +1457,40 @@ class EmployeeTransferSerializer(BaseModelSerializer):
         ]
         read_only_fields = ["transfer_number", "created_at", "updated_at"]
 
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        client_id = self.context.get("client_id")
+        if "employee" in data and "employeeId" not in data:
+            data["employeeId"] = data["employee"]
+
+        to_dept = data.get("toDepartmentId") or data.get("to_department")
+        if to_dept:
+            from apps.hrms.models import Department
+            dept_obj = Department.objects.filter(client_id=client_id, id=to_dept).first() if isinstance(to_dept, str) and len(to_dept) == 36 and "-" in to_dept else None
+            if not dept_obj and isinstance(to_dept, str):
+                dept_obj = Department.objects.filter(client_id=client_id, name__iexact=to_dept.strip()).first()
+                if not dept_obj:
+                    dept_obj = Department.objects.create(client_id=client_id, name=to_dept.strip())
+            if dept_obj:
+                data["toDepartmentId"] = str(dept_obj.id)
+
+        from_dept = data.get("fromDepartmentId") or data.get("from_department")
+        if from_dept:
+            from apps.hrms.models import Department
+            dept_obj = Department.objects.filter(client_id=client_id, id=from_dept).first() if isinstance(from_dept, str) and len(from_dept) == 36 and "-" in from_dept else None
+            if not dept_obj and isinstance(from_dept, str):
+                dept_obj = Department.objects.filter(client_id=client_id, name__iexact=from_dept.strip()).first()
+            if dept_obj:
+                data["fromDepartmentId"] = str(dept_obj.id)
+
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["from_department"] = instance.from_department.name if instance.from_department else ""
+        ret["to_department"] = instance.to_department.name if instance.to_department else ""
+        return ret
+
 
 class EmployeePromotionSerializer(BaseModelSerializer):
     employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
@@ -1477,6 +1511,43 @@ class EmployeePromotionSerializer(BaseModelSerializer):
         ]
         read_only_fields = ["promotion_number", "created_at", "updated_at"]
 
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        client_id = self.context.get("client_id")
+        if "employee" in data and "employeeId" not in data:
+            data["employeeId"] = data["employee"]
+        if "notes" in data and "justification" not in data:
+            data["justification"] = data["notes"]
+
+        to_desig = data.get("toDesignationId") or data.get("new_designation") or data.get("to_designation")
+        if to_desig:
+            from apps.hrms.models import Designation
+            desig_obj = Designation.objects.filter(client_id=client_id, id=to_desig).first() if isinstance(to_desig, str) and len(to_desig) == 36 and "-" in to_desig else None
+            if not desig_obj and isinstance(to_desig, str):
+                desig_obj = Designation.objects.filter(client_id=client_id, title__iexact=to_desig.strip()).first()
+                if not desig_obj:
+                    desig_obj = Designation.objects.create(client_id=client_id, title=to_desig.strip())
+            if desig_obj:
+                data["toDesignationId"] = str(desig_obj.id)
+
+        from_desig = data.get("fromDesignationId") or data.get("previous_designation") or data.get("from_designation")
+        if from_desig:
+            from apps.hrms.models import Designation
+            desig_obj = Designation.objects.filter(client_id=client_id, id=from_desig).first() if isinstance(from_desig, str) and len(from_desig) == 36 and "-" in from_desig else None
+            if not desig_obj and isinstance(from_desig, str):
+                desig_obj = Designation.objects.filter(client_id=client_id, title__iexact=from_desig.strip()).first()
+            if desig_obj:
+                data["fromDesignationId"] = str(desig_obj.id)
+
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["previous_designation"] = instance.from_designation.title if instance.from_designation else ""
+        ret["new_designation"] = instance.to_designation.title if instance.to_designation else ""
+        ret["notes"] = instance.justification or ""
+        return ret
+
 
 class EmployeeWarningSerializer(BaseModelSerializer):
     employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
@@ -1492,6 +1563,40 @@ class EmployeeWarningSerializer(BaseModelSerializer):
         ]
         read_only_fields = ["warning_number", "created_at", "updated_at"]
 
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        if "employee" in data and "employeeId" not in data:
+            data["employeeId"] = data["employee"]
+        if "title" in data and "subject" not in data:
+            data["subject"] = data["title"]
+        if "explanation" in data and "description" not in data:
+            data["description"] = data["explanation"]
+        if "warning_date" in data and "issue_date" not in data:
+            data["issue_date"] = data["warning_date"]
+
+        sev = data.get("severity") or data.get("warning_level")
+        if sev:
+            sev_map = {
+                "low": "Verbal",
+                "medium": "First Written",
+                "severe": "Final Written",
+                "verbal": "Verbal",
+                "first written": "First Written",
+                "final written": "Final Written",
+                "suspension": "Suspension",
+            }
+            data["severity"] = sev_map.get(str(sev).lower(), "First Written")
+
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["title"] = instance.subject
+        ret["explanation"] = instance.description
+        ret["warning_date"] = str(instance.issue_date) if instance.issue_date else ""
+        ret["warning_level"] = instance.severity
+        return ret
+
 
 class EmployeeAwardSerializer(BaseModelSerializer):
     employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
@@ -1506,6 +1611,23 @@ class EmployeeAwardSerializer(BaseModelSerializer):
             "badge_icon", "created_at",
         ]
         read_only_fields = ["award_number", "created_at"]
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        if "employee" in data and "employeeId" not in data:
+            data["employeeId"] = data["employee"]
+        if "cash_reward" in data and "gift_amount" not in data:
+            data["gift_amount"] = data["cash_reward"]
+        if "presentation_date" in data and "award_date" not in data:
+            data["award_date"] = data["presentation_date"]
+
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["cash_reward"] = instance.gift_amount
+        ret["presentation_date"] = str(instance.award_date) if instance.award_date else ""
+        return ret
 
 
 class TravelRequestSerializer(BaseModelSerializer):
