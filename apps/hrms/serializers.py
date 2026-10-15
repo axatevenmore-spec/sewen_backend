@@ -1197,6 +1197,7 @@ class HrDocumentSerializer(BaseModelSerializer):
     )
     fileSize = serializers.IntegerField(source="file.file_size", read_only=True)
     fileType = serializers.CharField(source="file.content_type", read_only=True)
+    fileData = serializers.CharField(required=False, allow_blank=True, write_only=True)
     expiry = serializers.DateField(source="valid_until", required=False, allow_null=True)
     #: DERIVED from ``valid_until`` at read time (api.md §11.8).
     status = serializers.SerializerMethodField()
@@ -1207,10 +1208,94 @@ class HrDocumentSerializer(BaseModelSerializer):
         model = HrDocument
         fields = [
             "id", "title", "category", "employee", "employeeId", "version",
-            "expiry", "status", "fileId", "fileSize", "fileType", "uploadedBy",
+            "expiry", "status", "fileId", "fileSize", "fileType", "fileData", "uploadedBy",
             "updatedOn", "tags", "description", "valid_from", "is_confidential",
             "created_at",
         ]
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        emp_id = data.get("employeeId")
+        if emp_id in ("ALL", "All Staff", "all", "", None) or (
+            isinstance(emp_id, str) and not (len(emp_id) == 36 and "-" in emp_id)
+        ):
+            data["employeeId"] = None
+
+        v_raw = data.get("version")
+        if isinstance(v_raw, str):
+            v_clean = v_raw.lower().replace("v", "").split(".")[0].strip()
+            data["version"] = int(v_clean) if v_clean.isdigit() else 1
+        elif not v_raw:
+            data["version"] = 1
+
+        exp_raw = data.get("expiry")
+        if exp_raw in ("—", "-", "Permanent", "permanent", "N/A", "n/a", "", None):
+            data["expiry"] = None
+
+        return super().to_internal_value(data)
+
+    def create(self, validated_data):
+        file_data = validated_data.pop("fileData", None)
+        instance = super().create(validated_data)
+        if file_data and not instance.file_id:
+            self._attach_file(instance, file_data)
+        return instance
+
+    def update(self, instance, validated_data):
+        file_data = validated_data.pop("fileData", None)
+        instance = super().update(instance, validated_data)
+        if file_data:
+            self._attach_file(instance, file_data)
+        return instance
+
+    def _attach_file(self, instance, file_data):
+        import base64
+        import logging
+        from apps.core.files import build_storage_key, write_bytes
+        from apps.core.models import File
+
+        try:
+            content_type = "application/pdf"
+            if "," in file_data:
+                header, base64_str = file_data.split(",", 1)
+                if ";base64" in header and "data:" in header:
+                    content_type = header.replace("data:", "").replace(";base64", "")
+            else:
+                base64_str = file_data
+            raw_bytes = base64.b64decode(base64_str)
+            client_id = str(instance.client_id)
+            title = instance.title or "document"
+            filename = f"{title}.pdf"
+            storage_key = build_storage_key(client_id, "hrms_documents", filename)
+            write_bytes(storage_key, raw_bytes)
+            f_obj = File.objects.create(
+                client=instance.client,
+                file_name=filename,
+                file_size=len(raw_bytes),
+                content_type=content_type,
+                storage_key=storage_key,
+                scope="hrms_documents",
+                status="Committed",
+                created_by=getattr(instance, "created_by", None),
+            )
+            instance.file = f_obj
+            instance.save(update_fields=["file"])
+        except Exception as err:
+            logging.getLogger(__name__).warning("Failed to attach fileData: %s", err)
+
+    def to_representation(self, instance):
+        from apps.core.files import public_url
+
+        ret = super().to_representation(instance)
+        if not instance.employee:
+            ret["employee"] = "All Staff"
+            ret["employeeId"] = "ALL"
+        if instance.file:
+            try:
+                ret["fileUrl"] = public_url(instance.file, self.context.get("request"))
+            except Exception:
+                pass
+        return ret
 
     def get_status(self, document):
         return services.document_status(document)
