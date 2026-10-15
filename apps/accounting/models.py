@@ -166,7 +166,9 @@ class JournalLine(TenantModel):
 
 
 class Budget(TenantModel):
-    account = models.ForeignKey(Account, on_delete=models.CASCADE, related_name="budgets")
+    account = models.ForeignKey(
+        Account, null=True, blank=True, on_delete=models.CASCADE, related_name="budgets"
+    )
     department_name = models.TextField(null=True, blank=True)
     category = models.ForeignKey(
         "ExpenseCategory", null=True, blank=True, on_delete=models.SET_NULL, related_name="budgets"
@@ -183,8 +185,14 @@ class Budget(TenantModel):
         constraints = [
             models.UniqueConstraint(
                 fields=["client", "account", "period_start", "period_end"],
+                condition=models.Q(account__isnull=False),
                 name="uq_budgets_period",
-            )
+            ),
+            models.UniqueConstraint(
+                fields=["client", "department_name", "period_start", "period_end"],
+                condition=models.Q(account__isnull=True) & models.Q(department_name__isnull=False),
+                name="uq_budgets_dept_period",
+            ),
         ]
 
 

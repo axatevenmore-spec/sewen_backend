@@ -189,6 +189,11 @@ class PartySerializer(BaseModelSerializer):
             raise serializers.ValidationError("A party with this code already exists.")
         return value
 
+    def validate_bank_account_number(self, value):
+        if value and not str(value).strip().isdigit():
+            raise serializers.ValidationError("Bank account number must contain only digits.")
+        return value.strip() if value else value
+
 
 class PartySummarySerializer(BaseSerializer):
     """``GET /parties/{id}/summary/`` -- the Customer 360 drawer.

@@ -255,7 +255,7 @@ class AccountLedgerView(APIView):
 
 
 class BudgetViewSet(TenantModelViewSet):
-    queryset = Budget.objects.select_related("account")
+    queryset = Budget.objects.select_related("account", "category")
     serializer_class = BudgetSerializer
     audit_entity_type = "Budget"
     permission_map = {
@@ -299,7 +299,7 @@ class BudgetViewSet(TenantModelViewSet):
         self._compute_actual(instance, request.client_id)
         return Response(self.get_serializer(instance).data)
 
-    @action(detail=False, methods=["get"])
+    @action(detail=False, methods=["get"], url_path="variance-summary")
     def variance_summary(self, request):
         """Aggregate variance report grouped by department and category."""
         budgets = list(self.filter_queryset(self.get_queryset()))
@@ -322,7 +322,7 @@ class BudgetViewSet(TenantModelViewSet):
             dept_data[dept]["budget"] += b.amount
             dept_data[dept]["actual"] += actual
 
-            cat = b.category or "Uncategorized"
+            cat = (b.category.name if b.category else None) or "Uncategorized"
             if cat not in category_data:
                 category_data[cat] = {"budget": Decimal("0.00"), "actual": Decimal("0.00")}
             category_data[cat]["budget"] += b.amount
@@ -332,7 +332,7 @@ class BudgetViewSet(TenantModelViewSet):
                 alerts.append({
                     "id": b.id,
                     "department": b.department_name,
-                    "category": b.category,
+                    "category": b.category.name if b.category else None,
                     "account": b.account.name if b.account else None,
                     "budget": float(b.amount),
                     "actual": float(actual),

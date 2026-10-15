@@ -1182,7 +1182,7 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
         if stage.status in ("Submitted", "Completed"):
             now = timezone.now()
             Task.objects.filter(stage=stage, deleted_at__isnull=True).update(
-                status="Completed", completion_pct=100, actual_completion_datetime=now, updated_at=now
+                status="Completed", completion_pct=100, updated_at=now
             )
             stage.completion_pct = 100
             update_fields.append("completion_pct")
@@ -1200,7 +1200,7 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
             from_value=previous, to_value=stage.status,
         )
         return Response(
-            ProjectStageSerializer(stage, context=self.get_serializer_context()).data
+            ProjectStageSerializer(stage, context=self._detail_context(project)).data
         )
 
     @action(

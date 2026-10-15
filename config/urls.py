@@ -30,6 +30,7 @@ api_v1 = [
     path("purchase/", include("apps.purchase.urls")),
     # Accounts (api.md §8)
     path("accounts/", include("apps.accounting.urls")),
+    path("accounting/", include("apps.accounting.urls")),
     # Modules (api.md §9, §10, §11)
     path("crm/", include("apps.crm.urls")),
     path("pms/", include("apps.pms.urls")),
