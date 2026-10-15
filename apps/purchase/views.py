@@ -21,7 +21,7 @@ from apps.core.exceptions import (
 )
 from apps.core.money import ZERO, D, round2, round4
 from apps.core.numbering import allocate_number
-from apps.core.pagination import envelope
+from apps.core.pagination import EnvelopePagination, envelope
 from apps.core.printing import PdfNotAvailable, print_payload, send_payload
 from apps.core.viewsets import ReadOnlyTenantViewSet, TenantModelViewSet
 from apps.inventory import services as stock
@@ -64,12 +64,21 @@ def money_sum(field, **kwargs):
     return Coalesce(Sum(field, **kwargs), Value(Decimal("0.00")), output_field=MONEY)
 
 
+class PurchasePagination(EnvelopePagination):
+    """Default pagination for purchase module endpoints: 20 items per page."""
+
+    page_size = 20
+    page_size_query_param = "page_size"
+    max_page_size = 200
+
+
 # ---------------------------------------------------------------------------
 # Purchase orders (api.md §6.2)
 # ---------------------------------------------------------------------------
 class PurchaseOrderViewSet(SalesDocumentViewSet):
     queryset = PurchaseOrder.objects.all()
     serializer_class = PurchaseOrderSerializer
+    pagination_class = PurchasePagination
     audit_entity_type = "PurchaseOrder"
     audit_label_field = "po_number"
     status_field = "status"
@@ -154,32 +163,64 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
         """``getPoBilledStatus`` moved server-side (api.md §6.2)."""
         return Response(services.po_billed_status(self.get_object()))
 
+    def _format_register_po(self, po):
+        billed_tot = sum(b.total for b in po.bills.all() if b.status != "Cancelled")
+        unbilled_commit = max(Decimal("0.00"), (po.total or Decimal("0.00")) - billed_tot)
+        total_qty = sum(l.qty for l in po.line_items.all())
+        rec_qty = sum(l.received_qty for l in po.line_items.all())
+        return {
+            "id": str(po.id),
+            "po_number": po.po_number,
+            "vendor_name": po.party_name,
+            "doc_date": str(po.doc_date) if po.doc_date else None,
+            "expected_date": str(po.expected_date) if po.expected_date else None,
+            "status": po.status,
+            "total": float(po.total or 0),
+            "billed_total": float(billed_tot),
+            "unbilled_commitment": float(unbilled_commit),
+            "ordered_qty": float(total_qty),
+            "received_qty": float(rec_qty),
+            "location": po.location.name if po.location else None,
+            "audit_status": "Complete" if po.status in ("Received", "Closed") else "Open Commitment",
+        }
+
     @action(detail=False, methods=["get"], url_path="register")
     def register(self, request):
-        """Purchase Order Books & Registers (Dev Spec §2.2.1)."""
-        orders = self.get_queryset().select_related("party", "location").prefetch_related("line_items", "bills")
-        items = []
+        """Purchase Order Books & Registers (Dev Spec §2.2.1) with 20 items per page pagination."""
+        orders = self.filter_queryset(
+            self.get_queryset().select_related("party", "location").prefetch_related("line_items", "bills")
+        )
+
+        # Global totals across all matching records for screen KPI cards
+        total_committed = sum((po.total or Decimal("0.00")) for po in orders)
+        billed_total = Decimal("0.00")
+        unbilled_total = Decimal("0.00")
         for po in orders:
-            billed_tot = sum(b.total for b in po.bills.all() if b.status != "Cancelled")
-            unbilled_commit = max(Decimal("0.00"), (po.total or Decimal("0.00")) - billed_tot)
-            total_qty = sum(l.qty for l in po.line_items.all())
-            rec_qty = sum(l.received_qty for l in po.line_items.all())
-            items.append({
-                "id": str(po.id),
-                "po_number": po.po_number,
-                "vendor_name": po.party_name,
-                "doc_date": str(po.doc_date) if po.doc_date else None,
-                "expected_date": str(po.expected_date) if po.expected_date else None,
-                "status": po.status,
-                "total": float(po.total or 0),
-                "billed_total": float(billed_tot),
-                "unbilled_commitment": float(unbilled_commit),
-                "ordered_qty": float(total_qty),
-                "received_qty": float(rec_qty),
-                "location": po.location.name if po.location else None,
-                "audit_status": "Complete" if po.status in ("Received", "Closed") else "Open Commitment",
-            })
-        return Response(envelope(items))
+            b_tot = sum(b.total for b in po.bills.all() if b.status != "Cancelled")
+            billed_total += b_tot
+            unbilled_total += max(Decimal("0.00"), (po.total or Decimal("0.00")) - b_tot)
+
+        aggregates = {
+            "totalCommitted": float(total_committed),
+            "billedTotal": float(billed_total),
+            "unbilledCommitment": float(unbilled_total),
+            "orderCount": len(orders),
+        }
+
+        # Caller can request unpaginated if needed via ?all=true or ?unpaginated=true
+        if request.query_params.get("all") in ("true", "1") or request.query_params.get("unpaginated") in ("true", "1"):
+            items = [self._format_register_po(po) for po in orders]
+            return Response(envelope(items, aggregates=aggregates, page_size=20))
+
+        page = self.paginate_queryset(orders)
+        if page is not None:
+            items = [self._format_register_po(po) for po in page]
+            response = self.get_paginated_response(items)
+            response.data["aggregates"] = aggregates
+            return response
+
+        items = [self._format_register_po(po) for po in orders]
+        return Response(envelope(items, aggregates=aggregates, page_size=20))
 
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
@@ -245,6 +286,7 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
 class PurchaseBillViewSet(SalesDocumentViewSet):
     queryset = PurchaseBill.objects.all()
     serializer_class = PurchaseBillSerializer
+    pagination_class = PurchasePagination
     audit_entity_type = "PurchaseBill"
     audit_label_field = "bill_number"
     status_field = "status"
@@ -426,6 +468,7 @@ class GoodsReceiptViewSet(TenantModelViewSet):
         "lines__item", "lines__item__grade", "lines__item__category", "lines__item__item_type"
     )
     serializer_class = GoodsReceiptSerializer
+    pagination_class = PurchasePagination
     audit_entity_type = "GoodsReceipt"
     audit_label_field = "grn_number"
     required_permissions = ["view_purchase"]
@@ -721,6 +764,7 @@ class GoodsReceiptViewSet(TenantModelViewSet):
 class PaymentOutViewSet(TenantModelViewSet):
     queryset = PaymentOut.objects.select_related("party", "bank_account")
     serializer_class = PaymentOutSerializer
+    pagination_class = PurchasePagination
     audit_entity_type = "PaymentOut"
     audit_label_field = "payment_number"
     idempotent_create = True
@@ -783,6 +827,7 @@ class PaymentOutViewSet(TenantModelViewSet):
 class PurchaseReturnViewSet(SalesDocumentViewSet):
     queryset = PurchaseReturn.objects.select_related("purchase_bill")
     serializer_class = PurchaseReturnSerializer
+    pagination_class = PurchasePagination
     audit_entity_type = "PurchaseReturn"
     audit_label_field = "return_number"
     status_field = "status"
@@ -881,6 +926,7 @@ class PurchaseReturnViewSet(SalesDocumentViewSet):
 class ExpenseViewSet(TenantModelViewSet):
     queryset = Expense.objects.select_related("category", "party", "bank_account")
     serializer_class = ExpenseSerializer
+    pagination_class = PurchasePagination
     audit_entity_type = "Expense"
     audit_label_field = "expense_number"
     status_field = "status"
@@ -969,6 +1015,7 @@ class VendorLookupViewSet(ReadOnlyTenantViewSet):
 class VendorAdvanceViewSet(TenantModelViewSet):
     queryset = VendorAdvance.objects.select_related("party", "purchase_order", "bank_account")
     serializer_class = VendorAdvanceSerializer
+    pagination_class = PurchasePagination
     audit_entity_type = "VendorAdvance"
     audit_label_field = "advance_number"
     status_field = "status"
@@ -977,6 +1024,15 @@ class VendorAdvanceViewSet(TenantModelViewSet):
     ordering = ["-advance_date", "-created_at"]
     filter_map = {"vendorId": "party_id", "purchaseOrderId": "purchase_order_id"}
     permission_map = {"read": ["view_purchase"], "write": ["create_payment"]}
+
+    def get_aggregates(self, queryset):
+        rows = queryset.aggregate(
+            count=Count("id"),
+            totalAmount=money_sum("amount"),
+            reconciledAmount=money_sum("reconciled_amount"),
+        )
+        rows["unallocated"] = round2(rows["totalAmount"] - rows["reconciledAmount"])
+        return rows
 
     def perform_create(self, serializer):
         serializer.validated_data["advance_number"] = allocate_number(
@@ -1028,6 +1084,7 @@ class VendorAdvanceViewSet(TenantModelViewSet):
 class AdvanceShippingNoticeViewSet(TenantModelViewSet):
     queryset = AdvanceShippingNotice.objects.select_related("purchase_order", "vendor")
     serializer_class = AdvanceShippingNoticeSerializer
+    pagination_class = PurchasePagination
     audit_entity_type = "AdvanceShippingNotice"
     audit_label_field = "asn_number"
     status_field = "status"
@@ -1132,13 +1189,19 @@ class VendorPortalOrdersView(APIView):
             .order_by("-doc_date", "-created_at")
         )
 
+        paginator = PurchasePagination()
+        page = paginator.paginate_queryset(orders, request, view=self)
+        target_orders = page if page is not None else orders
+
         data = []
-        for po in orders:
+        for po in target_orders:
             serialized = PurchaseOrderSerializer(po).data
             asns = AdvanceShippingNoticeSerializer(po.asns.all(), many=True).data
             serialized["asns"] = asns
             data.append(serialized)
 
+        if page is not None:
+            return paginator.get_paginated_response(data)
         return Response(data)
 
 
