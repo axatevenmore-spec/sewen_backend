@@ -620,6 +620,8 @@ class LeaveRequestSerializer(BaseModelSerializer):
     delegate = serializers.CharField(
         source="delegate_employee.name", read_only=True, default=""
     )
+    pmsTask = serializers.SerializerMethodField()
+    crmTask = serializers.SerializerMethodField()
 
     class Meta:
         model = LeaveRequest
@@ -627,12 +629,56 @@ class LeaveRequestSerializer(BaseModelSerializer):
             "id", "employeeId", "employeeName", "employeeCode", "type",
             "leaveTypeId", "fromDate", "toDate", "days", "reason", "delegateId", "delegate",
             "delegate_confirmed_at", "status", "approver", "decided_at",
-            "remark", "created_at", "updated_at",
+            "remark", "created_at", "updated_at", "pmsTask", "crmTask",
         ]
         read_only_fields = [
             "status", "approver", "decided_at", "delegate_confirmed_at",
-            "created_at", "updated_at",
+            "created_at", "updated_at", "pmsTask", "crmTask",
         ]
+
+    def get_pmsTask(self, obj):
+        try:
+            from apps.pms.models import DelegatedTask
+            task = DelegatedTask.objects.filter(
+                client_id=obj.client_id,
+                due_date=obj.to_date,
+                title__contains=obj.employee.name if obj.employee else "",
+                deleted_at__isnull=True,
+            ).first()
+            if task:
+                return {
+                    "id": str(task.id),
+                    "taskNumber": task.task_number,
+                    "title": task.title,
+                    "status": task.status,
+                    "priority": task.priority,
+                    "dueDate": str(task.due_date) if task.due_date else None,
+                }
+        except Exception:
+            pass
+        return None
+
+    def get_crmTask(self, obj):
+        try:
+            from apps.crm.models import Task as CrmTask
+            task = CrmTask.objects.filter(
+                client_id=obj.client_id,
+                due_date=obj.to_date,
+                title__contains=obj.employee.name if obj.employee else "",
+                deleted_at__isnull=True,
+            ).first()
+            if task:
+                return {
+                    "id": str(task.id),
+                    "taskNumber": task.task_number or f"CRM-{str(task.id)[:8]}",
+                    "title": task.title,
+                    "status": task.status,
+                    "priority": task.priority,
+                    "dueDate": str(task.due_date) if task.due_date else None,
+                }
+        except Exception:
+            pass
+        return None
 
     def validate(self, attrs):
         start = attrs.get("from_date") or getattr(self.instance, "from_date", None)

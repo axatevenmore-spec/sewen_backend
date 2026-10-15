@@ -170,7 +170,7 @@ def _as_date(value):
 
 def _as_moment(value, day):
     """An ISO datetime, or ``HH:MM`` on ``day``, as an aware datetime."""
-    if not value:
+    if not value or str(value).strip() in ("—", "-", "null", "undefined", ""):
         return None
     from django.utils.dateparse import parse_datetime
 
@@ -180,9 +180,7 @@ def _as_moment(value, day):
         try:
             moment = datetime.combine(day, datetime.strptime(text[:5], "%H:%M").time())
         except ValueError:
-            raise ValidationFailed(
-                f"'{text}' is not a time.", field_errors={"checkIn": ["Use HH:MM."]}
-            )
+            return None
     return timezone.make_aware(moment) if timezone.is_naive(moment) else moment
 
 
@@ -863,8 +861,10 @@ class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
                     "You can only view your own attendance.", code="view_team_attendance"
                 )
             self.check_own_employee(target)
+        target = self._resolve_employee(request, employee_id) if employee_id else None
+        target_id = target.id if target else employee_id
         rows = Attendance.objects.filter(
-            client_id=request.client_id, employee_id=employee_id, deleted_at__isnull=True
+            client_id=request.client_id, employee_id=target_id, deleted_at__isnull=True
         ).order_by("work_date")
         date_from = request.query_params.get("date_from")
         date_to = request.query_params.get("date_to")
@@ -1212,8 +1212,31 @@ class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
                 serializer.validated_data["employee"] = resolved
                 employee = resolved
         self.check_own_employee(employee)
+
+        from apps.hrms.models import LeaveRequest
+        from apps.core.exceptions import Conflict, Codes
+        from_date = serializer.validated_data.get("from_date")
+        to_date = serializer.validated_data.get("to_date")
+        if employee and from_date and to_date:
+            conflict = (
+                LeaveRequest.objects.filter(
+                    client_id=self.request.client_id,
+                    employee=employee,
+                    deleted_at__isnull=True,
+                    status__in=["Pending Review", "Delegate Confirmed", "Approved"],
+                    from_date__lte=to_date,
+                    to_date__gte=from_date,
+                )
+                .order_by("-created_at")
+                .first()
+            )
+            if conflict:
+                raise Conflict(
+                    f"This overlaps an existing leave request ({conflict.from_date} to {conflict.to_date}).",
+                    code=Codes.OVERLAPPING_LEAVE,
+                )
+
         request_row = super().perform_create(serializer)
-        services.assert_no_overlap(request_row)
         return request_row
 
     @transaction.atomic
@@ -1222,6 +1245,26 @@ class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
         approved = self.request.data.get("approved")
         target_status = self.request.data.get("status")
         instance = serializer.instance
+
+        delegate_id = (
+            self.request.data.get("delegateId")
+            or self.request.data.get("delegate_employee")
+            or self.request.data.get("delegate_employee_id")
+        )
+        if not delegate_id and self.request.data.get("delegate"):
+            from apps.hrms.models import Employee
+            delegate_name = self.request.data.get("delegate")
+            emp = Employee.objects.filter(
+                client_id=self.request.client_id,
+                name__iexact=str(delegate_name).strip(),
+                deleted_at__isnull=True,
+            ).first()
+            if emp:
+                delegate_id = emp.id
+
+        if delegate_id:
+            instance.delegate_employee_id = delegate_id
+            instance.save(update_fields=["delegate_employee_id"])
 
         if approved is True or target_status == "Approved":
             from apps.core.permissions import require_permission

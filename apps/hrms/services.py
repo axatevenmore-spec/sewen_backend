@@ -54,11 +54,45 @@ DEFAULT_FLEXIBILITY = {
 
 def flexibility_policy(client_id):
     from apps.core.models import Setting
+    import re
 
     row = Setting.objects.filter(client_id=client_id, key="attendance_flexibility").first()
     policy = dict(DEFAULT_FLEXIBILITY)
     if row and isinstance(row.value, dict):
-        policy.update(row.value)
+        raw = row.value
+        policy.update(raw)
+
+        # Normalize frontend keys if present
+        if "gracePeriod" in raw and raw["gracePeriod"]:
+            m = re.search(r"(\d+)", str(raw["gracePeriod"]))
+            if m:
+                policy["graceMinutes"] = int(m.group(1))
+
+        if "halfDayThreshold" in raw and raw["halfDayThreshold"]:
+            m = re.search(r"(\d+(\.\d+)?)", str(raw["halfDayThreshold"]))
+            if m:
+                policy["halfDayThresholdHours"] = float(m.group(1))
+
+        if "minimumWorkingHours" in raw and raw["minimumWorkingHours"]:
+            m = re.search(r"(\d+(\.\d+)?)", str(raw["minimumWorkingHours"]))
+            if m:
+                policy["fullDayHours"] = float(m.group(1))
+
+        if "flexibleWorkingHours" in raw and raw["flexibleWorkingHours"]:
+            times = re.findall(r"(\d{1,2}:\d{2})", str(raw["flexibleWorkingHours"]))
+            if len(times) >= 1:
+                policy["shiftStart"] = times[0]
+            if len(times) >= 2:
+                policy["shiftEnd"] = times[1]
+
+        if "lateAfter" in raw and raw["lateAfter"]:
+            policy["lateAfter"] = str(raw["lateAfter"])[:5]
+
+        if "overtimeStartsAfter" in raw and raw["overtimeStartsAfter"]:
+            m = re.search(r"(\d+(\.\d+)?)", str(raw["overtimeStartsAfter"]))
+            if m:
+                policy["overtimeStartsAfterHours"] = float(m.group(1))
+
     return policy
 
 
@@ -96,8 +130,8 @@ def derive_attendance(client_id, *, check_in, check_out, submitted_status=None):
                 field_errors={"checkOut": ["Must be after check-in."]},
             )
 
-    if submitted_status == "WFH":
-        return "WFH", hours
+    if submitted_status in ("WFH", "On Leave", "Absent", "Half Day"):
+        return submitted_status, hours
 
     policy = flexibility_policy(client_id)
     shift_start = _parse_time(policy.get("shiftStart"), time(9, 30))
@@ -114,9 +148,13 @@ def derive_attendance(client_id, *, check_in, check_out, submitted_status=None):
             pass
 
     local_check_in = timezone.localtime(check_in) if timezone.is_aware(check_in) else check_in
-    latest_on_time = (
-        datetime.combine(local_check_in.date(), shift_start) + timedelta(minutes=grace)
-    )
+    if policy.get("lateAfter"):
+        late_cutoff = _parse_time(policy.get("lateAfter"), shift_start)
+        latest_on_time = datetime.combine(local_check_in.date(), late_cutoff)
+    else:
+        latest_on_time = (
+            datetime.combine(local_check_in.date(), shift_start) + timedelta(minutes=grace)
+        )
     if local_check_in.replace(tzinfo=None) > latest_on_time:
         return "Late", hours
 
@@ -282,7 +320,11 @@ def calculate_punch_metrics(client_id, employee, work_date, punches=None, now=No
             else first_in.punch_time
         )
         shift_start_dt = datetime.combine(local_first_in.date(), shift_start)
-        grace_dt = shift_start_dt + timedelta(minutes=grace)
+        if policy.get("lateAfter"):
+            late_cutoff = _parse_time(policy.get("lateAfter"), shift_start)
+            grace_dt = datetime.combine(local_first_in.date(), late_cutoff)
+        else:
+            grace_dt = shift_start_dt + timedelta(minutes=grace)
         if local_first_in.replace(tzinfo=None) > grace_dt:
             diff = (local_first_in.replace(tzinfo=None) - shift_start_dt).total_seconds()
             late_minutes = max(0, int(diff // 60))
@@ -301,7 +343,9 @@ def calculate_punch_metrics(client_id, employee, work_date, punches=None, now=No
 
     is_early_out = bool(last_out and (early_leaving_minutes > 0 or working_hours < full_day_hours))
 
-    overtime_seconds = max(0, int(total_working_seconds - full_day_seconds))
+    overtime_threshold_hours = Decimal(str(policy.get("overtimeStartsAfterHours") or full_day_hours))
+    overtime_threshold_seconds = int(overtime_threshold_hours * 3600)
+    overtime_seconds = max(0, int(total_working_seconds - overtime_threshold_seconds))
     overtime_hours = round(Decimal(overtime_seconds) / Decimal(3600), 2)
 
     if not punches:
@@ -752,12 +796,12 @@ def attendance_summary(client_id, *, month=None, employee_id=None, department_id
 # ---------------------------------------------------------------------------
 # Leave (api.md §11.3)
 # ---------------------------------------------------------------------------
-def assert_no_overlap(leave_request):
+def assert_no_overlap(leave_request, statuses=("Pending Review", "Delegate Confirmed", "Approved")):
     """db.md §11.3 -- overlapping live requests for the same employee are rejected."""
     clash = LeaveRequest.objects.filter(
         client_id=leave_request.client_id,
         employee_id=leave_request.employee_id,
-        status__in=["Pending Review", "Delegate Confirmed", "Approved"],
+        status__in=statuses,
         from_date__lte=leave_request.to_date,
         to_date__gte=leave_request.from_date,
         deleted_at__isnull=True,
@@ -800,7 +844,19 @@ def approve_leave(leave_request, *, user=None, remark=None):
             code=Codes.BAD_TARGET,
         )
 
-    assert_no_overlap(leave_request)
+    # When approving, only an already Approved leave request constitutes an overlap error.
+    # Another unapproved / pending request should not block HR from approving this one.
+    assert_no_overlap(leave_request, statuses=("Approved",))
+
+    # Auto-cancel any other pending / unapproved requests that overlapped this now-approved range
+    LeaveRequest.objects.filter(
+        client_id=leave_request.client_id,
+        employee_id=leave_request.employee_id,
+        status__in=["Pending Review", "Delegate Confirmed"],
+        from_date__lte=leave_request.to_date,
+        to_date__gte=leave_request.from_date,
+        deleted_at__isnull=True,
+    ).exclude(pk=leave_request.pk).update(status="Cancelled", remark="Superseded by approved leave")
 
     balance = leave_balance_for(
         leave_request.client_id, leave_request.employee_id, leave_request.leave_type_id,
@@ -854,6 +910,90 @@ def approve_leave(leave_request, *, user=None, remark=None):
         source_id=leave_request.id,
         created_by=user if getattr(user, "is_authenticated", False) else None,
     )
+
+    # Connect delegate to PMS DelegatedTask & CRM Task
+    if leave_request.delegate_employee_id:
+        try:
+            import logging
+            from apps.pms.models import DelegatedTask
+            from apps.accounts.models import User
+            from apps.core.numbering import allocate_number
+
+            delegate_user = User.objects.filter(
+                client_id=leave_request.client_id,
+                employee_id=leave_request.delegate_employee_id,
+                deleted_at__isnull=True,
+            ).first()
+            if not delegate_user and leave_request.delegate_employee:
+                delegate_user = User.objects.filter(
+                    client_id=leave_request.client_id,
+                    name__iexact=leave_request.delegate_employee.name,
+                    deleted_at__isnull=True,
+                ).first()
+
+            creator_user = user if getattr(user, "is_authenticated", False) else None
+            if not creator_user:
+                creator_user = User.objects.filter(
+                    client_id=leave_request.client_id,
+                    employee_id=leave_request.employee_id,
+                    deleted_at__isnull=True,
+                ).first() or delegate_user
+
+            if delegate_user and creator_user:
+                existing_pms = DelegatedTask.objects.filter(
+                    client_id=leave_request.client_id,
+                    assigned_to=delegate_user,
+                    due_date=leave_request.to_date,
+                    title__contains=leave_request.employee.name,
+                    deleted_at__isnull=True,
+                ).first()
+                if not existing_pms:
+                    DelegatedTask.objects.create(
+                        client_id=leave_request.client_id,
+                        task_number=allocate_number(leave_request.client, "DEL"),
+                        title=f"Leave Coverage: {leave_request.employee.name} ({leave_request.from_date} to {leave_request.to_date})",
+                        description=f"Coverage handover delegated during leave: {leave_request.reason or 'General coverage'}",
+                        delegated_by=creator_user,
+                        assigned_to=delegate_user,
+                        priority="High",
+                        due_date=leave_request.to_date,
+                        status="Pending",
+                    )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("Failed to create PMS delegated task: %s", e)
+
+        try:
+            from apps.crm.models import Task as CrmTask, Lead, Deal
+            first_lead = Lead.objects.filter(client_id=leave_request.client_id, deleted_at__isnull=True).first()
+            first_deal = Deal.objects.filter(client_id=leave_request.client_id, deleted_at__isnull=True).first()
+            parent_lead = first_lead
+            parent_deal = first_deal if not parent_lead else None
+
+            if delegate_user:
+                existing_crm = CrmTask.objects.filter(
+                    client_id=leave_request.client_id,
+                    assignee=delegate_user,
+                    due_date=leave_request.to_date,
+                    title__contains=leave_request.employee.name,
+                    deleted_at__isnull=True,
+                ).first()
+                if not existing_crm:
+                    CrmTask.objects.create(
+                        client_id=leave_request.client_id,
+                        lead=parent_lead,
+                        deal=parent_deal,
+                        title=f"Leave Coverage: Support {leave_request.employee.name} Leads/Deals",
+                        description=f"Coverage delegated from {leave_request.from_date} to {leave_request.to_date}. Handover: {leave_request.reason or 'General client support'}",
+                        assignee=delegate_user,
+                        due_date=leave_request.to_date,
+                        priority="High",
+                        status="Open",
+                        source="Leave Delegation",
+                    )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("Failed to create CRM coverage task: %s", e)
 
     # Notifications go to logins: the employee's linked user, if they have one.
     # (This used to pass the employee id, which is not a user -- the insert
