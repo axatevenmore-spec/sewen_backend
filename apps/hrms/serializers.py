@@ -1352,9 +1352,77 @@ class TeamSerializer(BaseModelSerializer):
 
 
 class ApprovalChainSerializer(BaseModelSerializer):
+    module = serializers.CharField(source="applies_to", required=False, allow_blank=True)
+    tier1 = serializers.CharField(required=False, allow_blank=True)
+    tier2 = serializers.CharField(required=False, allow_blank=True)
+    tier3 = serializers.CharField(required=False, allow_blank=True)
+    autoEscalateDays = serializers.IntegerField(required=False, allow_null=True)
+
     class Meta:
         model = ApprovalChain
-        fields = ["id", "name", "applies_to", "steps", "status", "created_at"]
+        fields = [
+            "id", "name", "applies_to", "module", "tier1", "tier2", "tier3",
+            "autoEscalateDays", "steps", "status", "created_at"
+        ]
+        extra_kwargs = {
+            "name": {"required": False},
+            "applies_to": {"required": False},
+        }
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        module_val = data.get("module") or data.get("applies_to") or "General"
+        if not data.get("applies_to"):
+            data["applies_to"] = module_val
+        if not data.get("name"):
+            data["name"] = f"{module_val} Approval Chain"
+
+        if not data.get("steps") and (data.get("tier1") or data.get("tier2")):
+            steps = []
+            if data.get("tier1"):
+                steps.append({
+                    "tier": 1,
+                    "role": data["tier1"],
+                    "autoEscalateDays": int(data.get("autoEscalateDays") or 3),
+                })
+            if data.get("tier2"):
+                steps.append({"tier": 2, "role": data["tier2"]})
+            if data.get("tier3") and data["tier3"] not in ("—", "-"):
+                steps.append({"tier": 3, "role": data["tier3"]})
+            data["steps"] = steps
+
+        return super().to_internal_value(data)
+
+    def create(self, validated_data):
+        for k in ["tier1", "tier2", "tier3", "autoEscalateDays"]:
+            validated_data.pop(k, None)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        for k in ["tier1", "tier2", "tier3", "autoEscalateDays"]:
+            validated_data.pop(k, None)
+        return super().update(instance, validated_data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        steps = instance.steps if isinstance(instance.steps, list) else []
+        t1 = next((s.get("role") for s in steps if s.get("tier") == 1 or s.get("level") == 1), "")
+        if not t1 and steps:
+            t1 = steps[0].get("role", "")
+        t2 = next((s.get("role") for s in steps if s.get("tier") == 2 or s.get("level") == 2), "")
+        if not t2 and len(steps) > 1:
+            t2 = steps[1].get("role", "")
+        t3 = next((s.get("role") for s in steps if s.get("tier") == 3 or s.get("level") == 3), "—")
+        if (not t3 or t3 in ("—", "-")) and len(steps) > 2:
+            t3 = steps[2].get("role", "—")
+        esc = next((s.get("autoEscalateDays") for s in steps if s.get("autoEscalateDays")), 3)
+
+        ret["module"] = instance.applies_to or instance.name
+        ret["tier1"] = t1 or "Direct Line Manager"
+        ret["tier2"] = t2 or "Department Head"
+        ret["tier3"] = t3 or "—"
+        ret["autoEscalateDays"] = esc
+        return ret
 
 
 class TerminationSerializer(BaseModelSerializer):
