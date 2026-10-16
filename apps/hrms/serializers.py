@@ -1327,24 +1327,27 @@ class HrDocumentSerializer(BaseModelSerializer):
         source="employee", model="hrms.Employee", required=False, allow_null=True
     )
     employee = serializers.CharField(source="employee.name", read_only=True)
+    employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
     fileId = TenantPrimaryKeyRelatedField(
         source="file", model="core.File", required=False, allow_null=True
     )
     fileSize = serializers.IntegerField(source="file.file_size", read_only=True)
     fileType = serializers.CharField(source="file.content_type", read_only=True)
+    fileName = serializers.CharField(required=False, allow_blank=True)
     fileData = serializers.CharField(required=False, allow_blank=True, write_only=True)
     expiry = serializers.DateField(source="valid_until", required=False, allow_null=True)
     #: DERIVED from ``valid_until`` at read time (api.md §11.8).
     status = serializers.SerializerMethodField()
     uploadedBy = serializers.CharField(source="created_by.name", read_only=True)
     updatedOn = serializers.DateTimeField(source="updated_at", read_only=True)
+    uploadDate = serializers.SerializerMethodField()
 
     class Meta:
         model = HrDocument
         fields = [
-            "id", "title", "category", "employee", "employeeId", "version",
-            "expiry", "status", "fileId", "fileSize", "fileType", "fileData", "uploadedBy",
-            "updatedOn", "tags", "description", "valid_from", "is_confidential",
+            "id", "title", "category", "employee", "employeeId", "employeeCode", "version",
+            "expiry", "status", "fileId", "fileSize", "fileType", "fileName", "fileData", "uploadedBy",
+            "updatedOn", "uploadDate", "tags", "description", "valid_from", "is_confidential",
             "created_at",
         ]
 
@@ -1355,6 +1358,9 @@ class HrDocumentSerializer(BaseModelSerializer):
             isinstance(emp_id, str) and not (len(emp_id) == 36 and "-" in emp_id)
         ):
             data["employeeId"] = None
+
+        if "fileName" in data and data["fileName"]:
+            data["fileName"] = str(data["fileName"]).strip()
 
         v_raw = data.get("version")
         if isinstance(v_raw, str):
@@ -1371,23 +1377,27 @@ class HrDocumentSerializer(BaseModelSerializer):
 
     def create(self, validated_data):
         file_data = validated_data.pop("fileData", None)
+        file_name = validated_data.pop("fileName", None)
         instance = super().create(validated_data)
         if file_data and not instance.file_id:
-            self._attach_file(instance, file_data)
+            self._attach_file(instance, file_data, file_name=file_name)
         return instance
 
     def update(self, instance, validated_data):
         file_data = validated_data.pop("fileData", None)
+        file_name = validated_data.pop("fileName", None)
         instance = super().update(instance, validated_data)
         if file_data:
-            self._attach_file(instance, file_data)
+            self._attach_file(instance, file_data, file_name=file_name)
         return instance
 
-    def _attach_file(self, instance, file_data):
+    def _attach_file(self, instance, file_data, file_name=None):
         import base64
         import logging
+        from django.conf import settings
         from apps.core.files import build_storage_key, write_bytes
         from apps.core.models import File
+        from rest_framework.exceptions import ValidationError
 
         try:
             content_type = "application/pdf"
@@ -1398,16 +1408,35 @@ class HrDocumentSerializer(BaseModelSerializer):
             else:
                 base64_str = file_data
             raw_bytes = base64.b64decode(base64_str)
+
+            # Validate PDF format
+            if not raw_bytes.startswith(b"%PDF-") and "pdf" not in content_type.lower():
+                raise ValidationError({"fileData": "Only PDF format documents are allowed."})
+
+            # Validate file size (15 MB maximum)
+            max_size_bytes = getattr(settings, "FILE_MAX_BYTES", 25 * 1024 * 1024)
+            if len(raw_bytes) > max_size_bytes:
+                limit_mb = max_size_bytes // (1024 * 1024)
+                raise ValidationError({"fileData": f"File size exceeds the {limit_mb} MB limit."})
+
             client_id = str(instance.client_id)
             title = instance.title or "document"
-            filename = f"{title}.pdf"
+
+            # Retain original filename if provided
+            if file_name and str(file_name).strip():
+                clean_name = str(file_name).strip()
+                filename = clean_name if clean_name.lower().endswith(".pdf") else f"{clean_name}.pdf"
+            else:
+                clean_title = str(title).strip()
+                filename = clean_title if clean_title.lower().endswith(".pdf") else f"{clean_title}.pdf"
+
             storage_key = build_storage_key(client_id, "hrms_documents", filename)
             write_bytes(storage_key, raw_bytes)
             f_obj = File.objects.create(
                 client=instance.client,
                 file_name=filename,
                 file_size=len(raw_bytes),
-                content_type=content_type,
+                content_type="application/pdf",
                 storage_key=storage_key,
                 scope="hrms_documents",
                 status="Committed",
@@ -1415,6 +1444,8 @@ class HrDocumentSerializer(BaseModelSerializer):
             )
             instance.file = f_obj
             instance.save(update_fields=["file"])
+        except ValidationError:
+            raise
         except Exception as err:
             logging.getLogger(__name__).warning("Failed to attach fileData: %s", err)
 
@@ -1425,12 +1456,26 @@ class HrDocumentSerializer(BaseModelSerializer):
         if not instance.employee:
             ret["employee"] = "All Staff"
             ret["employeeId"] = "ALL"
+            ret["employeeCode"] = None
+        else:
+            ret["employeeCode"] = instance.employee.employee_code
         if instance.file:
             try:
                 ret["fileUrl"] = public_url(instance.file, self.context.get("request"))
             except Exception:
                 pass
+            ret["fileName"] = instance.file.file_name
+            ret["fileSize"] = instance.file.file_size
+            ret["fileType"] = "PDF"
+        else:
+            ret["fileName"] = f"{instance.title}.pdf"
+            ret["fileSize"] = 0
+            ret["fileType"] = "PDF"
+        ret["uploadDate"] = instance.created_at.date().isoformat() if instance.created_at else None
         return ret
+
+    def get_uploadDate(self, instance):
+        return instance.created_at.date().isoformat() if instance.created_at else None
 
     def get_status(self, document):
         return services.document_status(document)

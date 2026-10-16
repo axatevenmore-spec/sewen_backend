@@ -340,3 +340,185 @@ class EmployeeLifecycleOffboardingTests(TestCase):
         self.assertIn("Henry", all_names)
         self.assertIn("Ian", all_names)
         self.assertIn("Jack", all_names)
+
+    def test_employee_portal_resignation_submission_and_hr_admin_visibility(self):
+        """Employee submits resignation in portal, sees only own resignation, HR Admin sees all."""
+        emp, user = self.create_employee("Zara", "zara@lifecycle.test")
+        from apps.accounts.models import Role
+        em_role = Role.objects.filter(client=self.tenant, code="EM").first()
+        if em_role:
+            user.role = em_role
+            user.save()
+
+        # Authenticate as employee Zara
+        from rest_framework.test import APIClient
+        emp_client = APIClient()
+        emp_client.credentials(HTTP_AUTHORIZATION=f"Bearer {build_tokens(user)['access']}")
+
+        lwd = (date.today() + timedelta(days=30)).isoformat()
+        payload = {
+            "noticePeriod": "30 Days",
+            "noticePeriodDays": 30,
+            "lastWorkingDay": lwd,
+            "reason": "Pursuing master's degree abroad",
+        }
+
+        # 1. Employee submits resignation via API
+        resp = emp_client.post("/api/v1/hrms/resignations/", payload, format="json")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        res_data = resp.json()
+        self.assertEqual(res_data["employeeName"], "Zara")
+        self.assertIn(res_data["status"], ("Submitted", "Pending Review", "Pending"))
+        res_id = res_data["id"]
+
+        # 2. Duplicate submission by same employee rejected
+        dup_resp = emp_client.post("/api/v1/hrms/resignations/", payload, format="json")
+        self.assertEqual(dup_resp.status_code, 409)
+
+        # 3. Employee list query returns ONLY Zara's resignation
+        my_res = emp_client.get("/api/v1/hrms/resignations/")
+        self.assertEqual(my_res.status_code, 200)
+        items = my_res.json()["results"] if isinstance(my_res.json(), dict) and "results" in my_res.json() else my_res.json()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["id"], res_id)
+
+        # 4. HR Admin sees Zara's resignation in HR Admin view
+        admin_res = self.api.get("/api/v1/hrms/resignations/")
+        self.assertEqual(admin_res.status_code, 200)
+        admin_items = admin_res.json()["results"] if isinstance(admin_res.json(), dict) and "results" in admin_res.json() else admin_res.json()
+        admin_item_ids = [r["id"] for r in admin_items]
+        self.assertIn(res_id, admin_item_ids)
+
+        # 5. Employee can cancel/withdraw their own pending resignation
+        cancel_resp = emp_client.post(f"/api/v1/hrms/resignations/{res_id}/cancel/", {"reason": "Decided to stay"}, format="json")
+        self.assertEqual(cancel_resp.status_code, 200)
+        self.assertEqual(cancel_resp.json()["status"], "Cancelled")
+
+    def test_employee_document_submission_and_hr_admin_sync(self):
+        """Test employee PDF document submission, category enforcement, session derivation, and HR Admin sync."""
+        import base64
+        from apps.hrms.models import HrDocument
+
+        emp, user = self.create_employee("Devon", "devon@lifecycle.test")
+
+        emp_client = APIClient()
+        emp_client.credentials(HTTP_AUTHORIZATION=f"Bearer {build_tokens(user)['access']}")
+
+        # 1. Non-PDF upload rejection
+        txt_b64 = base64.b64encode(b"This is a text file").decode("utf-8")
+        bad_payload = {
+            "title": "Plain Text Notes",
+            "category": "Identity",
+            "fileData": f"data:text/plain;base64,{txt_b64}",
+            "fileName": "notes.txt",
+        }
+        bad_resp = emp_client.post("/api/v1/hrms/documents/", bad_payload, format="json")
+        self.assertEqual(bad_resp.status_code, 400)
+        self.assertIn("PDF", str(bad_resp.data))
+
+        # 2. Invalid category rejection
+        pdf_bytes = b"%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF"
+        pdf_b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+        invalid_cat_payload = {
+            "title": "Invalid Category Doc",
+            "category": "RandomUnapprovedCategory",
+            "fileData": f"data:application/pdf;base64,{pdf_b64}",
+            "fileName": "document.pdf",
+        }
+        inv_cat_resp = emp_client.post("/api/v1/hrms/documents/", invalid_cat_payload, format="json")
+        self.assertEqual(inv_cat_resp.status_code, 400)
+        self.assertIn("category", str(inv_cat_resp.data).lower())
+
+        # 3. Valid PDF submission with allowed category (e.g. Identity)
+        valid_payload = {
+            "title": "Passport Identification",
+            "category": "Identity",
+            "fileName": "Devon_Passport.pdf",
+            "fileData": f"data:application/pdf;base64,{pdf_b64}",
+            "expiry": "2030-12-31",
+            "description": "Government-issued passport copy for compliance.",
+        }
+        create_resp = emp_client.post("/api/v1/hrms/documents/", valid_payload, format="json")
+        self.assertEqual(create_resp.status_code, 201, create_resp.data)
+        doc_data = create_resp.json()
+        self.assertEqual(doc_data["title"], "Passport Identification")
+        self.assertEqual(doc_data["category"], "Identity")
+        self.assertEqual(doc_data["fileName"], "Devon_Passport.pdf")
+        # Employee identity derived from session
+        self.assertEqual(doc_data["employee"], "Devon")
+        self.assertEqual(doc_data["employeeId"], str(emp.id))
+        self.assertEqual(doc_data["employeeCode"], emp.employee_code)
+        self.assertEqual(doc_data["status"], "Valid")
+        doc_id = doc_data["id"]
+
+        # 4. Verify employee list only returns their own documents + company wide
+        other_emp, other_user = self.create_employee("OtherStaff", "other@lifecycle.test")
+        HrDocument.objects.create(
+            client=self.tenant,
+            employee=other_emp,
+            title="Other Staff Secret Doc",
+            category="Legal",
+        )
+        emp_list = emp_client.get("/api/v1/hrms/documents/")
+        self.assertEqual(emp_list.status_code, 200)
+        emp_items = emp_list.json()["results"] if isinstance(emp_list.json(), dict) and "results" in emp_list.json() else emp_list.json()
+        emp_doc_titles = [d["title"] for d in emp_items]
+        self.assertIn("Passport Identification", emp_doc_titles)
+        self.assertNotIn("Other Staff Secret Doc", emp_doc_titles)
+
+        # 5. HR Admin sees Devon's document in All Documents & Employee dossier
+        admin_list = self.api.get("/api/v1/hrms/documents/")
+        self.assertEqual(admin_list.status_code, 200)
+        admin_items = admin_list.json()["results"] if isinstance(admin_list.json(), dict) and "results" in admin_list.json() else admin_list.json()
+        admin_doc_ids = [d["id"] for d in admin_items]
+        self.assertIn(doc_id, admin_doc_ids)
+
+        # 6. Admin can filter by employeeId to view in Employee-wise dossier
+        emp_filtered = self.api.get(f"/api/v1/hrms/documents/?employeeId={emp.id}")
+        self.assertEqual(emp_filtered.status_code, 200)
+        filtered_items = emp_filtered.json()["results"] if isinstance(emp_filtered.json(), dict) and "results" in emp_filtered.json() else emp_filtered.json()
+        self.assertTrue(all(d["employeeId"] == str(emp.id) for d in filtered_items))
+        self.assertIn(doc_id, [d["id"] for d in filtered_items])
+
+        # 7. Employee cannot access other employee's document details or download URL
+        other_doc = HrDocument.objects.get(title="Other Staff Secret Doc")
+        # Direct GET /documents/{other_doc.id}/
+        direct_resp = emp_client.get(f"/api/v1/hrms/documents/{other_doc.id}/")
+        self.assertIn(direct_resp.status_code, [403, 404])
+
+        # Direct GET /documents/{other_doc.id}/download/
+        download_resp = emp_client.get(f"/api/v1/hrms/documents/{other_doc.id}/download/")
+        self.assertIn(download_resp.status_code, [403, 404])
+
+        # Employee CAN download their own document
+        own_download_resp = emp_client.get(f"/api/v1/hrms/documents/{doc_id}/download/")
+        self.assertEqual(own_download_resp.status_code, 200)
+        self.assertIn("downloadUrl", own_download_resp.json())
+
+        # 8. Employee cannot delete or edit other employee's document
+        patch_resp = emp_client.patch(f"/api/v1/hrms/documents/{other_doc.id}/", {"title": "Hacked Title"})
+        self.assertIn(patch_resp.status_code, [403, 404])
+        delete_resp = emp_client.delete(f"/api/v1/hrms/documents/{other_doc.id}/")
+        self.assertIn(delete_resp.status_code, [403, 404])
+
+        # 9. Admin CAN view and download other employee's document
+        admin_download = self.api.get(f"/api/v1/hrms/documents/{doc_id}/download/")
+        self.assertEqual(admin_download.status_code, 200)
+        self.assertIn("downloadUrl", admin_download.json())
+
+        # 10. File size validation check (>25 MB rejected)
+        oversized_b64 = base64.b64encode(b"%PDF-1.4\n" + b"A" * (26 * 1024 * 1024)).decode("utf-8")
+        oversized_resp = emp_client.post(
+            "/api/v1/hrms/documents/",
+            {
+                "title": "Oversized PDF",
+                "category": "Contract",
+                "fileData": f"data:application/pdf;base64,{oversized_b64}",
+                "fileName": "huge.pdf",
+            },
+            format="json",
+        )
+        self.assertEqual(oversized_resp.status_code, 400)
+        resp_content = str(oversized_resp.data)
+        self.assertIn("fileData", resp_content)
+        self.assertIn("exceeds", resp_content.lower())

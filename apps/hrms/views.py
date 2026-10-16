@@ -228,6 +228,10 @@ class OwnEmployeeScopeMixin:
         if self.has_team_scope():
             return queryset
         employee_id = getattr(self.request.user, "employee_id", None)
+        if not employee_id and hasattr(self, "_resolve_employee"):
+            resolved = self._resolve_employee(self.request)
+            if resolved:
+                employee_id = resolved.id
         if not employee_id:
             return queryset.none()
         if self.request.method not in ("GET", "HEAD", "OPTIONS"):
@@ -2626,7 +2630,7 @@ class AssetRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
         return super().perform_update(serializer)
 
 
-class HrDocumentViewSet(TenantModelViewSet):
+class HrDocumentViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
     queryset = HrDocument.objects.select_related("employee", "file", "created_by")
     serializer_class = HrDocumentSerializer
     audit_entity_type = "HrDocument"
@@ -2635,7 +2639,71 @@ class HrDocumentViewSet(TenantModelViewSet):
     search_fields = ["title", "description", "category"]
     ordering = ["-created_at"]
     filter_map = {"category": "category", "employeeId": "employee_id"}
-    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+    team_scope_permissions = ("view_staff", "edit_staff")
+    permission_map = {
+        "read": [],
+        "create": [],
+        "download": [],
+        "write": [],
+    }
+
+    def get_queryset(self):
+        queryset = TenantModelViewSet.get_queryset(self)
+        if self.has_team_scope():
+            return queryset
+        employee_id = getattr(self.request.user, "employee_id", None)
+        if not employee_id and hasattr(self, "_resolve_employee"):
+            resolved = self._resolve_employee(self.request)
+            if resolved:
+                employee_id = resolved.id
+        if not employee_id:
+            return queryset.none()
+        return queryset.filter(Q(employee_id=employee_id) | Q(employee__isnull=True))
+
+    def perform_create(self, serializer):
+        from rest_framework.exceptions import PermissionDenied, ValidationError
+
+        # Requirement 4: Automatically derive employee identity from authenticated session;
+        # do not allow employees to submit documents on behalf of another employee.
+        if not self.has_team_scope():
+            resolved = self._resolve_employee(self.request)
+            if not resolved:
+                raise PermissionDenied(
+                    "You must be an active employee to upload personal documents.",
+                    code="NO_EMPLOYEE_LINK",
+                )
+            serializer.validated_data["employee"] = resolved
+        else:
+            # HR Admin with team scope can assign to a specific employee or leave None for company-wide
+            pass
+
+        # Requirement 2 & 3: Require the employee to select a document category:
+        # Identity, Contract, Financial, Compliance, Legal, Educational, General. Save category with document.
+        category = serializer.validated_data.get("category")
+        allowed_categories = {
+            "identity": "Identity",
+            "contract": "Contract",
+            "financial": "Financial",
+            "compliance": "Compliance",
+            "legal": "Legal",
+            "educational": "Educational",
+            "general": "General",
+        }
+        if not category:
+            serializer.validated_data["category"] = "General"
+        else:
+            norm_cat = str(category).strip().lower()
+            if norm_cat in allowed_categories:
+                serializer.validated_data["category"] = allowed_categories[norm_cat]
+            elif self.has_team_scope():
+                # HR Admins can retain legacy categories (e.g. Policy)
+                pass
+            else:
+                raise ValidationError({
+                    "category": f"Invalid document category '{category}'. Allowed categories: {', '.join(allowed_categories.values())}."
+                })
+
+        return super().perform_create(serializer)
 
     def filter_queryset(self, queryset):
         queryset = super().filter_queryset(queryset)
@@ -2656,9 +2724,38 @@ class HrDocumentViewSet(TenantModelViewSet):
         from apps.core.files import public_url
 
         document = self.get_object()
+        # Requirement 1, 2, 6: Employees can download only their own documents; protect download endpoints
+        if not self.has_team_scope():
+            if document.employee_id:
+                self.check_own_employee(document.employee)
+            elif document.is_confidential:
+                raise PermissionDenied("You do not have permission to view or download this confidential document.")
+
         if document.file_id is None:
             raise NotFound("No file is attached to this document.")
         return Response({"downloadUrl": public_url(document.file, request)})
+
+    def perform_update(self, serializer):
+        # Requirement 2, 3: Only HR Admins with edit_staff or the document owner can update their own metadata
+        instance = serializer.instance
+        if not self.has_team_scope():
+            if instance.employee_id:
+                self.check_own_employee(instance.employee)
+            else:
+                raise PermissionDenied("Only authorized HR administrators can update company-wide documents.")
+            # Disallow changing document ownership / employee association
+            serializer.validated_data.pop("employee", None)
+            serializer.validated_data.pop("employee_id", None)
+        return super().perform_update(serializer)
+
+    def perform_destroy(self, instance):
+        # Requirement 2, 3: Only HR Admins with edit_staff or the document owner can delete their own documents
+        if not self.has_team_scope():
+            if instance.employee_id:
+                self.check_own_employee(instance.employee)
+            else:
+                raise PermissionDenied("Only authorized HR administrators can delete company-wide documents.")
+        return super().perform_destroy(instance)
 
 
 class PolicyViewSet(TenantModelViewSet):
@@ -3197,7 +3294,7 @@ class TerminationViewSet(TenantModelViewSet):
         })
 
 
-class ResignationViewSet(TenantModelViewSet):
+class ResignationViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
     queryset = Resignation.objects.select_related("employee", "approval_chain").prefetch_related("checklist")
     serializer_class = ResignationSerializer
     audit_entity_type = "Resignation"
@@ -3205,9 +3302,47 @@ class ResignationViewSet(TenantModelViewSet):
     default_date_field = "submitted_on"
     ordering = ["-submitted_on"]
     filter_map = {"employeeId": "employee_id", "status": "status"}
-    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+    team_scope_permissions = ("view_staff", "edit_staff")
+    permission_map = {
+        "read": [],
+        "create": [],
+        "cancel": [],
+        "write": ["edit_staff"],
+        "approve": ["edit_staff"],
+        "reject": ["edit_staff"],
+        "resubmit": ["edit_staff"],
+        "execute_offboarding": ["edit_staff"],
+        "checklist": ["edit_staff"],
+    }
 
     def perform_create(self, serializer):
+        employee = serializer.validated_data.get("employee")
+        if not employee:
+            resolved = self._resolve_employee(self.request)
+            if resolved:
+                serializer.validated_data["employee"] = resolved
+                employee = resolved
+        self.check_own_employee(employee)
+
+        from apps.core.exceptions import Conflict
+        if employee:
+            if employee.status in ("Terminated", "Resigned"):
+                raise Conflict(
+                    f"Cannot submit resignation for {employee.name}: employee is already {employee.status.lower()}.",
+                    code="EMPLOYEE_EXITED",
+                )
+            active_resignation = Resignation.objects.filter(
+                client_id=self.request.client_id,
+                employee=employee,
+                status__in=["Submitted", "Pending", "Pending Review", "Notice Period", "Exit Interview Scheduled", "Clearance In Progress", "Approved"],
+                deleted_at__isnull=True,
+            ).first()
+            if active_resignation:
+                raise Conflict(
+                    "An active resignation process is already recorded for this employee.",
+                    code="ALREADY_EXISTS",
+                )
+
         instance = super().perform_create(serializer)
         from . import workflow_service
         workflow_service.initialize_request_workflow(instance, "Resignations", self.request.user)
@@ -3267,6 +3402,8 @@ class ResignationViewSet(TenantModelViewSet):
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
         instance = self.get_object()
+        if not self.has_team_scope():
+            self.check_own_employee(instance.employee)
         from . import lifecycle_service
         updated = lifecycle_service.cancel_exit_process(
             instance, user=request.user, reason=request.data.get("reason") or request.data.get("remark")
