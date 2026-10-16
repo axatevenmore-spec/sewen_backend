@@ -381,6 +381,28 @@ def create_project_from_order(order, *, project_manager_id=None, priority="Mediu
         entity_label=project.code,
         description=f"Project created from order {order.order_number}",
     )
+    notif_recipients = [project.project_manager_id, getattr(user, "id", None)]
+    if not any(notif_recipients):
+        if getattr(order, "created_by_id", None):
+            notif_recipients.append(order.created_by_id)
+        else:
+            from django.contrib.auth import get_user_model
+            fallback_user = get_user_model().objects.filter(client_id=order.client_id, is_active=True).first()
+            if fallback_user:
+                notif_recipients.append(fallback_user.id)
+
+    notify(
+        client=order.client_id,
+        recipients=notif_recipients,
+        type="pms.project_arrived",
+        category="pms",
+        title=f"New Project Arrived: {project.code}",
+        body=f"Project {project.code} for {project.customer_name} has arrived and is ready for stage execution.",
+        entity_type="PmsProject",
+        entity_id=project.id,
+        actor=user if getattr(user, "is_authenticated", False) else None,
+        payload={"path": f"/pms/projects/{project.code}"},
+    )
     return project
 
 
@@ -697,11 +719,26 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
             serializer.validated_data["expected_completion_date"] = services.stage_expected_completion(
                 serializer.validated_data["start_date"], planned_duration, duration_unit
             )
-        return super().perform_create(serializer)
+        project = super().perform_create(serializer)
+        if project:
+            notify(
+                client=project.client_id,
+                recipients=[project.project_manager_id, getattr(self.request.user, "id", None)],
+                type="pms.project_arrived",
+                category="pms",
+                title=f"New Project Arrived: {project.code}",
+                body=f"Project {project.code} for {project.customer_name} has arrived.",
+                entity_type="PmsProject",
+                entity_id=project.id,
+                actor=self.request.user if getattr(self.request.user, "is_authenticated", False) else None,
+                payload={"path": f"/pms/projects/{project.code}"},
+            )
+        return project
 
     @transaction.atomic
     def perform_update(self, serializer):
         instance = serializer.instance
+        old_status = instance.status
         if instance.status == "Completed":
             if (
                 "planned_duration" in serializer.validated_data
@@ -716,6 +753,20 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
         ):
             services.recalculate_project_timeline(updated)
             updated.refresh_from_db()
+
+        if old_status != updated.status and updated.status == "Delayed":
+            notify(
+                client=updated.client_id,
+                recipients=[updated.project_manager_id, getattr(self.request.user, "id", None)],
+                type="pms.project_delayed",
+                category="pms",
+                title=f"Project Delayed: {updated.code}",
+                body=f"Project {updated.code} ({updated.customer_name}) is marked as Delayed.",
+                entity_type="PmsProject",
+                entity_id=updated.id,
+                actor=self.request.user if getattr(self.request.user, "is_authenticated", False) else None,
+                payload={"path": f"/pms/projects/{updated.code}"},
+            )
         return updated
 
     @action(detail=False, methods=["post"], url_path="from-order")
@@ -1755,6 +1806,7 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
                 entity_type="PmsStage",
                 entity_id=stage.id,
                 actor=request.user,
+                payload={"path": f"/pms/projects/{project.code}"},
             )
         return Response(DelaySerializer(delay).data, status=status.HTTP_201_CREATED)
 
