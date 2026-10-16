@@ -785,7 +785,7 @@ def _import_rows(request, rows, dry_run, serializer_class, model, required=()):
 # Item Types and Categories (api.md §4.3, Phase 2)
 # ---------------------------------------------------------------------------
 class ItemTypeViewSet(TenantModelViewSet):
-    queryset = ItemType.objects.all()
+    queryset = ItemType.objects.select_related("image_file")
     serializer_class = ItemTypeSerializer
     audit_entity_type = "ItemType"
     audit_label_field = "name"
@@ -861,7 +861,7 @@ class MaterialGradeViewSet(TenantModelViewSet):
 
 
 class ItemCategoryViewSet(TenantModelViewSet):
-    queryset = ItemCategory.objects.prefetch_related("custom_fields").select_related("item_type", "default_unit")
+    queryset = ItemCategory.objects.prefetch_related("custom_fields").select_related("item_type", "default_unit", "image_file")
     serializer_class = ItemCategorySerializer
     audit_entity_type = "ItemCategory"
     audit_label_field = "name"

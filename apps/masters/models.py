@@ -150,6 +150,10 @@ class ItemType(TenantModel, LegacyIdMixin):
     description = models.TextField(null=True, blank=True)
     shape_profile = models.TextField(null=True, blank=True)
     dimension_schema = models.JSONField(default=dict, blank=True)
+    image_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    image_url = models.TextField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
 
     class Meta:
@@ -194,6 +198,10 @@ class ItemCategory(TenantModel, LegacyIdMixin):
         "masters.Unit", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     default_uom = models.TextField(null=True, blank=True)
+    image_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    image_url = models.TextField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
 
     class Meta:

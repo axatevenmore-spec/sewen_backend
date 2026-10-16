@@ -164,6 +164,8 @@ class File(AuditedModel):
         ("import", "Bulk import"),
         ("export", "Export"),
         ("product_image", "Product image"),
+        ("category_image", "Category image"),
+        ("item_type_image", "Item type image"),
         ("other", "Other"),
     ]
     STATUSES = [("pending", "pending"), ("committed", "committed"), ("deleted", "deleted")]

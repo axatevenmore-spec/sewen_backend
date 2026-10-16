@@ -45,18 +45,76 @@ def slug_code(name, fallback):
 class ItemTypeSerializer(BaseModelSerializer):
     categoryCount = serializers.SerializerMethodField()
     itemCount = serializers.SerializerMethodField()
+    image = serializers.SerializerMethodField()
+    imageUrl = serializers.SerializerMethodField()
+    imageFileId = TenantPrimaryKeyRelatedField(
+        source="image_file",
+        model="core.File",
+        required=False,
+        allow_null=True,
+        write_only=True,
+    )
+    imageUrlInput = serializers.CharField(
+        source="image_url",
+        required=False,
+        allow_null=True,
+        allow_blank=True,
+        write_only=True,
+    )
 
     class Meta:
         model = ItemType
         fields = [
             "id", "code", "name", "description", "shape_profile",
             "dimension_schema", "is_active", "categoryCount", "itemCount",
+            "image", "imageUrl", "imageFileId", "imageUrlInput",
             "created_at", "updated_at",
         ]
+        read_only_fields = ["created_at", "updated_at", "image", "imageUrl"]
         extra_kwargs = {
             "code": {"required": False, "allow_blank": True},
             "is_active": {"required": False},
         }
+
+    def to_internal_value(self, data):
+        data = dict(data)
+        camel_map = {
+            "imageFileId": "imageFileId",
+            "imageUrlInput": "imageUrlInput",
+            "isActive": "is_active",
+            "shapeProfile": "shape_profile",
+            "dimensionSchema": "dimension_schema",
+        }
+        for c_key, s_key in camel_map.items():
+            if c_key in data and s_key not in data:
+                data[s_key] = data[c_key]
+
+        if "imageFileId" in data and not data["imageFileId"]:
+            data["imageFileId"] = None
+        if "imageUrl" in data and not data["imageUrl"] and "imageFileId" not in data:
+            data["imageFileId"] = None
+            data["imageUrlInput"] = ""
+
+        if "imageUrl" in data and "imageUrlInput" not in data:
+            val = data["imageUrl"]
+            if val and not (isinstance(val, str) and "/api/v1/files/" in val):
+                data["imageUrlInput"] = val
+
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["imageFileId"] = str(instance.image_file_id) if instance.image_file_id else None
+        data["isActive"] = bool(instance.is_active)
+        return data
+
+    def get_image(self, obj):
+        if getattr(obj, "image_file_id", None) and obj.image_file:
+            return public_url(obj.image_file, self.context.get("request"))
+        return obj.image_url or None
+
+    def get_imageUrl(self, obj):
+        return self.get_image(obj)
 
     def validate_name(self, value):
         client_id = self.context.get("client_id")
@@ -241,6 +299,22 @@ class ItemCategorySerializer(BaseModelSerializer):
     defaultUnitId = TenantPrimaryKeyRelatedField(
         source="default_unit", queryset=Unit.objects.all(), required=False, allow_null=True
     )
+    image = serializers.SerializerMethodField()
+    imageUrl = serializers.SerializerMethodField()
+    imageFileId = TenantPrimaryKeyRelatedField(
+        source="image_file",
+        model="core.File",
+        required=False,
+        allow_null=True,
+        write_only=True,
+    )
+    imageUrlInput = serializers.CharField(
+        source="image_url",
+        required=False,
+        allow_null=True,
+        allow_blank=True,
+        write_only=True,
+    )
 
     class Meta:
         model = ItemCategory
@@ -249,8 +323,10 @@ class ItemCategorySerializer(BaseModelSerializer):
             "lead_time_days", "default_hsn_code", "itemType", "itemTypeCode",
             "itemTypeId", "defaultUnit", "defaultUnitId", "default_uom",
             "is_active", "customFields", "itemCount",
+            "image", "imageUrl", "imageFileId", "imageUrlInput",
             "created_at", "updated_at",
         ]
+        read_only_fields = ["created_at", "updated_at", "image", "imageUrl"]
         extra_kwargs = {
             "code": {"required": False, "allow_blank": True},
             "is_active": {"required": False},
@@ -266,10 +342,24 @@ class ItemCategorySerializer(BaseModelSerializer):
             "leadTimeDays": "lead_time_days",
             "hasSubParts": "has_sub_parts",
             "isActive": "is_active",
+            "imageFileId": "imageFileId",
+            "imageUrlInput": "imageUrlInput",
         }
         for c_key, s_key in camel_map.items():
             if c_key in data and s_key not in data:
                 data[s_key] = data[c_key]
+
+        if "imageFileId" in data and not data["imageFileId"]:
+            data["imageFileId"] = None
+        if "imageUrl" in data and not data["imageUrl"] and "imageFileId" not in data:
+            data["imageFileId"] = None
+            data["imageUrlInput"] = ""
+
+        if "imageUrl" in data and "imageUrlInput" not in data:
+            val = data["imageUrl"]
+            if val and not (isinstance(val, str) and "/api/v1/files/" in val):
+                data["imageUrlInput"] = val
+
         return super().to_internal_value(data)
 
     def to_representation(self, instance):
@@ -281,7 +371,16 @@ class ItemCategorySerializer(BaseModelSerializer):
         data["hasSubParts"] = bool(instance.has_sub_parts)
         data["leadTimeDays"] = instance.lead_time_days
         data["defaultHsnCode"] = instance.default_hsn_code or ""
+        data["imageFileId"] = str(instance.image_file_id) if instance.image_file_id else None
         return data
+
+    def get_image(self, obj):
+        if getattr(obj, "image_file_id", None) and obj.image_file:
+            return public_url(obj.image_file, self.context.get("request"))
+        return obj.image_url or None
+
+    def get_imageUrl(self, obj):
+        return self.get_image(obj)
 
     def validate(self, attrs):
         """Derive code if missing, and prevent duplicate category names within item type."""
