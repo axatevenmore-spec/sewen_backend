@@ -3,6 +3,8 @@ import re
 
 from rest_framework import serializers
 
+from apps.core.models import File
+from apps.core.files import public_url
 from apps.core.serializers import (
     BaseModelSerializer,
     BaseSerializer,
@@ -157,6 +159,7 @@ class PartySerializer(BaseModelSerializer):
     ledgerAccountId = TenantPrimaryKeyRelatedField(
         source="ledger_account", model="accounting.Account", required=False, allow_null=True
     )
+    availableCredit = serializers.SerializerMethodField()
 
     class Meta:
         model = Party
@@ -167,16 +170,20 @@ class PartySerializer(BaseModelSerializer):
             "tcs_applicable", "tcs_rate",
             "ledgerAccount", "ledgerAccountId", "credit_limit", "payment_terms",
             "bank_account_number", "ifsc_code", "bank_name", "account_holder_name",
-            "opening_balance", "balance",
+            "opening_balance", "balance", "availableCredit",
             "billing_address", "shipping_address", "contacts", "status",
             "weight_tolerance_pct",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["balance", "created_at", "updated_at"]
+        read_only_fields = ["balance", "availableCredit", "created_at", "updated_at"]
         # api.md 1.7: the server allocates the CUST-/VEND- code in
         # ``PartyViewSet.perform_create``; the client must never invent one, so
         # it is optional on the wire rather than required.
         extra_kwargs = {"code": {"required": False, "allow_blank": True}}
+
+    def get_availableCredit(self, party):
+        from apps.sales.services import get_party_available_credit
+        return get_party_available_credit(party.client_id, party.id)
 
     def validate_code(self, value):
         client_id = self.context.get("client_id")
@@ -188,6 +195,11 @@ class PartySerializer(BaseModelSerializer):
         if existing.exists():
             raise serializers.ValidationError("A party with this code already exists.")
         return value
+
+    def validate_bank_account_number(self, value):
+        if value and not str(value).strip().isdigit():
+            raise serializers.ValidationError("Bank account number must contain only digits.")
+        return value.strip() if value else value
 
 
 class PartySummarySerializer(BaseSerializer):
@@ -402,6 +414,11 @@ class ItemSerializer(BaseModelSerializer):
         source="unit_conversion_factor", max_digits=18, decimal_places=6,
         coerce_to_string=False, required=False,
     )
+    imageFileId = TenantPrimaryKeyRelatedField(
+        source="image_file", queryset=File.objects.all(), required=False, allow_null=True
+    )
+    image = serializers.SerializerMethodField()
+    imageUrl = serializers.SerializerMethodField()
 
     # -- derived, read-only -------------------------------------------------
     availableQty = serializers.SerializerMethodField()
@@ -418,6 +435,7 @@ class ItemSerializer(BaseModelSerializer):
             "itemType", "itemTypeCode", "itemTypeId", "gradeName", "gradeId",
             "item_kind", "vendor", "vendorId",
             "uom", "purchase_unit", "sales_unit", "unitConversionFactor",
+            "image", "imageUrl", "imageFileId",
             "availableQty", "reservedQty", "onHandQty", "damagedQty",
             "reorder_level", "location", "locationId", "status", "lifecycle_status",
             "cost_price", "selling_price", "hsn_code", "tax_pct",
@@ -480,14 +498,35 @@ class ItemSerializer(BaseModelSerializer):
             "trackingMode": "tracking_mode",
             "lifecycleStatus": "lifecycle_status",
             "itemKind": "item_kind",
+            "imageFileId": "imageFileId",
         }
         for c_key, s_key in camel_map.items():
             if c_key in data and s_key not in data:
                 data[s_key] = data[c_key]
+        if "imageFileId" in data and not data["imageFileId"]:
+            data["image_file"] = None
+        if "image" in data and not data["image"]:
+            data["image_file"] = None
+            data["image_url"] = None
         return super().to_internal_value(data)
+
+    def _resolve_image_url(self, instance):
+        if instance.image_file:
+            request = self.context.get("request")
+            url = public_url(instance.image_file, request)
+            if url:
+                return url
+        return instance.image_url or None
+
+    def get_image(self, instance):
+        return self._resolve_image_url(instance)
+
+    def get_imageUrl(self, instance):
+        return self._resolve_image_url(instance)
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
+        data["imageFileId"] = str(instance.image_file_id) if instance.image_file_id else None
         data["itemTypeId"] = str(instance.item_type_id) if instance.item_type_id else None
         data["gradeId"] = str(instance.grade_id) if instance.grade_id else None
         data["metalGrade"] = instance.grade.code if instance.grade else (instance.metal_grade or "")

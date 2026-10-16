@@ -66,6 +66,7 @@ from .models import (
     Training,
     TrainingParticipant,
     WorkingDay,
+    WorkSchedule,
     EmployeeTransfer,
     EmployeePromotion,
     EmployeeWarning,
@@ -231,7 +232,21 @@ class EmployeeSerializer(BaseModelSerializer):
         source="salary_structure", model="hrms.SalaryStructure",
         required=False, allow_null=True,
     )
+    workSchedule = serializers.CharField(source="work_schedule.name", read_only=True)
+    workScheduleId = TenantPrimaryKeyRelatedField(
+        source="work_schedule", model="hrms.WorkSchedule",
+        required=False, allow_null=True,
+    )
     avatar = serializers.CharField(source="avatar_url", required=False, allow_null=True)
+    probationStartDate = serializers.DateField(source="probation_start_date", required=False, allow_null=True)
+    probationPeriod = serializers.CharField(source="probation_period", required=False, allow_blank=True, allow_null=True)
+    probationEndDate = serializers.DateField(source="probation_end_date", required=False, allow_null=True)
+    confirmationStatus = serializers.CharField(source="confirmation_status", required=False, allow_blank=True, allow_null=True)
+    confirmationDate = serializers.DateField(source="confirmation_date", required=False, allow_null=True)
+    confirmationRemarks = serializers.CharField(source="confirmation_remarks", required=False, allow_blank=True, allow_null=True)
+    probationHistory = serializers.JSONField(source="probation_history", required=False, read_only=True)
+    noticePeriod = serializers.CharField(source="notice_period", required=False, allow_blank=True, allow_null=True)
+    noticePeriodDays = serializers.IntegerField(source="notice_period_days", required=False, allow_null=True)
     #: The Administration login backed by this record (read-only; the link is
     #: made from either side's create, or from the user's "Linked employee").
     login = serializers.SerializerMethodField()
@@ -242,11 +257,15 @@ class EmployeeSerializer(BaseModelSerializer):
             "id", "employeeCode", "name", "email", "phone", "avatar", "login",
             "designation", "designationId", "department", "departmentId",
             "manager", "managerId", "location", "locationId", "joining",
-            "employmentType", "shift", "salaryStructureId", "standard_salary",
+            "employmentType", "shift", "workSchedule", "workScheduleId",
+            "salaryStructureId", "standard_salary",
             "status", "date_of_birth", "gender", "blood_group", "personal_email",
             "emergency_contact", "address", "bank_account_number", "ifsc_code",
             "pan", "uan", "aadhaar_last4", "last_working_day",
-            "termination_reason", "created_at", "updated_at",
+            "termination_reason", "probationStartDate", "probationPeriod",
+            "probationEndDate", "confirmationStatus", "confirmationDate",
+            "confirmationRemarks", "probationHistory", "noticePeriod",
+            "noticePeriodDays", "created_at", "updated_at",
         ]
         read_only_fields = ["employeeCode", "created_at", "updated_at"]
 
@@ -297,6 +316,22 @@ class EmployeeSerializer(BaseModelSerializer):
                 data["joining"] = data["joiningDate"]
             elif "joining" not in data and "doj" in data:
                 data["joining"] = data["doj"]
+            if "probationStartDate" in data:
+                data["probation_start_date"] = data["probationStartDate"]
+            if "probationPeriod" in data:
+                data["probation_period"] = data["probationPeriod"]
+            if "probationEndDate" in data:
+                data["probation_end_date"] = data["probationEndDate"]
+            if "confirmationStatus" in data:
+                data["confirmation_status"] = data["confirmationStatus"]
+            if "confirmationDate" in data:
+                data["confirmation_date"] = data["confirmationDate"]
+            if "confirmationRemarks" in data:
+                data["confirmation_remarks"] = data["confirmationRemarks"]
+            if "noticePeriod" in data:
+                data["notice_period"] = data["noticePeriod"]
+            if "noticePeriodDays" in data:
+                data["notice_period_days"] = data["noticePeriodDays"]
         return super().to_internal_value(data)
 
     def validate(self, attrs):
@@ -314,6 +349,41 @@ class EmployeeSerializer(BaseModelSerializer):
 
         if not attrs.get("joining_date") and not self.instance:
             attrs["joining_date"] = timezone.now().date()
+
+        request = self.context.get("request")
+        client_id = getattr(request, "client_id", None) or (
+            getattr(getattr(request, "user", None), "client_id", None)
+        )
+
+        if client_id:
+            from apps.core.models import Setting
+            from .views import DEFAULT_HRMS_SETTINGS
+            from .lifecycle_service import calculate_probation_end_date, parse_duration_to_days
+
+            hrms_row = Setting.objects.filter(client_id=client_id, key="hrms").first()
+            cfg = dict(DEFAULT_HRMS_SETTINGS)
+            if hrms_row and isinstance(hrms_row.value, dict):
+                cfg.update(hrms_row.value)
+
+            if not self.instance:
+                if not attrs.get("probation_period"):
+                    attrs["probation_period"] = cfg.get("probationPeriod", "90 Days (3 Months)")
+                if not attrs.get("probation_start_date"):
+                    attrs["probation_start_date"] = attrs.get("joining_date") or timezone.now().date()
+                if not attrs.get("probation_end_date"):
+                    attrs["probation_end_date"] = calculate_probation_end_date(
+                        attrs["probation_start_date"], attrs["probation_period"]
+                    )
+                if not attrs.get("confirmation_status"):
+                    attrs["confirmation_status"] = "On Probation" if attrs.get("status") == "Probation" else "Confirmed"
+                if not attrs.get("notice_period"):
+                    attrs["notice_period"] = cfg.get("noticePeriod", "60 Days (2 Months)")
+                if not attrs.get("notice_period_days"):
+                    attrs["notice_period_days"] = parse_duration_to_days(attrs["notice_period"], default=60)
+            else:
+                if "probation_period" in attrs and "probation_end_date" not in attrs:
+                    st_date = attrs.get("probation_start_date") or self.instance.probation_start_date or self.instance.joining_date
+                    attrs["probation_end_date"] = calculate_probation_end_date(st_date, attrs["probation_period"])
 
         # Resolve department / designation / location if names were passed instead of IDs
         request = self.context.get("request")
@@ -620,19 +690,82 @@ class LeaveRequestSerializer(BaseModelSerializer):
     delegate = serializers.CharField(
         source="delegate_employee.name", read_only=True, default=""
     )
+    pmsTask = serializers.SerializerMethodField()
+    crmTask = serializers.SerializerMethodField()
+    currentStep = serializers.IntegerField(source="current_step", read_only=True)
+    approvalChainId = serializers.CharField(source="approval_chain_id", read_only=True)
+    approvalHistory = serializers.JSONField(source="approval_history", read_only=True)
+    approverName = serializers.CharField(source="approver.name", read_only=True, default="")
+    nextApproverRole = serializers.SerializerMethodField()
 
     class Meta:
         model = LeaveRequest
         fields = [
             "id", "employeeId", "employeeName", "employeeCode", "type",
             "leaveTypeId", "fromDate", "toDate", "days", "reason", "delegateId", "delegate",
-            "delegate_confirmed_at", "status", "approver", "decided_at",
-            "remark", "created_at", "updated_at",
+            "delegate_confirmed_at", "status", "approver", "approverName", "decided_at",
+            "remark", "currentStep", "approvalChainId", "approvalHistory", "nextApproverRole",
+            "created_at", "updated_at", "pmsTask", "crmTask",
         ]
         read_only_fields = [
-            "status", "approver", "decided_at", "delegate_confirmed_at",
-            "created_at", "updated_at",
+            "status", "approver", "approverName", "decided_at", "delegate_confirmed_at",
+            "currentStep", "approvalChainId", "approvalHistory", "nextApproverRole",
+            "created_at", "updated_at", "pmsTask", "crmTask",
         ]
+
+    def get_nextApproverRole(self, obj):
+        if not obj.approval_chain or not isinstance(obj.approval_chain.steps, list):
+            return "Direct Line Manager" if obj.status in ("Pending Review", "Delegate Confirmed") else None
+        steps = obj.approval_chain.steps
+        step_num = obj.current_step or 1
+        for s in steps:
+            if (s.get("tier") or s.get("level")) == step_num:
+                return s.get("role")
+        return steps[-1].get("role") if steps else None
+
+    def get_pmsTask(self, obj):
+        try:
+            from apps.pms.models import DelegatedTask
+            task = DelegatedTask.objects.filter(
+                client_id=obj.client_id,
+                due_date=obj.to_date,
+                title__contains=obj.employee.name if obj.employee else "",
+                deleted_at__isnull=True,
+            ).first()
+            if task:
+                return {
+                    "id": str(task.id),
+                    "taskNumber": task.task_number,
+                    "title": task.title,
+                    "status": task.status,
+                    "priority": task.priority,
+                    "dueDate": str(task.due_date) if task.due_date else None,
+                }
+        except Exception:
+            pass
+        return None
+
+    def get_crmTask(self, obj):
+        try:
+            from apps.crm.models import Task as CrmTask
+            task = CrmTask.objects.filter(
+                client_id=obj.client_id,
+                due_date=obj.to_date,
+                title__contains=obj.employee.name if obj.employee else "",
+                deleted_at__isnull=True,
+            ).first()
+            if task:
+                return {
+                    "id": str(task.id),
+                    "taskNumber": task.task_number or f"CRM-{str(task.id)[:8]}",
+                    "title": task.title,
+                    "status": task.status,
+                    "priority": task.priority,
+                    "dueDate": str(task.due_date) if task.due_date else None,
+                }
+        except Exception:
+            pass
+        return None
 
     def validate(self, attrs):
         start = attrs.get("from_date") or getattr(self.instance, "from_date", None)
@@ -830,7 +963,42 @@ class JobSerializer(BaseModelSerializer):
         read_only_fields = ["published_at", "slug", "created_at", "updated_at"]
 
     def get_applicantCount(self, job):
-        return getattr(job, "applicant_count", None)
+        return getattr(job, "applicant_count", None) or job.applications.filter(deleted_at__isnull=True).count()
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        request = self.context.get("request")
+        client_id = getattr(request, "client_id", None) if request else None
+        if "department" in data and not data.get("departmentId") and client_id:
+            from .models import Department
+            dept = Department.objects.filter(client_id=client_id, name__iexact=str(data["department"]).strip(), deleted_at__isnull=True).first()
+            if dept:
+                data["departmentId"] = str(dept.id)
+        if ("location" in data or "branch" in data) and not data.get("locationId") and client_id:
+            from .models import Location
+            loc_name = str(data.get("location") or data.get("branch")).strip()
+            loc = Location.objects.filter(client_id=client_id, name__iexact=loc_name, deleted_at__isnull=True).first()
+            if loc:
+                data["locationId"] = str(loc.id)
+        if "experience" in data and "experience_range" not in data:
+            data["experience_range"] = data["experience"]
+        if "salary" in data and "salary_range" not in data:
+            data["salary_range"] = data["salary"]
+        if "employmentType" in data and "employment_type" not in data:
+            data["employment_type"] = data["employmentType"]
+        if data.get("status") == "Active":
+            data["status"] = "Open"
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["experience"] = instance.experience_range or ""
+        ret["salary"] = instance.salary_range or ""
+        ret["employmentType"] = instance.employment_type or "Full-time"
+        ret["location"] = instance.location.name if instance.location else ""
+        ret["branch"] = ret["location"]
+        ret["workMode"] = "Hybrid"
+        return ret
 
 
 class CandidateSerializer(BaseModelSerializer):
@@ -842,10 +1010,96 @@ class CandidateSerializer(BaseModelSerializer):
         model = Candidate
         fields = [
             "id", "name", "email", "phone", "resumeFileId", "source",
-            "current_ctc", "expected_ctc", "notice_period_days", "stage",
-            "rating", "employee", "notes", "created_at", "updated_at",
+            "location", "experience", "skills", "current_ctc", "expected_ctc",
+            "notice_period_days", "stage", "rating", "is_onboarded",
+            "documents_verified", "employee", "notes", "created_at", "updated_at",
         ]
         read_only_fields = ["employee", "created_at", "updated_at"]
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        if "appliedDate" in data:
+            data.pop("appliedDate", None)
+        return super().to_internal_value(data)
+
+    def create(self, validated_data):
+        job_id = self.initial_data.get("jobId")
+        client_id = validated_data.get("client_id")
+        if not client_id and self.context.get("request"):
+            client_id = getattr(self.context["request"], "client_id", None)
+            if not client_id:
+                user = getattr(self.context["request"], "user", None)
+                client_id = getattr(user, "client_id", None)
+        if client_id and "client_id" not in validated_data:
+            validated_data["client_id"] = client_id
+
+        email = (validated_data.get("email") or "").strip().lower()
+        existing_candidate = None
+        if email and client_id:
+            existing_candidate = Candidate.objects.filter(
+                client_id=client_id, email__iexact=email, deleted_at__isnull=True
+            ).first()
+
+        if existing_candidate:
+            # Update fields if new details provided
+            update_fields = []
+            for field in ["phone", "location", "experience", "skills"]:
+                val = validated_data.get(field)
+                if val and getattr(existing_candidate, field) != val:
+                    setattr(existing_candidate, field, val)
+                    update_fields.append(field)
+            if update_fields:
+                update_fields.append("updated_at")
+                existing_candidate.save(update_fields=update_fields)
+            candidate = existing_candidate
+        else:
+            candidate = super().create(validated_data)
+
+        if job_id:
+            from .models import Application, Job
+            job = Job.objects.filter(client_id=candidate.client_id, pk=job_id, deleted_at__isnull=True).first()
+            if job:
+                Application.objects.get_or_create(
+                    client_id=candidate.client_id,
+                    candidate=candidate,
+                    job=job,
+                    defaults={"stage": candidate.stage, "created_by": candidate.created_by}
+                )
+        return candidate
+
+    def update(self, instance, validated_data):
+        job_id = self.initial_data.get("jobId")
+        candidate = super().update(instance, validated_data)
+        if job_id:
+            from .models import Application, Job
+            job = Job.objects.filter(client_id=candidate.client_id, pk=job_id, deleted_at__isnull=True).first()
+            if job:
+                app, created = Application.objects.get_or_create(
+                    client_id=candidate.client_id,
+                    candidate=candidate,
+                    job=job,
+                    defaults={"stage": candidate.stage, "created_by": candidate.created_by}
+                )
+                if not created and app.stage != candidate.stage:
+                    app.stage = candidate.stage
+                    app.save(update_fields=["stage", "updated_at"])
+        return candidate
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        app = instance.applications.select_related("job").order_by("-applied_at").first()
+        if app and app.job:
+            ret["jobId"] = str(app.job_id)
+            ret["position"] = app.job.title
+            ret["jobTitle"] = app.job.title
+        else:
+            ret["jobId"] = ""
+            ret["position"] = ""
+            ret["jobTitle"] = ""
+        ret["isOnboarded"] = instance.is_onboarded or (instance.employee_id is not None)
+        ret["documentsVerified"] = instance.documents_verified
+        ret["appliedDate"] = instance.created_at.strftime("%d %b %Y") if instance.created_at else ""
+        return ret
 
 
 class ApplicationSerializer(BaseModelSerializer):
@@ -864,51 +1118,279 @@ class ApplicationSerializer(BaseModelSerializer):
 
 class InterviewSerializer(BaseModelSerializer):
     applicationId = TenantPrimaryKeyRelatedField(
-        source="application", model="hrms.Application"
+        source="application", model="hrms.Application", required=False, allow_null=True
     )
     candidateName = serializers.CharField(
         source="application.candidate.name", read_only=True
     )
-    scheduledAt = serializers.DateTimeField(source="scheduled_at")
+    scheduledAt = serializers.DateTimeField(source="scheduled_at", required=False)
     panelUserIds = serializers.JSONField(source="panel_user_ids", required=False)
 
     class Meta:
         model = Interview
         fields = [
             "id", "applicationId", "candidateName", "round", "scheduledAt",
-            "mode", "panelUserIds", "status", "rating", "notes",
+            "mode", "location", "interview_type", "panelUserIds", "status", "rating", "notes",
             "recommendation", "created_at",
         ]
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        request = self.context.get("request")
+        client_id = getattr(request, "client_id", None) if request else None
+
+        # Resolve candidateId to applicationId if applicationId not explicitly provided
+        if not data.get("applicationId") and (data.get("candidateId") or data.get("candidate")):
+            cand_id = data.get("candidateId") or data.get("candidate")
+            from .models import Application, Job
+            app = Application.objects.filter(client_id=client_id, candidate_id=cand_id, deleted_at__isnull=True).order_by("-applied_at").first()
+            if not app:
+                job = None
+                if data.get("jobId"):
+                    job = Job.objects.filter(client_id=client_id, pk=data.get("jobId"), deleted_at__isnull=True).first()
+                elif data.get("job"):
+                    job = Job.objects.filter(client_id=client_id, title__iexact=str(data.get("job")).strip(), deleted_at__isnull=True).first()
+                if not job:
+                    job = Job.objects.filter(client_id=client_id, deleted_at__isnull=True).first()
+                if job:
+                    app = Application.objects.create(client_id=client_id, candidate_id=cand_id, job=job, stage="Interview")
+            if app:
+                data["applicationId"] = str(app.id)
+
+        # Datetime parsing from separate date/start fields or string
+        if "scheduledAt" not in data or not data["scheduledAt"]:
+            date_val = data.get("date") or data.get("scheduledDate")
+            time_val = data.get("start") or data.get("startTime")
+            if date_val:
+                import datetime
+                from django.utils import timezone
+                parsed_dt = None
+                for fmt in ("%d %b %Y", "%d %B %Y", "%Y-%m-%d"):
+                    try:
+                        d = datetime.datetime.strptime(str(date_val).strip(), fmt).date()
+                        t_h, t_m = 10, 0
+                        if time_val:
+                            for t_fmt in ("%I:%M %p", "%I:%M%p", "%H:%M"):
+                                try:
+                                    t = datetime.datetime.strptime(str(time_val).strip(), t_fmt).time()
+                                    t_h, t_m = t.hour, t.minute
+                                    break
+                                except Exception:
+                                    pass
+                        parsed_dt = timezone.make_aware(datetime.datetime.combine(d, datetime.time(t_h, t_m)))
+                        break
+                    except Exception:
+                        pass
+                if parsed_dt:
+                    data["scheduledAt"] = parsed_dt.isoformat()
+                else:
+                    from django.utils import timezone
+                    data["scheduledAt"] = timezone.now().isoformat()
+            else:
+                from django.utils import timezone
+                data["scheduledAt"] = timezone.now().isoformat()
+
+        if "type" in data and "interview_type" not in data:
+            data["interview_type"] = data["type"]
+        if "meetingLink" in data and "location" not in data:
+            data["location"] = data["meetingLink"]
+        if "feedback" in data and "notes" not in data:
+            data["notes"] = data["feedback"]
+        if "score" in data and ("rating" not in data or data.get("rating") is None):
+            try:
+                raw_score = float(data["score"])
+                data["rating"] = round(min(5.0, max(0.0, raw_score / 20.0)), 1)
+            except (ValueError, TypeError):
+                pass
+
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        import datetime
+        ret = super().to_representation(instance)
+        cand = instance.application.candidate if instance.application else None
+        job = instance.application.job if instance.application else None
+        ret["candidateId"] = str(cand.id) if cand else ""
+        ret["candidateName"] = cand.name if cand else "Candidate"
+        ret["job"] = job.title if job else ""
+        ret["jobTitle"] = ret["job"]
+        if instance.scheduled_at:
+            ret["date"] = instance.scheduled_at.strftime("%d %b %Y")
+            ret["start"] = instance.scheduled_at.strftime("%I:%M %p")
+            ret["end"] = (instance.scheduled_at + datetime.timedelta(minutes=60)).strftime("%I:%M %p")
+            ret["duration"] = "60m"
+        ret["type"] = instance.interview_type or instance.mode or "Technical Interview"
+        ret["location"] = instance.location or ""
+        ret["meetingLink"] = instance.location or ""
+        ret["interviewer"] = "Interviewer" if not instance.panel_user_ids else "Panel"
+        if instance.rating is not None:
+            ret["score"] = int(float(instance.rating) * 20)
+        else:
+            ret["score"] = None
+        ret["feedback"] = instance.notes or ""
+        return ret
 
 
 class OfferSerializer(BaseModelSerializer):
     applicationId = TenantPrimaryKeyRelatedField(
-        source="application", model="hrms.Application"
+        source="application", model="hrms.Application", required=False, allow_null=True
+    )
+    candidateId = TenantPrimaryKeyRelatedField(
+        source="candidate", model="hrms.Candidate", required=False, allow_null=True
     )
     candidateName = serializers.CharField(
-        source="application.candidate.name", read_only=True
+        source="candidate_name", required=False, allow_blank=True
     )
+    email = serializers.EmailField(required=False, allow_blank=True)
+    position = serializers.CharField(required=False, allow_blank=True)
+    department = serializers.CharField(required=False, allow_blank=True)
+    dept = serializers.CharField(source="department", required=False, allow_blank=True)
+    location = serializers.CharField(required=False, allow_blank=True)
+    jobType = serializers.CharField(source="job_type", required=False, allow_blank=True)
+    workMode = serializers.CharField(source="work_mode", required=False, allow_blank=True)
+    salary = serializers.CharField(required=False, allow_blank=True)
     offeredCtc = MoneyField(source="offered_ctc", required=False, allow_null=True)
     joiningDate = serializers.DateField(
         source="joining_date", required=False, allow_null=True
     )
+    expiryDate = serializers.DateField(
+        source="expiry_date", required=False, allow_null=True
+    )
+    reportingManager = serializers.CharField(
+        source="reporting_manager", required=False, allow_blank=True
+    )
+    probationPeriod = serializers.CharField(
+        source="probation_period", required=False, allow_blank=True
+    )
+    letterContent = serializers.JSONField(
+        source="letter_content", required=False, allow_null=True
+    )
+    approvalChainId = serializers.CharField(source="approval_chain_id", read_only=True)
+    currentStep = serializers.IntegerField(source="current_step", read_only=True)
+    approvalHistory = serializers.JSONField(source="approval_history", read_only=True)
+    approverName = serializers.CharField(source="approver.name", read_only=True, default="")
+    decidedAt = serializers.DateTimeField(source="decided_at", read_only=True)
+    sentDate = serializers.SerializerMethodField()
 
     class Meta:
         model = Offer
         fields = [
-            "id", "applicationId", "candidateName", "offeredCtc", "joiningDate",
-            "status", "letter_file", "sent_at", "responded_at", "notes",
-            "created_at",
+            "id", "applicationId", "candidateId", "candidateName", "email", "position",
+            "department", "dept", "location", "jobType", "workMode", "salary",
+            "offeredCtc", "joiningDate", "expiryDate", "reportingManager",
+            "probationPeriod", "letterContent", "sentDate", "status",
+            "approvalChainId", "currentStep", "approvalHistory", "approverName", "decidedAt",
+            "letter_file", "sent_at", "responded_at", "notes", "created_at",
         ]
-        read_only_fields = ["sent_at", "responded_at", "created_at"]
+        read_only_fields = [
+            "sent_at", "responded_at", "created_at",
+            "approvalChainId", "currentStep", "approvalHistory", "approverName", "decidedAt"
+        ]
+
+    def validate(self, data):
+        data = super().validate(data)
+        joining = data.get("joining_date")
+        expiry = data.get("expiry_date")
+        if joining and expiry and expiry > joining:
+            # Instead of rejecting, adjust expiry to joining date minus 1 day or match
+            data["expiry_date"] = joining
+        return data
+
+    def get_sentDate(self, obj):
+        dt = obj.sent_at or obj.created_at
+        return dt.date().isoformat() if dt else ""
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        if data.get("status") == "Confirmed":
+            data["status"] = "Pending"
+        if "dept" in data and "department" not in data:
+            data["department"] = data["dept"]
+        if "jobType" in data and "job_type" not in data:
+            data["job_type"] = data["jobType"]
+        if "workMode" in data and "work_mode" not in data:
+            data["work_mode"] = data["workMode"]
+        if "expiryDate" in data and "expiry_date" not in data:
+            data["expiry_date"] = data["expiryDate"]
+        if "reportingManager" in data and "reporting_manager" not in data:
+            data["reporting_manager"] = data["reportingManager"]
+        if "probationPeriod" in data and "probation_period" not in data:
+            data["probation_period"] = data["probationPeriod"]
+        if "letterContent" in data and "letter_content" not in data:
+            data["letter_content"] = data["letterContent"]
+
+        salary_raw = data.get("salary")
+        if salary_raw is not None and not data.get("offered_ctc") and not data.get("offeredCtc"):
+            import re
+            nums = re.findall(r"[\d]+(?:[.,]\d+)*", str(salary_raw))
+            if nums:
+                clean_num = nums[0].replace(",", "")
+                try:
+                    data["offeredCtc"] = float(clean_num)
+                    data["offered_ctc"] = float(clean_num)
+                except ValueError:
+                    pass
+
+        return super().to_internal_value(data)
+
+    def create(self, validated_data):
+        validated_data.pop("salary", None)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        validated_data.pop("salary", None)
+        return super().update(instance, validated_data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        cand_name = instance.candidate_name
+        if not cand_name:
+            if instance.candidate:
+                cand_name = instance.candidate.name
+            elif instance.application and instance.application.candidate:
+                cand_name = instance.application.candidate.name
+        ret["candidateName"] = cand_name or "Candidate"
+        if not ret.get("email") and instance.candidate and instance.candidate.email:
+            ret["email"] = instance.candidate.email
+        if not ret.get("salary"):
+            if instance.offered_ctc:
+                ret["salary"] = f"${int(instance.offered_ctc):,} / year"
+            elif instance.letter_content and isinstance(instance.letter_content, dict) and instance.letter_content.get("salary"):
+                ret["salary"] = instance.letter_content.get("salary")
+            else:
+                ret["salary"] = "Competitive"
+        ret["dept"] = instance.department or ""
+        ret["jobType"] = instance.job_type or "Full-time"
+        ret["workMode"] = instance.work_mode or "Hybrid"
+        return ret
 
 
 class OnboardingTaskSerializer(BaseModelSerializer):
     candidateId = TenantPrimaryKeyRelatedField(source="candidate", model="hrms.Candidate")
+    candidateName = serializers.CharField(source="candidate.name", read_only=True)
+    ownerName = serializers.CharField(source="owner.name", read_only=True, default="")
+    dueDate = serializers.DateField(source="due_date", required=False, allow_null=True)
+    completedAt = serializers.DateTimeField(source="completed_at", required=False, allow_null=True)
+    isCompleted = serializers.SerializerMethodField()
 
     class Meta:
         model = OnboardingTask
-        fields = ["id", "candidateId", "title", "owner", "due_date", "completed_at"]
+        fields = [
+            "id", "candidateId", "candidateName", "title", "owner", "ownerName",
+            "due_date", "dueDate", "completed_at", "completedAt", "isCompleted"
+        ]
+
+    def get_isCompleted(self, obj):
+        return obj.completed_at is not None
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        if "dueDate" in data and "due_date" not in data:
+            data["due_date"] = data["dueDate"]
+        if data.get("completed") is True and not data.get("completed_at"):
+            from django.utils import timezone
+            data["completed_at"] = timezone.now()
+        return super().to_internal_value(data)
 
 
 class ScreeningQuestionSerializer(BaseModelSerializer):
@@ -916,10 +1398,29 @@ class ScreeningQuestionSerializer(BaseModelSerializer):
         source="job", model="hrms.Job", required=False, allow_null=True
     )
     jobTitle = serializers.CharField(source="job.title", read_only=True)
+    isActive = serializers.BooleanField(source="is_active", required=False)
 
     class Meta:
         model = ScreeningQuestion
-        fields = ["id", "jobId", "jobTitle", "question", "type", "options", "is_active", "sort_order", "created_at"]
+        fields = [
+            "id", "jobId", "jobTitle", "question", "type", "options",
+            "is_active", "isActive", "sort_order", "created_at"
+        ]
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        if "text" in data and "question" not in data:
+            data["question"] = data["text"]
+        if "enabled" in data and "is_active" not in data and "isActive" not in data:
+            data["is_active"] = bool(data["enabled"])
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["text"] = instance.question
+        ret["enabled"] = instance.is_active
+        ret["isActive"] = instance.is_active
+        return ret
 
 
 class ScreeningAnswerSerializer(BaseModelSerializer):
@@ -930,6 +1431,17 @@ class ScreeningAnswerSerializer(BaseModelSerializer):
     class Meta:
         model = ScreeningAnswer
         fields = ["id", "applicationId", "questionId", "questionText", "answer", "created_at"]
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        if "answer_text" in data and "answer" not in data:
+            data["answer"] = data["answer_text"]
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["answer_text"] = ret.get("answer")
+        return ret
 
 
 
@@ -1146,25 +1658,155 @@ class HrDocumentSerializer(BaseModelSerializer):
         source="employee", model="hrms.Employee", required=False, allow_null=True
     )
     employee = serializers.CharField(source="employee.name", read_only=True)
+    employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
     fileId = TenantPrimaryKeyRelatedField(
         source="file", model="core.File", required=False, allow_null=True
     )
     fileSize = serializers.IntegerField(source="file.file_size", read_only=True)
     fileType = serializers.CharField(source="file.content_type", read_only=True)
+    fileName = serializers.CharField(required=False, allow_blank=True)
+    fileData = serializers.CharField(required=False, allow_blank=True, write_only=True)
     expiry = serializers.DateField(source="valid_until", required=False, allow_null=True)
     #: DERIVED from ``valid_until`` at read time (api.md §11.8).
     status = serializers.SerializerMethodField()
     uploadedBy = serializers.CharField(source="created_by.name", read_only=True)
     updatedOn = serializers.DateTimeField(source="updated_at", read_only=True)
+    uploadDate = serializers.SerializerMethodField()
 
     class Meta:
         model = HrDocument
         fields = [
-            "id", "title", "category", "employee", "employeeId", "version",
-            "expiry", "status", "fileId", "fileSize", "fileType", "uploadedBy",
-            "updatedOn", "tags", "description", "valid_from", "is_confidential",
+            "id", "title", "category", "employee", "employeeId", "employeeCode", "version",
+            "expiry", "status", "fileId", "fileSize", "fileType", "fileName", "fileData", "uploadedBy",
+            "updatedOn", "uploadDate", "tags", "description", "valid_from", "is_confidential",
             "created_at",
         ]
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        emp_id = data.get("employeeId")
+        if emp_id in ("ALL", "All Staff", "all", "", None) or (
+            isinstance(emp_id, str) and not (len(emp_id) == 36 and "-" in emp_id)
+        ):
+            data["employeeId"] = None
+
+        if "fileName" in data and data["fileName"]:
+            data["fileName"] = str(data["fileName"]).strip()
+
+        v_raw = data.get("version")
+        if isinstance(v_raw, str):
+            v_clean = v_raw.lower().replace("v", "").split(".")[0].strip()
+            data["version"] = int(v_clean) if v_clean.isdigit() else 1
+        elif not v_raw:
+            data["version"] = 1
+
+        exp_raw = data.get("expiry")
+        if exp_raw in ("—", "-", "Permanent", "permanent", "N/A", "n/a", "", None):
+            data["expiry"] = None
+
+        return super().to_internal_value(data)
+
+    def create(self, validated_data):
+        file_data = validated_data.pop("fileData", None)
+        file_name = validated_data.pop("fileName", None)
+        instance = super().create(validated_data)
+        if file_data and not instance.file_id:
+            self._attach_file(instance, file_data, file_name=file_name)
+        return instance
+
+    def update(self, instance, validated_data):
+        file_data = validated_data.pop("fileData", None)
+        file_name = validated_data.pop("fileName", None)
+        instance = super().update(instance, validated_data)
+        if file_data:
+            self._attach_file(instance, file_data, file_name=file_name)
+        return instance
+
+    def _attach_file(self, instance, file_data, file_name=None):
+        import base64
+        import logging
+        from django.conf import settings
+        from apps.core.files import build_storage_key, write_bytes
+        from apps.core.models import File
+        from rest_framework.exceptions import ValidationError
+
+        try:
+            content_type = "application/pdf"
+            if "," in file_data:
+                header, base64_str = file_data.split(",", 1)
+                if ";base64" in header and "data:" in header:
+                    content_type = header.replace("data:", "").replace(";base64", "")
+            else:
+                base64_str = file_data
+            raw_bytes = base64.b64decode(base64_str)
+
+            # Validate PDF format
+            if not raw_bytes.startswith(b"%PDF-") and "pdf" not in content_type.lower():
+                raise ValidationError({"fileData": "Only PDF format documents are allowed."})
+
+            # Validate file size (15 MB maximum)
+            max_size_bytes = getattr(settings, "FILE_MAX_BYTES", 25 * 1024 * 1024)
+            if len(raw_bytes) > max_size_bytes:
+                limit_mb = max_size_bytes // (1024 * 1024)
+                raise ValidationError({"fileData": f"File size exceeds the {limit_mb} MB limit."})
+
+            client_id = str(instance.client_id)
+            title = instance.title or "document"
+
+            # Retain original filename if provided
+            if file_name and str(file_name).strip():
+                clean_name = str(file_name).strip()
+                filename = clean_name if clean_name.lower().endswith(".pdf") else f"{clean_name}.pdf"
+            else:
+                clean_title = str(title).strip()
+                filename = clean_title if clean_title.lower().endswith(".pdf") else f"{clean_title}.pdf"
+
+            storage_key = build_storage_key(client_id, "hrms_documents", filename)
+            write_bytes(storage_key, raw_bytes)
+            f_obj = File.objects.create(
+                client=instance.client,
+                file_name=filename,
+                file_size=len(raw_bytes),
+                content_type="application/pdf",
+                storage_key=storage_key,
+                scope="hrms_documents",
+                status="Committed",
+                created_by=getattr(instance, "created_by", None),
+            )
+            instance.file = f_obj
+            instance.save(update_fields=["file"])
+        except ValidationError:
+            raise
+        except Exception as err:
+            logging.getLogger(__name__).warning("Failed to attach fileData: %s", err)
+
+    def to_representation(self, instance):
+        from apps.core.files import public_url
+
+        ret = super().to_representation(instance)
+        if not instance.employee:
+            ret["employee"] = "All Staff"
+            ret["employeeId"] = "ALL"
+            ret["employeeCode"] = None
+        else:
+            ret["employeeCode"] = instance.employee.employee_code
+        if instance.file:
+            try:
+                ret["fileUrl"] = public_url(instance.file, self.context.get("request"))
+            except Exception:
+                pass
+            ret["fileName"] = instance.file.file_name
+            ret["fileSize"] = instance.file.file_size
+            ret["fileType"] = "PDF"
+        else:
+            ret["fileName"] = f"{instance.title}.pdf"
+            ret["fileSize"] = 0
+            ret["fileType"] = "PDF"
+        ret["uploadDate"] = instance.created_at.date().isoformat() if instance.created_at else None
+        return ret
+
+    def get_uploadDate(self, instance):
+        return instance.created_at.date().isoformat() if instance.created_at else None
 
     def get_status(self, document):
         return services.document_status(document)
@@ -1274,10 +1916,145 @@ class HolidaySerializer(BaseModelSerializer):
     locationId = TenantPrimaryKeyRelatedField(
         source="location", model="hrms.Location", required=False, allow_null=True
     )
+    locationName = serializers.CharField(source="location.name", read_only=True)
+    departmentId = TenantPrimaryKeyRelatedField(
+        source="department", model="hrms.Department", required=False, allow_null=True
+    )
+    departmentName = serializers.CharField(source="department.name", read_only=True)
+    holidayType = serializers.CharField(source="holiday_type", required=False, default="National Gazetted")
+    isOptional = serializers.BooleanField(source="is_optional", required=False, default=False)
+    year = serializers.SerializerMethodField(read_only=True)
+    day = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Holiday
-        fields = ["id", "date", "name", "locationId", "is_optional", "created_at"]
+        fields = [
+            "id", "date", "name", "locationId", "locationName",
+            "departmentId", "departmentName", "holidayType",
+            "isOptional", "is_optional", "status", "description",
+            "year", "day", "created_at"
+        ]
+
+    def get_year(self, obj):
+        return obj.date.year if obj.date else None
+
+    def get_day(self, obj):
+        return obj.date.strftime("%A") if obj.date else None
+
+    def validate(self, attrs):
+        request = self.context.get("request")
+        client_id = getattr(request, "client_id", None)
+        date = attrs.get("date") or (self.instance.date if self.instance else None)
+        location = attrs.get("location") if "location" in attrs else (self.instance.location if self.instance else None)
+        department = attrs.get("department") if "department" in attrs else (self.instance.department if self.instance else None)
+
+        if client_id and date:
+            qs = Holiday.objects.filter(client_id=client_id, date=date, deleted_at__isnull=True)
+            if location:
+                qs = qs.filter(location=location)
+            else:
+                qs = qs.filter(location__isnull=True)
+            if department:
+                qs = qs.filter(department=department)
+            else:
+                qs = qs.filter(department__isnull=True)
+            if self.instance:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise serializers.ValidationError({"date": f"A holiday on {date} already exists for this scope."})
+        return attrs
+
+
+class WorkScheduleSerializer(BaseModelSerializer):
+    departmentId = TenantPrimaryKeyRelatedField(
+        source="department", model="hrms.Department", required=False, allow_null=True
+    )
+    departmentName = serializers.CharField(source="department.name", read_only=True)
+    teamId = TenantPrimaryKeyRelatedField(
+        source="team", model="hrms.Team", required=False, allow_null=True
+    )
+    teamName = serializers.CharField(source="team.name", read_only=True)
+    locationId = TenantPrimaryKeyRelatedField(
+        source="location", model="hrms.Location", required=False, allow_null=True
+    )
+    locationName = serializers.CharField(source="location.name", read_only=True)
+    shiftType = serializers.CharField(source="shift_type", required=False, default="Regular")
+    shiftStart = serializers.TimeField(source="shift_start", required=False)
+    shiftEnd = serializers.TimeField(source="shift_end", required=False)
+    breakDuration = serializers.IntegerField(source="break_duration_minutes", required=False, default=60)
+    workingHours = serializers.DecimalField(source="working_hours", max_digits=4, decimal_places=2, required=False, default=8.0)
+    workingDays = serializers.ListField(source="working_days", child=serializers.IntegerField(min_value=0, max_value=6), required=False)
+    weeklyOffs = serializers.ListField(source="weekly_offs", child=serializers.IntegerField(min_value=0, max_value=6), required=False)
+    isDefault = serializers.BooleanField(source="is_default", required=False, default=False)
+    effectiveFrom = serializers.DateField(source="effective_from", required=False, allow_null=True)
+    effectiveTo = serializers.DateField(source="effective_to", required=False, allow_null=True)
+    assignedCount = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = WorkSchedule
+        fields = [
+            "id", "name", "code", "shiftType", "shift_type",
+            "shiftStart", "shift_start", "shiftEnd", "shift_end",
+            "breakDuration", "break_duration_minutes",
+            "workingHours", "working_hours",
+            "workingDays", "working_days",
+            "weeklyOffs", "weekly_offs",
+            "departmentId", "departmentName",
+            "teamId", "teamName",
+            "locationId", "locationName",
+            "isDefault", "is_default",
+            "status", "effectiveFrom", "effective_from",
+            "effectiveTo", "effective_to",
+            "description", "assignedCount",
+            "created_at", "updated_at",
+        ]
+
+    def get_assignedCount(self, obj):
+        emp_ids = set(obj.employees.filter(status__in=["Active", "Probation"], deleted_at__isnull=True).values_list("id", flat=True))
+        if obj.team_id:
+            emp_ids.update(obj.team.members.filter(status__in=["Active", "Probation"], deleted_at__isnull=True).values_list("id", flat=True))
+            if obj.team.lead_id:
+                emp_ids.add(obj.team.lead_id)
+        if obj.department_id:
+            emp_ids.update(Employee.objects.filter(department_id=obj.department_id, status__in=["Active", "Probation"], deleted_at__isnull=True).values_list("id", flat=True))
+        return len(emp_ids)
+
+    def validate(self, attrs):
+        shift_start = attrs.get("shift_start") or (self.instance.shift_start if self.instance else None)
+        shift_end = attrs.get("shift_end") or (self.instance.shift_end if self.instance else None)
+        shift_type = attrs.get("shift_type") or (self.instance.shift_type if self.instance else "Regular")
+        eff_from = attrs.get("effective_from") or (self.instance.effective_from if self.instance else None)
+        eff_to = attrs.get("effective_to") or (self.instance.effective_to if self.instance else None)
+
+        if eff_from and eff_to and eff_to < eff_from:
+            raise serializers.ValidationError({"effectiveTo": "Effective To cannot be earlier than Effective From."})
+
+        if shift_start and shift_end and shift_start == shift_end and shift_type != "Flexible":
+            raise serializers.ValidationError({"shiftEnd": "Shift start time and end time cannot be identical."})
+
+        w_days = set(attrs.get("working_days") or (self.instance.working_days if self.instance else []))
+        w_offs = set(attrs.get("weekly_offs") or (self.instance.weekly_offs if self.instance else []))
+        overlap = w_days.intersection(w_offs)
+        if overlap:
+            raise serializers.ValidationError({"weeklyOffs": f"Days {list(overlap)} cannot be both a working day and a weekly off."})
+
+        return attrs
+
+    def create(self, validated_data):
+        if validated_data.get("is_default"):
+            request = self.context.get("request")
+            client_id = getattr(request, "client_id", None)
+            if client_id:
+                WorkSchedule.objects.filter(client_id=client_id, is_default=True).update(is_default=False)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if validated_data.get("is_default"):
+            request = self.context.get("request")
+            client_id = getattr(request, "client_id", None)
+            if client_id:
+                WorkSchedule.objects.filter(client_id=client_id, is_default=True).exclude(pk=instance.pk).update(is_default=False)
+        return super().update(instance, validated_data)
 
 
 class WorkingDaySerializer(BaseModelSerializer):
@@ -1287,68 +2064,582 @@ class WorkingDaySerializer(BaseModelSerializer):
 
 
 class TeamSerializer(BaseModelSerializer):
+    code = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    dept = serializers.CharField(source="department.name", read_only=True)
     department = serializers.CharField(source="department.name", read_only=True)
     departmentId = TenantPrimaryKeyRelatedField(
         source="department", model="hrms.Department", required=False, allow_null=True
     )
-    leadName = serializers.CharField(source="lead.name", read_only=True)
-    memberCount = serializers.SerializerMethodField()
+    lead = serializers.CharField(source="lead_name", required=False, allow_blank=True)
+    leadId = TenantPrimaryKeyRelatedField(
+        source="lead", model="hrms.Employee", required=False, allow_null=True
+    )
+    leadName = serializers.CharField(source="lead_name", read_only=True)
+    approver = serializers.CharField(source="approver_name", required=False, allow_blank=True)
+    approverId = TenantPrimaryKeyRelatedField(
+        source="approver", model="hrms.Employee", required=False, allow_null=True
+    )
+    approverName = serializers.CharField(source="approver_name", read_only=True)
+    headcount = serializers.IntegerField(required=False, allow_null=True)
+    memberIds = serializers.ListField(child=serializers.CharField(), required=False, write_only=True)
+    members = serializers.SerializerMethodField(read_only=True)
+    memberCount = serializers.SerializerMethodField(read_only=True)
+    membersDetail = serializers.SerializerMethodField(read_only=True)
 
     class Meta:
         model = Team
         fields = [
-            "id", "name", "department", "departmentId", "lead", "leadName",
-            "members", "memberCount", "description", "status", "created_at",
+            "id", "code", "name", "department", "dept", "departmentId", "lead", "leadId", "leadName",
+            "approver", "approverId", "approverName", "headcount", "members", "memberCount",
+            "memberIds", "membersDetail", "description", "status", "created_at",
         ]
 
     def get_memberCount(self, team):
-        return team.members.count()
+        active_members = team.members.filter(deleted_at__isnull=True).exclude(status__in=["Terminated", "Resigned"])
+        count = active_members.count()
+        if count > 0:
+            return count
+        return team.headcount or 0
+
+    def get_members(self, team):
+        return self.get_memberCount(team)
+
+    def get_membersDetail(self, team):
+        active_members = team.members.filter(deleted_at__isnull=True).exclude(status__in=["Terminated", "Resigned"])
+        return [
+            {
+                "id": str(m.id),
+                "name": m.name,
+                "employeeCode": m.employee_code,
+                "department": m.department.name if m.department else "",
+                "designation": m.designation.name if m.designation else "",
+                "status": m.status,
+            }
+            for m in active_members
+        ]
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        request = self.context.get("request")
+        client_id = getattr(request, "client_id", None) or getattr(getattr(request, "user", None), "client_id", None)
+
+        # Team Code validation
+        code_val = data.get("code") or data.get("teamCode")
+        if code_val and client_id:
+            from .models import Team
+            code_clean = str(code_val).strip()
+            qs = Team.objects.filter(client_id=client_id, code__iexact=code_clean)
+            if self.instance:
+                qs = qs.exclude(pk=self.instance.pk)
+            if qs.exists():
+                raise ValidationFailed(
+                    f"Team ID / Code '{code_clean}' is already assigned to another team.",
+                    field_errors={"code": ["Team ID must be unique."]}
+                )
+            data["code"] = code_clean
+
+        # Department resolution
+        dept_val = data.get("dept") or data.get("department")
+        if dept_val and not data.get("departmentId") and client_id:
+            from .models import Department
+            dept_obj = None
+            if isinstance(dept_val, str) and not ("-" in dept_val and len(dept_val) == 36):
+                dept_obj = Department.objects.filter(client_id=client_id, name__iexact=dept_val.strip(), deleted_at__isnull=True).first()
+                if not dept_obj:
+                    dept_obj = Department.objects.create(client_id=client_id, name=dept_val.strip())
+            elif isinstance(dept_val, str) and "-" in dept_val and len(dept_val) == 36:
+                dept_obj = Department.objects.filter(client_id=client_id, id=dept_val, deleted_at__isnull=True).first()
+            if dept_obj:
+                data["departmentId"] = str(dept_obj.id)
+
+        # Lead resolution & eligibility
+        lead_val = data.get("lead") or data.get("leadId")
+        if lead_val:
+            from .models import Employee
+            lead_obj = None
+            if isinstance(lead_val, str) and "-" in lead_val and len(lead_val) == 36:
+                lead_obj = Employee.objects.filter(id=lead_val).first()
+            elif isinstance(lead_val, str) and client_id:
+                lead_obj = Employee.objects.filter(client_id=client_id, name__iexact=lead_val.strip(), deleted_at__isnull=True).first()
+            if lead_obj:
+                if lead_obj.status in ("Terminated", "Resigned"):
+                    raise ValidationFailed(
+                        f"Cannot assign {lead_obj.name} as Team Lead: employee is {lead_obj.status.lower()}.",
+                        field_errors={"lead": ["Team leader must be an active employee."]}
+                    )
+                data["leadId"] = str(lead_obj.id)
+                data["lead"] = lead_obj.name
+            else:
+                data["lead"] = str(lead_val).strip()
+
+        # Approver resolution & eligibility
+        appr_val = data.get("approver") or data.get("approverId")
+        if appr_val:
+            from .models import Employee
+            appr_obj = None
+            if isinstance(appr_val, str) and "-" in appr_val and len(appr_val) == 36:
+                appr_obj = Employee.objects.filter(id=appr_val).first()
+            elif isinstance(appr_val, str) and client_id:
+                appr_obj = Employee.objects.filter(client_id=client_id, name__iexact=appr_val.strip(), deleted_at__isnull=True).first()
+            if appr_obj:
+                if appr_obj.status in ("Terminated", "Resigned"):
+                    raise ValidationFailed(
+                        f"Cannot assign {appr_obj.name} as Default Approver: employee is {appr_obj.status.lower()}.",
+                        field_errors={"approver": ["Approver must be an active employee."]}
+                    )
+                data["approverId"] = str(appr_obj.id)
+                data["approver"] = appr_obj.name
+            else:
+                data["approver"] = str(appr_val).strip()
+
+        # Members / Headcount
+        raw_members = data.get("memberIds") if "memberIds" in data else data.get("members")
+        if isinstance(raw_members, list):
+            valid_ids = []
+            for m in raw_members:
+                m_str = str(m).strip()
+                if not m_str:
+                    continue
+                valid_ids.append(m_str)
+            data["memberIds"] = valid_ids
+            data["headcount"] = len(valid_ids)
+        elif isinstance(raw_members, (int, float)):
+            data["headcount"] = int(raw_members)
+            data["memberIds"] = []
+        elif isinstance(raw_members, str) and raw_members.isdigit():
+            data["headcount"] = int(raw_members)
+            data["memberIds"] = []
+
+        return super().to_internal_value(data)
+
+    def create(self, validated_data):
+        raw_member_ids = validated_data.pop("memberIds", None)
+        request = self.context.get("request")
+        client = getattr(request, "client", None) or getattr(getattr(request, "user", None), "client", None)
+        if not validated_data.get("code") and client:
+            from apps.core.numbering import allocate_number
+            try:
+                validated_data["code"] = allocate_number(client, "TM")
+            except Exception:
+                pass
+
+        instance = super().create(validated_data)
+        if raw_member_ids is not None:
+            from .models import Employee
+            client_id = instance.client_id
+            resolved_employees = []
+            for item in raw_member_ids:
+                if "-" in item and len(item) == 36:
+                    emp = Employee.objects.filter(client_id=client_id, id=item, deleted_at__isnull=True).first()
+                else:
+                    emp = Employee.objects.filter(client_id=client_id, employee_code__iexact=item, deleted_at__isnull=True).first()
+                    if not emp:
+                        emp = Employee.objects.filter(client_id=client_id, name__iexact=item, deleted_at__isnull=True).first()
+                if emp and emp.status not in ("Terminated", "Resigned"):
+                    resolved_employees.append(emp)
+            instance.members.set(resolved_employees)
+            instance.headcount = len(resolved_employees)
+            instance.save(update_fields=["headcount"])
+        return instance
+
+    def update(self, instance, validated_data):
+        raw_member_ids = validated_data.pop("memberIds", None)
+        instance = super().update(instance, validated_data)
+        if raw_member_ids is not None:
+            from .models import Employee
+            client_id = instance.client_id
+            resolved_employees = []
+            for item in raw_member_ids:
+                if "-" in item and len(item) == 36:
+                    emp = Employee.objects.filter(client_id=client_id, id=item, deleted_at__isnull=True).first()
+                else:
+                    emp = Employee.objects.filter(client_id=client_id, employee_code__iexact=item, deleted_at__isnull=True).first()
+                    if not emp:
+                        emp = Employee.objects.filter(client_id=client_id, name__iexact=item, deleted_at__isnull=True).first()
+                if emp and emp.status not in ("Terminated", "Resigned"):
+                    resolved_employees.append(emp)
+            instance.members.set(resolved_employees)
+            instance.headcount = len(resolved_employees)
+            instance.save(update_fields=["headcount"])
+        return instance
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        lead_display = instance.lead_name or (instance.lead.name if instance.lead else "")
+        appr_display = instance.approver_name or (instance.approver.name if instance.approver else "")
+        active_members = instance.members.filter(deleted_at__isnull=True).exclude(status__in=["Terminated", "Resigned"])
+        actual_count = active_members.count()
+        count = actual_count if actual_count > 0 else (instance.headcount or 0)
+
+        team_code = instance.code or getattr(instance, "legacy_id", None) or f"T-{str(instance.id)[:4].upper()}"
+        ret["code"] = team_code
+        ret["teamCode"] = team_code
+        ret["lead"] = lead_display
+        ret["leadName"] = lead_display
+        ret["approver"] = appr_display
+        ret["approverName"] = appr_display
+        ret["members"] = count
+        ret["memberCount"] = count
+        ret["headcount"] = count
+        ret["dept"] = instance.department.name if instance.department else ""
+        ret["departmentId"] = str(instance.department.id) if instance.department else None
+        ret["memberIds"] = [str(m.id) for m in active_members]
+        ret["membersDetail"] = [
+            {
+                "id": str(m.id),
+                "name": m.name,
+                "employeeCode": m.employee_code,
+                "department": m.department.name if m.department else "",
+                "designation": m.designation.name if m.designation else "",
+                "status": m.status,
+            }
+            for m in active_members
+        ]
+        return ret
+
+
+class HrmsSettingsSerializer(serializers.Serializer):
+    companyName = serializers.CharField(required=False, allow_blank=True, max_length=255)
+    workWeek = serializers.CharField(required=False, allow_blank=True, max_length=100)
+    timezone = serializers.CharField(required=False, allow_blank=True, max_length=100)
+    fiscalYearStart = serializers.CharField(required=False, allow_blank=True, max_length=50)
+    probationPeriod = serializers.CharField(required=False, allow_blank=True, max_length=100)
+    noticePeriod = serializers.CharField(required=False, allow_blank=True, max_length=100)
+    allowEmployeeDelegation = serializers.BooleanField(required=False, default=True)
+    requireTwoFactorForAdmin = serializers.BooleanField(required=False, default=True)
+    sandwichRuleEnabled = serializers.BooleanField(required=False, default=True)
+    maxCarryForwardDays = serializers.IntegerField(required=False, min_value=0, max_value=365, default=15)
 
 
 class ApprovalChainSerializer(BaseModelSerializer):
+    module = serializers.CharField(source="applies_to", required=False, allow_blank=True)
+    tier1 = serializers.CharField(required=False, allow_blank=True)
+    tier2 = serializers.CharField(required=False, allow_blank=True)
+    tier3 = serializers.CharField(required=False, allow_blank=True)
+    autoEscalateDays = serializers.IntegerField(required=False, allow_null=True)
+
     class Meta:
         model = ApprovalChain
-        fields = ["id", "name", "applies_to", "steps", "status", "created_at"]
+        fields = [
+            "id", "name", "applies_to", "module", "tier1", "tier2", "tier3",
+            "autoEscalateDays", "steps", "status", "created_at"
+        ]
+        extra_kwargs = {
+            "name": {"required": False},
+            "applies_to": {"required": False},
+        }
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        from .workflow_service import normalize_module_name
+
+        raw_module = data.get("module") or data.get("applies_to") or "General"
+        canonical = normalize_module_name(raw_module)
+        data["applies_to"] = canonical
+        if not data.get("name"):
+            data["name"] = f"{canonical} Approval Chain"
+
+        if data.get("steps") and isinstance(data["steps"], list):
+            steps = []
+            for idx, s in enumerate(data["steps"]):
+                if isinstance(s, dict) and s.get("role"):
+                    tier = s.get("tier") or s.get("level") or (idx + 1)
+                    auto_esc = s.get("autoEscalateDays") or data.get("autoEscalateDays") or 3
+                    steps.append({
+                        "tier": int(tier),
+                        "role": str(s["role"]).strip(),
+                        "autoEscalateDays": int(auto_esc),
+                    })
+            if steps:
+                data["steps"] = sorted(steps, key=lambda x: x["tier"])
+
+        elif data.get("tier1") or data.get("tier2"):
+            steps = []
+            if data.get("tier1"):
+                steps.append({
+                    "tier": 1,
+                    "role": data["tier1"],
+                    "autoEscalateDays": int(data.get("autoEscalateDays") or 3),
+                })
+            if data.get("tier2"):
+                steps.append({"tier": 2, "role": data["tier2"]})
+            if data.get("tier3") and data["tier3"] not in ("—", "-"):
+                steps.append({"tier": 3, "role": data["tier3"]})
+            data["steps"] = steps
+
+        return super().to_internal_value(data)
+
+    def validate(self, attrs):
+        steps = attrs.get("steps") or (self.instance.steps if self.instance else [])
+        if not steps:
+            raise ValidationFailed({"steps": ["At least one approval step or Tier 1 approver is required."]})
+        return attrs
+
+    def create(self, validated_data):
+        for k in ["tier1", "tier2", "tier3", "autoEscalateDays"]:
+            validated_data.pop(k, None)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        for k in ["tier1", "tier2", "tier3", "autoEscalateDays"]:
+            validated_data.pop(k, None)
+        return super().update(instance, validated_data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        steps = instance.steps if isinstance(instance.steps, list) else []
+        t1 = next((s.get("role") for s in steps if s.get("tier") == 1 or s.get("level") == 1), "")
+        if not t1 and steps:
+            t1 = steps[0].get("role", "")
+        t2 = next((s.get("role") for s in steps if s.get("tier") == 2 or s.get("level") == 2), "")
+        if not t2 and len(steps) > 1:
+            t2 = steps[1].get("role", "")
+        t3 = next((s.get("role") for s in steps if s.get("tier") == 3 or s.get("level") == 3), "—")
+        if (not t3 or t3 in ("—", "-")) and len(steps) > 2:
+            t3 = steps[2].get("role", "—")
+        esc = next((s.get("autoEscalateDays") for s in steps if s.get("autoEscalateDays")), 3)
+
+        ret["module"] = instance.applies_to or instance.name
+        ret["tier1"] = t1 or "Direct Line Manager"
+        ret["tier2"] = t2 or "Department Head"
+        ret["tier3"] = t3 or "—"
+        ret["autoEscalateDays"] = esc
+        return ret
 
 
 class TerminationSerializer(BaseModelSerializer):
-    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee", required=False, allow_null=True)
     employeeName = serializers.CharField(source="employee.name", read_only=True)
+    employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
+    employee = serializers.CharField(source="employee.name", read_only=True)
+    dept = serializers.CharField(source="employee.department.name", read_only=True)
+    role = serializers.CharField(source="employee.designation.name", read_only=True)
+    terminationType = serializers.CharField(source="termination_type", required=False, allow_blank=True)
+    noticeDate = serializers.DateField(source="notice_date", required=False, allow_null=True)
+    exitDate = serializers.DateField(source="last_working_day", required=False, allow_null=True)
     lastWorkingDay = serializers.DateField(
         source="last_working_day", required=False, allow_null=True
     )
+    severance = serializers.CharField(required=False, allow_blank=True)
+    letterContent = serializers.JSONField(source="letter_content", required=False, allow_null=True)
+    currentStep = serializers.IntegerField(source="current_step", read_only=True)
+    approvalChainId = serializers.CharField(source="approval_chain_id", read_only=True)
+    approvalHistory = serializers.JSONField(source="approval_history", read_only=True)
+    approverName = serializers.CharField(source="approver.name", read_only=True, default="")
+    decidedAt = serializers.DateTimeField(source="decided_at", read_only=True)
+    remark = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+    checklist = serializers.SerializerMethodField()
 
     class Meta:
         model = Termination
         fields = [
-            "id", "employeeId", "employeeName", "reason", "lastWorkingDay",
-            "letter_file", "settlement_amount", "status", "created_at",
+            "id", "employeeId", "employeeName", "employeeCode", "employee", "dept", "role",
+            "terminationType", "noticeDate", "exitDate", "lastWorkingDay", "severance",
+            "reason", "letter_file", "letterContent", "settlement_amount", "status",
+            "currentStep", "approvalChainId", "approvalHistory", "approverName", "decidedAt", "remark",
+            "checklist", "created_at",
         ]
+
+    def get_checklist(self, obj):
+        items = obj.checklist.all()
+        return [
+            {
+                "id": str(i.id),
+                "title": i.title,
+                "department": i.department or "General",
+                "notes": i.notes or "",
+                "isCompleted": i.is_completed,
+                "completedAt": i.completed_at.isoformat() if i.completed_at else None,
+                "ownerName": i.owner.name if i.owner else "",
+            }
+            for i in items
+        ]
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        request = self.context.get("request")
+        client_id = getattr(request, "client_id", None) or getattr(getattr(request, "user", None), "client_id", None)
+        if not data.get("employeeId") and data.get("employee") and client_id:
+            from .models import Employee
+            emp_val = str(data["employee"]).strip()
+            emp = Employee.objects.filter(client_id=client_id, name__iexact=emp_val, deleted_at__isnull=True).first()
+            if not emp:
+                emp = Employee.objects.filter(client_id=client_id, employee_code__iexact=emp_val, deleted_at__isnull=True).first()
+            if emp:
+                data["employeeId"] = str(emp.id)
+
+        if "exitDate" in data and "lastWorkingDay" not in data:
+            data["lastWorkingDay"] = data["exitDate"]
+        if "terminationType" in data and "termination_type" not in data:
+            data["termination_type"] = data["terminationType"]
+        if "noticeDate" in data and "notice_date" not in data:
+            data["notice_date"] = data["noticeDate"]
+        if "letterContent" in data and "letter_content" not in data:
+            data["letter_content"] = data["letterContent"]
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["employee"] = instance.employee.name if instance.employee else ""
+        ret["employeeCode"] = instance.employee.employee_code if instance.employee else ""
+        ret["dept"] = instance.employee.department.name if instance.employee and instance.employee.department else ""
+        ret["role"] = instance.employee.designation.name if instance.employee and instance.employee.designation else ""
+        ret["terminationType"] = instance.termination_type or "Performance / Restructuring"
+        ret["exitDate"] = instance.last_working_day.isoformat() if instance.last_working_day else ""
+        ret["noticeDate"] = instance.notice_date.isoformat() if instance.notice_date else ""
+        ret["severance"] = instance.severance or "1 Month Gross Settlement"
+        ret["status"] = instance.status or "In Exit Clearance"
+        return ret
 
 
 class ResignationChecklistItemSerializer(BaseModelSerializer):
+    ownerName = serializers.CharField(source="owner.name", read_only=True, default="")
+    isCompleted = serializers.BooleanField(source="is_completed", required=False)
+    completedAt = serializers.DateTimeField(source="completed_at", read_only=True)
+
     class Meta:
         model = ResignationChecklistItem
-        fields = ["id", "title", "owner", "completed_at"]
+        fields = ["id", "title", "department", "notes", "isCompleted", "completedAt", "owner", "ownerName"]
 
 
 class ResignationSerializer(BaseModelSerializer):
-    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
+    employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee", required=False, allow_null=True)
     employeeName = serializers.CharField(source="employee.name", read_only=True)
-    submittedOn = serializers.DateField(source="submitted_on")
+    employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
+    employee = serializers.CharField(source="employee.name", read_only=True)
+    dept = serializers.CharField(source="employee.department.name", read_only=True)
+    role = serializers.CharField(source="employee.designation.name", read_only=True)
+    submittedOn = serializers.DateField(source="submitted_on", required=False, allow_null=True)
+    submittedDate = serializers.DateField(source="submitted_on", required=False, allow_null=True)
     noticePeriodDays = serializers.IntegerField(source="notice_period_days", required=False)
+    noticePeriod = serializers.CharField(source="notice_period", required=False, allow_blank=True)
     lastWorkingDay = serializers.DateField(
         source="last_working_day", required=False, allow_null=True
     )
+    handoverTo = serializers.CharField(source="handover_name", required=False, allow_blank=True)
+    handoverToId = TenantPrimaryKeyRelatedField(
+        source="handover_to", model="hrms.Employee", required=False, allow_null=True
+    )
     checklist = ResignationChecklistItemSerializer(many=True, read_only=True)
+    currentStep = serializers.IntegerField(source="current_step", read_only=True)
+    approvalChainId = serializers.CharField(source="approval_chain_id", read_only=True)
+    approvalHistory = serializers.JSONField(source="approval_history", read_only=True)
+    approverName = serializers.CharField(source="approver.name", read_only=True, default="")
+    decidedAt = serializers.DateTimeField(source="decided_at", read_only=True)
+    remark = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    noticeWaived = serializers.BooleanField(source="notice_waived", read_only=True)
+    waiverReason = serializers.CharField(source="waiver_reason", read_only=True)
+    originalLastWorkingDay = serializers.DateField(source="original_last_working_day", read_only=True)
 
     class Meta:
         model = Resignation
         fields = [
-            "id", "employeeId", "employeeName", "submittedOn", "noticePeriodDays",
-            "lastWorkingDay", "exit_interview_at", "reason", "status",
-            "checklist", "created_at",
+            "id", "employeeId", "employeeName", "employeeCode", "employee", "dept", "role",
+            "submittedOn", "submittedDate", "noticePeriodDays", "noticePeriod",
+            "lastWorkingDay", "originalLastWorkingDay", "noticeWaived", "waiverReason",
+            "handoverTo", "handoverToId", "exit_interview_at",
+            "reason", "status", "checklist", "currentStep", "approvalChainId", "approvalHistory",
+            "approverName", "decidedAt", "remark", "created_at",
         ]
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        request = self.context.get("request")
+        client_id = getattr(request, "client_id", None) or getattr(getattr(request, "user", None), "client_id", None)
+        emp_obj = None
+        if not data.get("employeeId") and data.get("employee") and client_id:
+            from .models import Employee
+            emp_val = str(data["employee"]).strip()
+            emp_obj = Employee.objects.filter(client_id=client_id, name__iexact=emp_val, deleted_at__isnull=True).first()
+            if not emp_obj:
+                emp_obj = Employee.objects.filter(client_id=client_id, employee_code__iexact=emp_val, deleted_at__isnull=True).first()
+            if emp_obj:
+                data["employeeId"] = str(emp_obj.id)
+        elif data.get("employeeId"):
+            from .models import Employee
+            emp_obj = Employee.objects.filter(id=data["employeeId"]).first()
+
+        if "submittedDate" in data and "submittedOn" not in data:
+            data["submittedOn"] = data["submittedDate"]
+        if not data.get("submittedOn") and not data.get("submitted_on"):
+            today_str = timezone.now().date().isoformat()
+            data["submittedOn"] = today_str
+            data["submitted_on"] = today_str
+
+        # Notice period defaults from employee or HR Admin settings
+        if data.get("noticePeriod"):
+            import re
+            m = re.search(r"\d+", str(data["noticePeriod"]))
+            if m:
+                data["notice_period_days"] = int(m.group(0))
+            data["notice_period"] = str(data["noticePeriod"])
+        elif not data.get("noticePeriodDays") and not data.get("notice_period_days"):
+            if emp_obj and emp_obj.notice_period_days:
+                data["notice_period_days"] = emp_obj.notice_period_days
+                data["notice_period"] = emp_obj.notice_period or f"{emp_obj.notice_period_days} Days"
+            else:
+                from apps.core.models import Setting
+                from .views import DEFAULT_HRMS_SETTINGS
+                from .lifecycle_service import parse_duration_to_days
+                hrms_row = Setting.objects.filter(client_id=client_id, key="hrms").first() if client_id else None
+                cfg = dict(DEFAULT_HRMS_SETTINGS)
+                if hrms_row and isinstance(hrms_row.value, dict):
+                    cfg.update(hrms_row.value)
+                np_str = cfg.get("noticePeriod", "60 Days (2 Months)")
+                data["notice_period"] = np_str
+                data["notice_period_days"] = parse_duration_to_days(np_str, default=60)
+
+        # Calculate last working day if not provided
+        if not data.get("lastWorkingDay") and not data.get("last_working_day"):
+            from .lifecycle_service import calculate_notice_last_working_day
+            from datetime import date
+            sub_dt = data.get("submittedOn") or data.get("submitted_on")
+            if isinstance(sub_dt, str):
+                try:
+                    sub_dt = date.fromisoformat(sub_dt)
+                except ValueError:
+                    sub_dt = timezone.localdate()
+            calc_lwd = calculate_notice_last_working_day(
+                sub_dt, data.get("notice_period_days") or 30, client_id=client_id
+            )
+            data["last_working_day"] = calc_lwd.isoformat()
+            data["lastWorkingDay"] = calc_lwd.isoformat()
+
+        # Handover resolution
+        handover_val = data.get("handoverTo") or data.get("handoverToId")
+        if handover_val:
+            from .models import Employee
+            if isinstance(handover_val, str) and "-" in handover_val and len(handover_val) == 36:
+                data["handoverToId"] = handover_val
+                hand_obj = Employee.objects.filter(id=handover_val).first()
+                if hand_obj:
+                    data["handoverTo"] = hand_obj.name
+            elif isinstance(handover_val, str) and client_id:
+                hand_obj = Employee.objects.filter(client_id=client_id, name__iexact=handover_val.strip(), deleted_at__isnull=True).first()
+                if hand_obj:
+                    data["handoverToId"] = str(hand_obj.id)
+                    data["handoverTo"] = hand_obj.name
+                else:
+                    data["handoverTo"] = handover_val.strip()
+
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["employee"] = instance.employee.name if instance.employee else ""
+        ret["employeeCode"] = instance.employee.employee_code if instance.employee else ""
+        ret["dept"] = instance.employee.department.name if instance.employee and instance.employee.department else ""
+        ret["role"] = instance.employee.designation.name if instance.employee and instance.employee.designation else ""
+        ret["submittedDate"] = instance.submitted_on.isoformat() if instance.submitted_on else ""
+        ret["lastWorkingDay"] = instance.last_working_day.isoformat() if instance.last_working_day else ""
+        ret["originalLastWorkingDay"] = instance.original_last_working_day.isoformat() if instance.original_last_working_day else ""
+        ret["noticeWaived"] = bool(instance.notice_waived)
+        ret["waiverReason"] = instance.waiver_reason or ""
+        ret["noticePeriod"] = instance.notice_period or f"{instance.notice_period_days} Days"
+        ret["handoverTo"] = instance.handover_name or (instance.handover_to.name if instance.handover_to else "Pending Assignment")
+        ret["status"] = instance.status or "Pending Manager Review"
+        return ret
 
 
 class ComplaintSerializer(BaseModelSerializer):
@@ -1365,24 +2656,94 @@ class ComplaintSerializer(BaseModelSerializer):
         required=False, allow_null=True,
     )
     againstName = serializers.SerializerMethodField()
+    complainant = serializers.SerializerMethodField()
+    against = serializers.SerializerMethodField()
+    summary = serializers.CharField(source="description", required=False, allow_blank=True)
+    priority = serializers.CharField(required=False, allow_blank=True)
+    assignedInvestigator = serializers.CharField(source="assigned_investigator_name", required=False, allow_blank=True)
+    filedOn = serializers.DateField(source="filed_on", required=False, allow_null=True)
     isAnonymous = serializers.BooleanField(source="is_anonymous", required=False)
+    currentStep = serializers.IntegerField(source="current_step", read_only=True)
+    approvalChainId = serializers.CharField(source="approval_chain_id", read_only=True)
+    approvalHistory = serializers.JSONField(source="approval_history", read_only=True)
 
     class Meta:
         model = Complaint
         fields = [
-            "id", "raisedBy", "raisedByEmployeeId", "againstEmployeeId",
-            "againstName", "category", "description", "isAnonymous", "status",
-            "assigned_to", "resolution", "resolved_at", "created_at",
+            "id", "raisedBy", "raisedByEmployeeId", "complainant", "againstEmployeeId",
+            "againstName", "against", "category", "description", "summary", "priority",
+            "isAnonymous", "status", "assigned_to", "assignedInvestigator", "filedOn",
+            "resolution", "resolved_at", "comments", "currentStep", "approvalChainId", "approvalHistory",
+            "created_at",
         ]
-        read_only_fields = ["resolved_at", "created_at"]
+        read_only_fields = ["resolved_at", "currentStep", "approvalChainId", "approvalHistory", "created_at"]
 
-    def get_raisedBy(self, complaint):
-        if complaint.is_anonymous:
-            return None
-        return complaint.raised_by_employee.name if complaint.raised_by_employee_id else None
+    def get_raisedBy(self, obj):
+        if obj.is_anonymous:
+            return "Anonymous"
+        return obj.raised_by_employee.name if obj.raised_by_employee else "Anonymous"
 
-    def get_againstName(self, complaint):
-        return complaint.against_employee.name if complaint.against_employee_id else None
+    def get_complainant(self, obj):
+        return self.get_raisedBy(obj)
+
+    def get_againstName(self, obj):
+        return obj.against_employee.name if obj.against_employee else "Management / General"
+
+    def get_against(self, obj):
+        return self.get_againstName(obj)
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        request = self.context.get("request")
+        client_id = getattr(request, "client_id", None) or getattr(getattr(request, "user", None), "client_id", None)
+        from .models import Employee
+
+        # Complainant
+        comp_val = data.get("complainant") or data.get("raisedBy")
+        if comp_val and not data.get("raisedByEmployeeId") and str(comp_val).lower() != "anonymous" and client_id:
+            emp = Employee.objects.filter(client_id=client_id, name__iexact=str(comp_val).strip(), deleted_at__isnull=True).first()
+            if emp:
+                data["raisedByEmployeeId"] = str(emp.id)
+
+        # Against
+        against_val = data.get("against") or data.get("againstName")
+        if against_val and not data.get("againstEmployeeId") and client_id:
+            emp = Employee.objects.filter(client_id=client_id, name__iexact=str(against_val).strip(), deleted_at__isnull=True).first()
+            if emp:
+                data["againstEmployeeId"] = str(emp.id)
+
+        # Investigator
+        inv_val = data.get("assignedInvestigator")
+        if inv_val and not data.get("assigned_investigator_name"):
+            data["assigned_investigator_name"] = str(inv_val).strip()
+
+        if "summary" in data and "description" not in data:
+            data["description"] = data["summary"]
+        if "filedOn" in data and "filed_on" not in data:
+            data["filed_on"] = data["filedOn"]
+        if not data.get("filed_on") and not data.get("filedOn"):
+            data["filed_on"] = timezone.now().date().isoformat()
+
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        import datetime as dt
+        if instance.filed_on and isinstance(instance.filed_on, dt.datetime):
+            instance.filed_on = instance.filed_on.date()
+        ret = super().to_representation(instance)
+        ret["complainant"] = self.get_complainant(instance)
+        ret["raisedBy"] = ret["complainant"]
+        ret["against"] = self.get_against(instance)
+        ret["againstName"] = ret["against"]
+        ret["summary"] = instance.description or ""
+        ret["assignedInvestigator"] = instance.assigned_investigator_name or (
+            (instance.assigned_to.name or instance.assigned_to.email)
+            if instance.assigned_to
+            else "Ethics Committee"
+        )
+        ret["filedOn"] = instance.filed_on.isoformat() if instance.filed_on else (instance.created_at.date().isoformat() if instance.created_at else "")
+        ret["status"] = instance.status or "Open"
+        return ret
 
 
 # ---------------------------------------------------------------------------
@@ -1411,6 +2772,40 @@ class EmployeeTransferSerializer(BaseModelSerializer):
         ]
         read_only_fields = ["transfer_number", "created_at", "updated_at"]
 
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        client_id = self.context.get("client_id")
+        if "employee" in data and "employeeId" not in data:
+            data["employeeId"] = data["employee"]
+
+        to_dept = data.get("toDepartmentId") or data.get("to_department")
+        if to_dept:
+            from apps.hrms.models import Department
+            dept_obj = Department.objects.filter(client_id=client_id, id=to_dept).first() if isinstance(to_dept, str) and len(to_dept) == 36 and "-" in to_dept else None
+            if not dept_obj and isinstance(to_dept, str):
+                dept_obj = Department.objects.filter(client_id=client_id, name__iexact=to_dept.strip()).first()
+                if not dept_obj:
+                    dept_obj = Department.objects.create(client_id=client_id, name=to_dept.strip())
+            if dept_obj:
+                data["toDepartmentId"] = str(dept_obj.id)
+
+        from_dept = data.get("fromDepartmentId") or data.get("from_department")
+        if from_dept:
+            from apps.hrms.models import Department
+            dept_obj = Department.objects.filter(client_id=client_id, id=from_dept).first() if isinstance(from_dept, str) and len(from_dept) == 36 and "-" in from_dept else None
+            if not dept_obj and isinstance(from_dept, str):
+                dept_obj = Department.objects.filter(client_id=client_id, name__iexact=from_dept.strip()).first()
+            if dept_obj:
+                data["fromDepartmentId"] = str(dept_obj.id)
+
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["from_department"] = instance.from_department.name if instance.from_department else ""
+        ret["to_department"] = instance.to_department.name if instance.to_department else ""
+        return ret
+
 
 class EmployeePromotionSerializer(BaseModelSerializer):
     employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
@@ -1431,6 +2826,43 @@ class EmployeePromotionSerializer(BaseModelSerializer):
         ]
         read_only_fields = ["promotion_number", "created_at", "updated_at"]
 
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        client_id = self.context.get("client_id")
+        if "employee" in data and "employeeId" not in data:
+            data["employeeId"] = data["employee"]
+        if "notes" in data and "justification" not in data:
+            data["justification"] = data["notes"]
+
+        to_desig = data.get("toDesignationId") or data.get("new_designation") or data.get("to_designation")
+        if to_desig:
+            from apps.hrms.models import Designation
+            desig_obj = Designation.objects.filter(client_id=client_id, id=to_desig).first() if isinstance(to_desig, str) and len(to_desig) == 36 and "-" in to_desig else None
+            if not desig_obj and isinstance(to_desig, str):
+                desig_obj = Designation.objects.filter(client_id=client_id, title__iexact=to_desig.strip()).first()
+                if not desig_obj:
+                    desig_obj = Designation.objects.create(client_id=client_id, title=to_desig.strip())
+            if desig_obj:
+                data["toDesignationId"] = str(desig_obj.id)
+
+        from_desig = data.get("fromDesignationId") or data.get("previous_designation") or data.get("from_designation")
+        if from_desig:
+            from apps.hrms.models import Designation
+            desig_obj = Designation.objects.filter(client_id=client_id, id=from_desig).first() if isinstance(from_desig, str) and len(from_desig) == 36 and "-" in from_desig else None
+            if not desig_obj and isinstance(from_desig, str):
+                desig_obj = Designation.objects.filter(client_id=client_id, title__iexact=from_desig.strip()).first()
+            if desig_obj:
+                data["fromDesignationId"] = str(desig_obj.id)
+
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["previous_designation"] = instance.from_designation.title if instance.from_designation else ""
+        ret["new_designation"] = instance.to_designation.title if instance.to_designation else ""
+        ret["notes"] = instance.justification or ""
+        return ret
+
 
 class EmployeeWarningSerializer(BaseModelSerializer):
     employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
@@ -1445,6 +2877,40 @@ class EmployeeWarningSerializer(BaseModelSerializer):
             "corrective_action", "status", "employee_explanation", "created_at", "updated_at",
         ]
         read_only_fields = ["warning_number", "created_at", "updated_at"]
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        if "employee" in data and "employeeId" not in data:
+            data["employeeId"] = data["employee"]
+        if "title" in data and "subject" not in data:
+            data["subject"] = data["title"]
+        if "explanation" in data and "description" not in data:
+            data["description"] = data["explanation"]
+        if "warning_date" in data and "issue_date" not in data:
+            data["issue_date"] = data["warning_date"]
+
+        sev = data.get("severity") or data.get("warning_level")
+        if sev:
+            sev_map = {
+                "low": "Verbal",
+                "medium": "First Written",
+                "severe": "Final Written",
+                "verbal": "Verbal",
+                "first written": "First Written",
+                "final written": "Final Written",
+                "suspension": "Suspension",
+            }
+            data["severity"] = sev_map.get(str(sev).lower(), "First Written")
+
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["title"] = instance.subject
+        ret["explanation"] = instance.description
+        ret["warning_date"] = str(instance.issue_date) if instance.issue_date else ""
+        ret["warning_level"] = instance.severity
+        return ret
 
 
 class EmployeeAwardSerializer(BaseModelSerializer):
@@ -1461,11 +2927,34 @@ class EmployeeAwardSerializer(BaseModelSerializer):
         ]
         read_only_fields = ["award_number", "created_at"]
 
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        if "employee" in data and "employeeId" not in data:
+            data["employeeId"] = data["employee"]
+        if "cash_reward" in data and "gift_amount" not in data:
+            data["gift_amount"] = data["cash_reward"]
+        if "presentation_date" in data and "award_date" not in data:
+            data["award_date"] = data["presentation_date"]
+
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        ret["cash_reward"] = instance.gift_amount
+        ret["presentation_date"] = str(instance.award_date) if instance.award_date else ""
+        return ret
+
 
 class TravelRequestSerializer(BaseModelSerializer):
     employeeId = TenantPrimaryKeyRelatedField(source="employee", model="hrms.Employee")
     employeeName = serializers.CharField(source="employee.name", read_only=True)
     employeeCode = serializers.CharField(source="employee.employee_code", read_only=True)
+    currentStep = serializers.IntegerField(source="current_step", read_only=True)
+    approvalChainId = serializers.CharField(source="approval_chain_id", read_only=True)
+    approvalHistory = serializers.JSONField(source="approval_history", read_only=True)
+    approverName = serializers.CharField(source="approver.name", read_only=True, default="")
+    decidedAt = serializers.DateTimeField(source="decided_at", read_only=True)
+    remark = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
     class Meta:
         model = TravelRequest
@@ -1473,9 +2962,38 @@ class TravelRequestSerializer(BaseModelSerializer):
             "id", "travel_number", "employeeId", "employeeName", "employeeCode",
             "purpose", "destination", "start_date", "end_date", "advance_requested",
             "advance_disbursed", "actual_expenses", "settlement_notes", "status",
-            "created_at", "updated_at",
+            "currentStep", "approvalChainId", "approvalHistory", "approverName",
+            "decidedAt", "remark", "created_at", "updated_at",
         ]
-        read_only_fields = ["travel_number", "created_at", "updated_at"]
+        read_only_fields = [
+            "travel_number", "currentStep", "approvalChainId", "approvalHistory",
+            "approverName", "decidedAt", "created_at", "updated_at"
+        ]
+
+    def validate(self, data):
+        data = super().validate(data)
+        start = data.get("start_date")
+        end = data.get("end_date")
+        if start and end and end < start:
+            raise serializers.ValidationError({
+                "end_date": "End date cannot be earlier than start date."
+            })
+
+        emp = data.get("employee")
+        if emp:
+            if emp.status in ("Terminated", "Resigned"):
+                from apps.core.exceptions import Conflict
+                raise Conflict(
+                    f"Cannot create travel requisition for {emp.name}: employee is {emp.status.lower()}.",
+                    code="EMPLOYEE_EXITED",
+                )
+            if emp.last_working_day and start and start > emp.last_working_day:
+                from apps.core.exceptions import Conflict
+                raise Conflict(
+                    f"Travel request starts after employee exit date ({emp.last_working_day}).",
+                    code="EMPLOYEE_EXITED",
+                )
+        return data
 
 
 class AnnouncementSerializer(BaseModelSerializer):
@@ -1487,9 +3005,30 @@ class AnnouncementSerializer(BaseModelSerializer):
         fields = [
             "id", "title", "content", "priority", "targetDepartmentId",
             "targetDepartmentName", "is_pinned", "publish_date", "expiry_date",
-            "author_name", "created_at", "updated_at",
+            "author_name", "status", "created_at", "updated_at",
         ]
         read_only_fields = ["created_at", "updated_at"]
+
+    def validate(self, data):
+        data = super().validate(data)
+        pub = data.get("publish_date")
+        exp = data.get("expiry_date")
+        if pub and exp and exp < pub:
+            raise serializers.ValidationError({
+                "expiry_date": "Announcement expiry date cannot be prior to publish date."
+            })
+        return data
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        p = data.get("priority")
+        if p and isinstance(p, str):
+            p_clean = p.strip().lower()
+            if p_clean in ("urgent", "high", "medium", "low"):
+                data["priority"] = p_clean.capitalize()
+            elif p_clean == "normal":
+                data["priority"] = "Medium"
+        return super().to_internal_value(data)
 
 
 class MeetingRoomSerializer(BaseModelSerializer):

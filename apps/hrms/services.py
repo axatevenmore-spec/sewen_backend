@@ -54,11 +54,45 @@ DEFAULT_FLEXIBILITY = {
 
 def flexibility_policy(client_id):
     from apps.core.models import Setting
+    import re
 
     row = Setting.objects.filter(client_id=client_id, key="attendance_flexibility").first()
     policy = dict(DEFAULT_FLEXIBILITY)
     if row and isinstance(row.value, dict):
-        policy.update(row.value)
+        raw = row.value
+        policy.update(raw)
+
+        # Normalize frontend keys if present
+        if "gracePeriod" in raw and raw["gracePeriod"]:
+            m = re.search(r"(\d+)", str(raw["gracePeriod"]))
+            if m:
+                policy["graceMinutes"] = int(m.group(1))
+
+        if "halfDayThreshold" in raw and raw["halfDayThreshold"]:
+            m = re.search(r"(\d+(\.\d+)?)", str(raw["halfDayThreshold"]))
+            if m:
+                policy["halfDayThresholdHours"] = float(m.group(1))
+
+        if "minimumWorkingHours" in raw and raw["minimumWorkingHours"]:
+            m = re.search(r"(\d+(\.\d+)?)", str(raw["minimumWorkingHours"]))
+            if m:
+                policy["fullDayHours"] = float(m.group(1))
+
+        if "flexibleWorkingHours" in raw and raw["flexibleWorkingHours"]:
+            times = re.findall(r"(\d{1,2}:\d{2})", str(raw["flexibleWorkingHours"]))
+            if len(times) >= 1:
+                policy["shiftStart"] = times[0]
+            if len(times) >= 2:
+                policy["shiftEnd"] = times[1]
+
+        if "lateAfter" in raw and raw["lateAfter"]:
+            policy["lateAfter"] = str(raw["lateAfter"])[:5]
+
+        if "overtimeStartsAfter" in raw and raw["overtimeStartsAfter"]:
+            m = re.search(r"(\d+(\.\d+)?)", str(raw["overtimeStartsAfter"]))
+            if m:
+                policy["overtimeStartsAfterHours"] = float(m.group(1))
+
     return policy
 
 
@@ -70,10 +104,128 @@ def _parse_time(value, fallback):
         return fallback
 
 
+def get_employee_schedule(client_id, employee, work_date=None):
+    """Resolve an employee's applicable WorkSchedule with precedence:
+    1. Direct Employee.work_schedule
+    2. Department.work_schedules (active)
+    3. Team.work_schedules (active)
+    4. Tenant default WorkSchedule (is_default=True, active)
+    5. Fallback to None (caller falls back to flexibility_policy)
+    """
+    from apps.hrms.models import WorkSchedule, Employee
+
+    if employee is None:
+        return WorkSchedule.objects.filter(
+            client_id=client_id, is_default=True, status="Active", deleted_at__isnull=True
+        ).first()
+
+    if isinstance(employee, (int, str)):
+        employee = Employee.objects.filter(client_id=client_id, pk=employee, deleted_at__isnull=True).first()
+        if not employee:
+            return None
+
+    def _is_active_on_date(sched):
+        if not sched or sched.status != "Active":
+            return False
+        if work_date:
+            if sched.effective_from and work_date < sched.effective_from:
+                return False
+            if sched.effective_to and work_date > sched.effective_to:
+                return False
+        return True
+
+    # 1. Direct assignment
+    if employee.work_schedule and _is_active_on_date(employee.work_schedule):
+        return employee.work_schedule
+
+    # 2. Department assignment
+    if employee.department_id:
+        dept_sched = WorkSchedule.objects.filter(
+            client_id=client_id, department_id=employee.department_id, status="Active", deleted_at__isnull=True
+        ).first()
+        if _is_active_on_date(dept_sched):
+            return dept_sched
+
+    # 3. Team assignment
+    team_ids = []
+    if hasattr(employee, "teams"):
+        team_ids.extend(list(employee.teams.values_list("id", flat=True)))
+    if hasattr(employee, "led_teams"):
+        team_ids.extend(list(employee.led_teams.values_list("id", flat=True)))
+    if team_ids:
+        team_sched = WorkSchedule.objects.filter(
+            client_id=client_id, team_id__in=team_ids, status="Active", deleted_at__isnull=True
+        ).first()
+        if _is_active_on_date(team_sched):
+            return team_sched
+
+    # 4. Default schedule
+    default_sched = WorkSchedule.objects.filter(
+        client_id=client_id, is_default=True, status="Active", deleted_at__isnull=True
+    ).first()
+    if _is_active_on_date(default_sched):
+        return default_sched
+
+    return None
+
+
+def is_employee_holiday(client_id, date, employee=None):
+    """Check if date is a published holiday for tenant and employee scope."""
+    from apps.hrms.models import Holiday, Employee
+    qs = Holiday.objects.filter(
+        client_id=client_id,
+        date=date,
+        status="Published",
+        deleted_at__isnull=True,
+    )
+    if not qs.exists():
+        return False
+
+    if employee is None:
+        return True
+
+    if isinstance(employee, (int, str)):
+        employee = Employee.objects.filter(client_id=client_id, pk=employee).first()
+
+    # If any published holiday on this date is global (no location and no department)
+    if qs.filter(location__isnull=True, department__isnull=True).exists():
+        return True
+
+    # Or matches employee's location or department
+    if employee:
+        if employee.location_id and qs.filter(location_id=employee.location_id).exists():
+            return True
+        if employee.department_id and qs.filter(department_id=employee.department_id).exists():
+            return True
+
+    return False
+
+
+def is_employee_weekly_off(client_id, date, employee=None, schedule=None):
+    """Check if date is a weekly off day for the employee's schedule."""
+    if schedule is None:
+        schedule = get_employee_schedule(client_id, employee, work_date=date)
+
+    weekday = date.weekday()
+    if schedule and schedule.weekly_offs is not None and len(schedule.weekly_offs) > 0:
+        return weekday in schedule.weekly_offs
+
+    if schedule and schedule.working_days is not None and len(schedule.working_days) > 0:
+        return weekday not in schedule.working_days
+
+    # Fallback to WorkingDay model config or standard Mon-Fri (5=Sat, 6=Sun)
+    from apps.hrms.models import WorkingDay
+    wd = WorkingDay.objects.filter(client_id=client_id, weekday=weekday, deleted_at__isnull=True).first()
+    if wd is not None:
+        return not wd.is_working
+
+    return weekday in (5, 6)
+
+
 # ---------------------------------------------------------------------------
 # Attendance (api.md §11.2)
 # ---------------------------------------------------------------------------
-def derive_attendance(client_id, *, check_in, check_out, submitted_status=None):
+def derive_attendance(client_id, *, check_in, check_out, submitted_status=None, employee=None, work_date=None):
     """``hours`` plus the Late / Half Day determination, applied server-side.
 
     An explicitly-submitted non-working status (Absent, On Leave, Holiday,
@@ -83,8 +235,18 @@ def derive_attendance(client_id, *, check_in, check_out, submitted_status=None):
     if submitted_status in ("Absent", "On Leave", "Holiday", "Week Off"):
         return submitted_status, None
 
+    schedule = get_employee_schedule(client_id, employee, work_date=work_date)
+    policy = flexibility_policy(client_id)
+
     if check_in is None:
-        return submitted_status or "Absent", None
+        if submitted_status:
+            return submitted_status, None
+        if work_date:
+            if is_employee_holiday(client_id, work_date, employee):
+                return "Holiday", None
+            if is_employee_weekly_off(client_id, work_date, employee, schedule=schedule):
+                return "Week Off", None
+        return "Absent", None
 
     hours = None
     if check_out is not None:
@@ -96,27 +258,28 @@ def derive_attendance(client_id, *, check_in, check_out, submitted_status=None):
                 field_errors={"checkOut": ["Must be after check-in."]},
             )
 
-    if submitted_status == "WFH":
-        return "WFH", hours
+    if submitted_status in ("WFH", "On Leave", "Absent", "Half Day"):
+        return submitted_status, hours
 
-    policy = flexibility_policy(client_id)
-    shift_start = _parse_time(policy.get("shiftStart"), time(9, 30))
+    shift_start = (schedule.shift_start if schedule else None) or _parse_time(policy.get("shiftStart"), time(9, 30))
     grace = int(policy.get("graceMinutes") or 0)
     half_day_threshold = Decimal(str(policy.get("halfDayThresholdHours") or 4))
-    full_day_hours = Decimal(str(policy.get("fullDayHours") or 8))
+    full_day_hours = Decimal(str(schedule.working_hours if schedule else (policy.get("fullDayHours") or 8)))
 
     if hours is not None:
         if hours < half_day_threshold:
             return "Half Day", hours
         if hours < full_day_hours:
-            # Short of a full day but past the half-day threshold still counts
-            # as a present day; the shortfall shows in `hours`.
             pass
 
     local_check_in = timezone.localtime(check_in) if timezone.is_aware(check_in) else check_in
-    latest_on_time = (
-        datetime.combine(local_check_in.date(), shift_start) + timedelta(minutes=grace)
-    )
+    if policy.get("lateAfter"):
+        late_cutoff = _parse_time(policy.get("lateAfter"), shift_start)
+        latest_on_time = datetime.combine(local_check_in.date(), late_cutoff)
+    else:
+        latest_on_time = (
+            datetime.combine(local_check_in.date(), shift_start) + timedelta(minutes=grace)
+        )
     if local_check_in.replace(tzinfo=None) > latest_on_time:
         return "Late", hours
 
@@ -128,7 +291,21 @@ def mark_attendance(
     *, client, employee, work_date, check_in=None, check_out=None, status=None,
     remark=None, source="manual", user=None, leave_request=None,
 ):
-    """Upsert against the one-row-per-employee-per-day constraint (db.md §11.2)."""
+    client_id = getattr(client, "id", client)
+    emp = employee if hasattr(employee, "status") else Employee.objects.filter(pk=employee).first()
+    if emp and emp.status in ("Terminated", "Resigned") and not leave_request:
+        from apps.hrms.models import Resignation, Termination
+        exit_rec = (
+            Resignation.objects.filter(client_id=client_id, employee=emp, status__in=["Completed", "Relieved & Completed", "Approved", "Exit Clearance Completed"]).first() or
+            Termination.objects.filter(client_id=client_id, employee=emp, status__in=["Completed", "Settled", "Approved", "In Exit Clearance"]).first()
+        )
+        last_day = getattr(exit_rec, "last_working_day", None) if exit_rec else None
+        if not last_day or work_date > last_day:
+            raise Conflict(
+                f"Cannot mark attendance for {emp.name}: employee is {emp.status.lower()} (effective exit date: {last_day or 'prior to today'}).",
+                code="EMPLOYEE_EXITED",
+            )
+
     if source == "regularization" and status:
         derived_status = status
         hours = None
@@ -141,9 +318,10 @@ def mark_attendance(
             check_in=check_in,
             check_out=check_out,
             submitted_status=status,
+            employee=employee,
+            work_date=work_date,
         )
 
-    client_id = getattr(client, "id", client)
     existing = Attendance.objects.select_for_update().filter(
         client_id=client_id, employee=employee, work_date=work_date
     ).first()
@@ -266,12 +444,13 @@ def calculate_punch_metrics(client_id, employee, work_date, punches=None, now=No
     first_in = next((p for p in punches if p.punch_type == "IN"), None)
     last_out = next((p for p in reversed(punches) if p.punch_type == "OUT"), None)
 
+    schedule = get_employee_schedule(client_id, employee, work_date=work_date)
     policy = flexibility_policy(client_id)
-    shift_start = _parse_time(policy.get("shiftStart"), time(9, 30))
-    shift_end = _parse_time(policy.get("shiftEnd"), time(18, 30))
+    shift_start = (schedule.shift_start if schedule else None) or _parse_time(policy.get("shiftStart"), time(9, 30))
+    shift_end = (schedule.shift_end if schedule else None) or _parse_time(policy.get("shiftEnd"), time(18, 30))
     grace = int(policy.get("graceMinutes") or 0)
     half_day_threshold = Decimal(str(policy.get("halfDayThresholdHours") or 4))
-    full_day_hours = Decimal(str(policy.get("fullDayHours") or 8))
+    full_day_hours = Decimal(str(schedule.working_hours if schedule else (policy.get("fullDayHours") or 8)))
     full_day_seconds = int(full_day_hours * 3600)
 
     late_minutes = 0
@@ -282,7 +461,11 @@ def calculate_punch_metrics(client_id, employee, work_date, punches=None, now=No
             else first_in.punch_time
         )
         shift_start_dt = datetime.combine(local_first_in.date(), shift_start)
-        grace_dt = shift_start_dt + timedelta(minutes=grace)
+        if policy.get("lateAfter"):
+            late_cutoff = _parse_time(policy.get("lateAfter"), shift_start)
+            grace_dt = datetime.combine(local_first_in.date(), late_cutoff)
+        else:
+            grace_dt = shift_start_dt + timedelta(minutes=grace)
         if local_first_in.replace(tzinfo=None) > grace_dt:
             diff = (local_first_in.replace(tzinfo=None) - shift_start_dt).total_seconds()
             late_minutes = max(0, int(diff // 60))
@@ -301,11 +484,18 @@ def calculate_punch_metrics(client_id, employee, work_date, punches=None, now=No
 
     is_early_out = bool(last_out and (early_leaving_minutes > 0 or working_hours < full_day_hours))
 
-    overtime_seconds = max(0, int(total_working_seconds - full_day_seconds))
+    overtime_threshold_hours = Decimal(str(policy.get("overtimeStartsAfterHours") or full_day_hours))
+    overtime_threshold_seconds = int(overtime_threshold_hours * 3600)
+    overtime_seconds = max(0, int(total_working_seconds - overtime_threshold_seconds))
     overtime_hours = round(Decimal(overtime_seconds) / Decimal(3600), 2)
 
     if not punches:
-        status = "Absent"
+        if is_employee_holiday(client_id, work_date, employee):
+            status = "Holiday"
+        elif is_employee_weekly_off(client_id, work_date, employee, schedule=schedule):
+            status = "Week Off"
+        else:
+            status = "Absent"
     elif is_punched_in:
         status = "Late" if late_minutes > 0 else "Present"
     elif working_hours == 0:
@@ -679,24 +869,57 @@ def correct_punch(*, client, employee, work_date, punch_type, punch_time, reason
     return punch, get_today_punch_status(client_id, employee, work_date=work_date)
 
 
-def working_days_in(client_id, start, end, location_id=None):
-    """Working dates in a range, honouring the working-day and holiday config."""
-    config = {
-        row.weekday: row.is_working
-        for row in WorkingDay.objects.filter(client_id=client_id, deleted_at__isnull=True)
-    }
-    holidays = set(
-        Holiday.objects.filter(
-            client_id=client_id, deleted_at__isnull=True, date__gte=start, date__lte=end
-        ).values_list("date", flat=True)
+def working_days_in(client_id, start, end, location_id=None, department_id=None, employee=None):
+    """Working dates in a range, honouring employee/department/tenant work-schedule and published holidays."""
+    schedule = get_employee_schedule(client_id, employee) if employee else None
+    if not schedule and department_id:
+        from apps.hrms.models import WorkSchedule
+        schedule = WorkSchedule.objects.filter(
+            client_id=client_id, department_id=department_id, status="Active", deleted_at__isnull=True
+        ).first()
+    if not schedule:
+        from apps.hrms.models import WorkSchedule
+        schedule = WorkSchedule.objects.filter(
+            client_id=client_id, is_default=True, status="Active", deleted_at__isnull=True
+        ).first()
+
+    weekly_offs = set(schedule.weekly_offs) if (schedule and schedule.weekly_offs) else None
+    working_days_list = set(schedule.working_days) if (schedule and schedule.working_days) else None
+
+    config = {}
+    if weekly_offs is None and working_days_list is None:
+        config = {
+            row.weekday: row.is_working
+            for row in WorkingDay.objects.filter(client_id=client_id, deleted_at__isnull=True)
+        }
+
+    holiday_qs = Holiday.objects.filter(
+        client_id=client_id, deleted_at__isnull=True, status="Published", date__gte=start, date__lte=end
     )
+    loc_id = location_id or (getattr(employee, "location_id", None) if employee else None)
+    dep_id = department_id or (getattr(employee, "department_id", None) if employee else None)
+
+    applicable_holidays = set()
+    for h in holiday_qs:
+        if h.location_id is None and h.department_id is None:
+            applicable_holidays.add(h.date)
+        elif loc_id and h.location_id == loc_id:
+            applicable_holidays.add(h.date)
+        elif dep_id and h.department_id == dep_id:
+            applicable_holidays.add(h.date)
 
     days = []
     current = start
     while current <= end:
         weekday = current.weekday()
-        is_working = config.get(weekday, weekday < 5)  # Mon-Fri by default
-        if is_working and current not in holidays:
+        if weekly_offs is not None:
+            is_working = (weekday not in weekly_offs)
+        elif working_days_list is not None:
+            is_working = (weekday in working_days_list)
+        else:
+            is_working = config.get(weekday, weekday < 5)
+
+        if is_working and current not in applicable_holidays:
             days.append(current)
         current += timedelta(days=1)
     return days
@@ -752,12 +975,12 @@ def attendance_summary(client_id, *, month=None, employee_id=None, department_id
 # ---------------------------------------------------------------------------
 # Leave (api.md §11.3)
 # ---------------------------------------------------------------------------
-def assert_no_overlap(leave_request):
+def assert_no_overlap(leave_request, statuses=("Pending Review", "Delegate Confirmed", "Approved")):
     """db.md §11.3 -- overlapping live requests for the same employee are rejected."""
     clash = LeaveRequest.objects.filter(
         client_id=leave_request.client_id,
         employee_id=leave_request.employee_id,
-        status__in=["Pending Review", "Delegate Confirmed", "Approved"],
+        status__in=statuses,
         from_date__lte=leave_request.to_date,
         to_date__gte=leave_request.from_date,
         deleted_at__isnull=True,
@@ -800,7 +1023,19 @@ def approve_leave(leave_request, *, user=None, remark=None):
             code=Codes.BAD_TARGET,
         )
 
-    assert_no_overlap(leave_request)
+    # When approving, only an already Approved leave request constitutes an overlap error.
+    # Another unapproved / pending request should not block HR from approving this one.
+    assert_no_overlap(leave_request, statuses=("Approved",))
+
+    # Auto-cancel any other pending / unapproved requests that overlapped this now-approved range
+    LeaveRequest.objects.filter(
+        client_id=leave_request.client_id,
+        employee_id=leave_request.employee_id,
+        status__in=["Pending Review", "Delegate Confirmed"],
+        from_date__lte=leave_request.to_date,
+        to_date__gte=leave_request.from_date,
+        deleted_at__isnull=True,
+    ).exclude(pk=leave_request.pk).update(status="Cancelled", remark="Superseded by approved leave")
 
     balance = leave_balance_for(
         leave_request.client_id, leave_request.employee_id, leave_request.leave_type_id,
@@ -854,6 +1089,90 @@ def approve_leave(leave_request, *, user=None, remark=None):
         source_id=leave_request.id,
         created_by=user if getattr(user, "is_authenticated", False) else None,
     )
+
+    # Connect delegate to PMS DelegatedTask & CRM Task
+    if leave_request.delegate_employee_id:
+        try:
+            import logging
+            from apps.pms.models import DelegatedTask
+            from apps.accounts.models import User
+            from apps.core.numbering import allocate_number
+
+            delegate_user = User.objects.filter(
+                client_id=leave_request.client_id,
+                employee_id=leave_request.delegate_employee_id,
+                deleted_at__isnull=True,
+            ).first()
+            if not delegate_user and leave_request.delegate_employee:
+                delegate_user = User.objects.filter(
+                    client_id=leave_request.client_id,
+                    name__iexact=leave_request.delegate_employee.name,
+                    deleted_at__isnull=True,
+                ).first()
+
+            creator_user = user if getattr(user, "is_authenticated", False) else None
+            if not creator_user:
+                creator_user = User.objects.filter(
+                    client_id=leave_request.client_id,
+                    employee_id=leave_request.employee_id,
+                    deleted_at__isnull=True,
+                ).first() or delegate_user
+
+            if delegate_user and creator_user:
+                existing_pms = DelegatedTask.objects.filter(
+                    client_id=leave_request.client_id,
+                    assigned_to=delegate_user,
+                    due_date=leave_request.to_date,
+                    title__contains=leave_request.employee.name,
+                    deleted_at__isnull=True,
+                ).first()
+                if not existing_pms:
+                    DelegatedTask.objects.create(
+                        client_id=leave_request.client_id,
+                        task_number=allocate_number(leave_request.client, "DEL"),
+                        title=f"Leave Coverage: {leave_request.employee.name} ({leave_request.from_date} to {leave_request.to_date})",
+                        description=f"Coverage handover delegated during leave: {leave_request.reason or 'General coverage'}",
+                        delegated_by=creator_user,
+                        assigned_to=delegate_user,
+                        priority="High",
+                        due_date=leave_request.to_date,
+                        status="Pending",
+                    )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("Failed to create PMS delegated task: %s", e)
+
+        try:
+            from apps.crm.models import Task as CrmTask, Lead, Deal
+            first_lead = Lead.objects.filter(client_id=leave_request.client_id, deleted_at__isnull=True).first()
+            first_deal = Deal.objects.filter(client_id=leave_request.client_id, deleted_at__isnull=True).first()
+            parent_lead = first_lead
+            parent_deal = first_deal if not parent_lead else None
+
+            if delegate_user:
+                existing_crm = CrmTask.objects.filter(
+                    client_id=leave_request.client_id,
+                    assignee=delegate_user,
+                    due_date=leave_request.to_date,
+                    title__contains=leave_request.employee.name,
+                    deleted_at__isnull=True,
+                ).first()
+                if not existing_crm:
+                    CrmTask.objects.create(
+                        client_id=leave_request.client_id,
+                        lead=parent_lead,
+                        deal=parent_deal,
+                        title=f"Leave Coverage: Support {leave_request.employee.name} Leads/Deals",
+                        description=f"Coverage delegated from {leave_request.from_date} to {leave_request.to_date}. Handover: {leave_request.reason or 'General client support'}",
+                        assignee=delegate_user,
+                        due_date=leave_request.to_date,
+                        priority="High",
+                        status="Open",
+                        source="Leave Delegation",
+                    )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning("Failed to create CRM coverage task: %s", e)
 
     # Notifications go to logins: the employee's linked user, if they have one.
     # (This used to pass the employee id, which is not a user -- the insert

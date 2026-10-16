@@ -772,10 +772,17 @@ def record_payment_out(
             "Payment amount must be greater than zero.", code="PAYMENT_AMOUNT_INVALID"
         )
     if mode != "Cash" and bank_account is None:
-        raise ValidationFailed(
-            "Choose the bank account this payment was made from.",
-            field_errors={"bankAccountId": ["Required for non-cash payments."]},
+        from apps.accounting.models import BankAccount
+
+        bank_account = (
+            BankAccount.objects.filter(client=client, is_default=True).first()
+            or BankAccount.objects.filter(client=client).first()
         )
+        if bank_account is None:
+            raise ValidationFailed(
+                "Choose the bank account this payment was made from.",
+                field_errors={"bankAccountId": ["Required for non-cash payments."]},
+            )
 
     payment = PaymentOut.objects.create(
         client=client,

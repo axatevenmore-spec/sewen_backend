@@ -37,6 +37,11 @@ class BankAccountSerializer(BaseModelSerializer):
     def get_balance(self, bank_account):
         return getattr(bank_account, "computed_balance", None)
 
+    def validate_account_number(self, value):
+        if value and not str(value).strip().isdigit():
+            raise serializers.ValidationError("Account number must contain only digits.")
+        return value.strip() if value else value
+
 
 class JournalLineSerializer(BaseModelSerializer):
     accountId = TenantPrimaryKeyRelatedField(source="account", queryset=Account.objects.all())
@@ -126,6 +131,7 @@ class BankTransferSerializer(BaseModelSerializer):
 class BudgetSerializer(BaseModelSerializer):
     accountId = TenantPrimaryKeyRelatedField(source="account", queryset=Account.objects.all(), required=False, allow_null=True)
     accountName = serializers.CharField(source="account.name", read_only=True)
+    category = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     actual = serializers.SerializerMethodField()
     variance = serializers.SerializerMethodField()
     percent_consumed = serializers.SerializerMethodField()
@@ -139,6 +145,29 @@ class BudgetSerializer(BaseModelSerializer):
             "alert_threshold_pct", "percent_consumed", "is_alert", "notes",
             "created_at", "updated_at",
         ]
+
+    def to_internal_value(self, data):
+        ret = super().to_internal_value(data)
+        category_name = data.get("category")
+        if category_name and isinstance(category_name, str):
+            client_id = self.context.get("client_id")
+            category_obj, _ = ExpenseCategory.objects.get_or_create(
+                client_id=client_id,
+                name=category_name.strip(),
+                defaults={"is_active": True},
+            )
+            ret["category"] = category_obj
+        elif "category" in data and not data.get("category"):
+            ret["category"] = None
+        return ret
+
+    def to_representation(self, instance):
+        ret = super().to_representation(instance)
+        if instance.category:
+            ret["category"] = instance.category.name
+        else:
+            ret["category"] = ""
+        return ret
 
     def get_actual(self, budget):
         return getattr(budget, "actual_amount", None)

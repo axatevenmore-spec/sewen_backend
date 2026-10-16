@@ -81,6 +81,7 @@ class PartyViewSet(TenantModelViewSet):
         "ledger": [PARTY_FINANCE],
         "summary": [PARTY_FINANCE],
         "documents": [PARTY_FINANCE],
+        "available_credit": [PARTY_FINANCE],
         "write": [PARTY_MAINTAINERS],
     }
 
@@ -156,6 +157,10 @@ class PartyViewSet(TenantModelViewSet):
         invoice_rows = invoices.aggregate(
             lifetime=money_sum("total"), paid=money_sum("amount_paid"), count=Count("id")
         )
+        invoice_list = list(invoices)
+        total_outstanding = round2(sum((inv.balance_due for inv in invoice_list), ZERO))
+        open_invoices_count = sum(1 for inv in invoice_list if inv.balance_due > Decimal("0.01"))
+
         advance = PaymentIn.objects.filter(
             client_id=request.client_id, party=party, status="Active", deleted_at__isnull=True
         ).aggregate(
@@ -167,16 +172,20 @@ class PartyViewSet(TenantModelViewSet):
             invoices.order_by("-doc_date").values_list("doc_date", flat=True).first()
         )
 
+        from apps.sales.services import get_party_available_credit
+        available_credit = get_party_available_credit(request.client_id, party.id)
+
         return Response(
             {
                 "partyId": str(party.id),
                 "name": party.name,
                 "balance": round2(party.balance),
+                "availableCredit": available_credit,
                 "creditLimit": round2(party.credit_limit) if party.credit_limit else None,
-                "outstanding": round2(invoice_rows["lifetime"] - invoice_rows["paid"]),
+                "outstanding": total_outstanding,
                 "lifetimeValue": round2(invoice_rows["lifetime"]),
                 "openOrders": orders.exclude(stage__in=["Invoiced", "Delivered"]).count(),
-                "openInvoices": invoices.exclude(status="Paid").count(),
+                "openInvoices": open_invoices_count,
                 "totalInvoices": invoice_rows["count"],
                 "lastOrderDate": last_order,
                 "lastInvoiceDate": last_invoice,
@@ -185,6 +194,32 @@ class PartyViewSet(TenantModelViewSet):
                 ),
             }
         )
+
+    @action(detail=True, methods=["get"], url_path="available-credit")
+    def available_credit(self, request, pk=None):
+        """``GET /parties/{id}/available-credit/`` -- detailed available credit sources."""
+        from apps.sales.services import get_party_available_credit, get_party_available_credit_sources
+        party = self.get_object()
+        sources = get_party_available_credit_sources(request.client_id, party.id)
+        total = get_party_available_credit(request.client_id, party.id)
+        clean_sources = [
+            {
+                "type": s["type"],
+                "sourceId": str(s["id"]),
+                "reference": s["reference"],
+                "docDate": s["date"],
+                "originalCredit": s["original_credit"],
+                "allocatedCredit": s["allocated_credit"],
+                "unusedCredit": s["unused_credit"],
+            }
+            for s in sources
+        ]
+        return Response({
+            "partyId": str(party.id),
+            "partyName": party.name,
+            "availableCredit": total,
+            "sources": clean_sources,
+        })
 
     @action(detail=True, methods=["get"])
     def documents(self, request, pk=None):
@@ -295,7 +330,7 @@ class PartyViewSet(TenantModelViewSet):
 # Items (api.md §4.2)
 # ---------------------------------------------------------------------------
 class ItemViewSet(TenantModelViewSet):
-    queryset = Item.objects.select_related("category", "vendor", "default_location")
+    queryset = Item.objects.select_related("category", "vendor", "default_location", "image_file")
     serializer_class = ItemSerializer
     audit_entity_type = "Item"
     audit_label_field = "sku"

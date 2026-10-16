@@ -46,6 +46,7 @@ from .models import (
     Department,
     Designation,
     Employee,
+    EMPLOYMENT_TYPES,
     Goal,
     Holiday,
     HrDocument,
@@ -76,7 +77,9 @@ from .models import (
     Trainer,
     Training,
     TrainingParticipant,
+    TRAINING_STAGES,
     WorkingDay,
+    WorkSchedule,
     EmployeeTransfer,
     EmployeePromotion,
     EmployeeWarning,
@@ -106,6 +109,7 @@ from .serializers import (
     EmployeeSerializer,
     GoalSerializer,
     HolidaySerializer,
+    WorkScheduleSerializer,
     HrDocumentSerializer,
     InterviewSerializer,
     JobSerializer,
@@ -170,7 +174,7 @@ def _as_date(value):
 
 def _as_moment(value, day):
     """An ISO datetime, or ``HH:MM`` on ``day``, as an aware datetime."""
-    if not value:
+    if not value or str(value).strip() in ("—", "-", "null", "undefined", ""):
         return None
     from django.utils.dateparse import parse_datetime
 
@@ -180,9 +184,7 @@ def _as_moment(value, day):
         try:
             moment = datetime.combine(day, datetime.strptime(text[:5], "%H:%M").time())
         except ValueError:
-            raise ValidationFailed(
-                f"'{text}' is not a time.", field_errors={"checkIn": ["Use HH:MM."]}
-            )
+            return None
     return timezone.make_aware(moment) if timezone.is_naive(moment) else moment
 
 
@@ -227,6 +229,10 @@ class OwnEmployeeScopeMixin:
         if self.has_team_scope():
             return queryset
         employee_id = getattr(self.request.user, "employee_id", None)
+        if not employee_id and hasattr(self, "_resolve_employee"):
+            resolved = self._resolve_employee(self.request)
+            if resolved:
+                employee_id = resolved.id
         if not employee_id:
             return queryset.none()
         if self.request.method not in ("GET", "HEAD", "OPTIONS"):
@@ -333,7 +339,52 @@ class EmployeeViewSet(TenantModelViewSet):
         "colleagues": [LEAVE_READERS],
         # Every signed-in employee may read their own record.
         "me": [],
+        "confirm_probation": ["edit_staff", "create_staff"],
+        "extend_probation": ["edit_staff", "create_staff"],
+        "evaluate_lifecycle": ["edit_staff", "create_staff"],
     }
+
+    @action(detail=True, methods=["post"], url_path="confirm-probation")
+    def confirm_probation(self, request, pk=None):
+        employee = self.get_object()
+        from . import lifecycle_service
+        from datetime import date
+        eff_date = request.data.get("effectiveDate") or request.data.get("confirmationDate")
+        if isinstance(eff_date, str):
+            try:
+                eff_date = date.fromisoformat(eff_date)
+            except ValueError:
+                eff_date = None
+        remarks = request.data.get("remarks") or request.data.get("reason")
+        updated = lifecycle_service.confirm_employee_probation(
+            employee, user=request.user, effective_date=eff_date, remarks=remarks
+        )
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=True, methods=["post"], url_path="extend-probation")
+    def extend_probation(self, request, pk=None):
+        employee = self.get_object()
+        from . import lifecycle_service
+        from datetime import date
+        ext_days = request.data.get("extensionDays") or request.data.get("days")
+        new_end = request.data.get("newEndDate")
+        if isinstance(new_end, str):
+            try:
+                new_end = date.fromisoformat(new_end)
+            except ValueError:
+                new_end = None
+        reason = request.data.get("reason") or request.data.get("remarks")
+        updated = lifecycle_service.extend_employee_probation(
+            employee, user=request.user, extension_days=ext_days, new_end_date=new_end, reason=reason
+        )
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=False, methods=["post"], url_path="evaluate-lifecycle")
+    def evaluate_lifecycle(self, request):
+        from . import lifecycle_service
+        res = lifecycle_service.evaluate_employee_lifecycle(client_id=request.client_id)
+        return Response(res)
+
 
     @action(detail=False, methods=["get"])
     def me(self, request):
@@ -397,15 +448,44 @@ class EmployeeViewSet(TenantModelViewSet):
         logins = User.objects.filter(
             employee=OuterRef("pk"), deleted_at__isnull=True
         ).exclude(status="Deleted").order_by("created_at")
-        return super().get_queryset().annotate(
+        qs = super().get_queryset().annotate(
             linked_user_id=Subquery(logins.values("id")[:1]),
             linked_user_email=Subquery(logins.values("email")[:1]),
             linked_user_status=Subquery(logins.values("status")[:1]),
             linked_user_role=Subquery(logins.values("role__name")[:1]),
         )
 
+        status_vals = []
+        include_exited = None
+        if hasattr(self, "request") and self.request and hasattr(self.request, "query_params"):
+            status_vals = [s.strip() for s in self.request.query_params.getlist("status") if s.strip()]
+            include_exited = self.request.query_params.get("include_exited")
+
+        if any(s.lower() == "all" for s in status_vals):
+            self.status_field = None
+            return qs
+
+        if not status_vals and str(include_exited).lower() not in ("true", "1", "yes"):
+            # Exclude exited employees from active employee lists by default while preserving historical access
+            qs = qs.exclude(status__in=["Resigned", "Terminated"])
+
+        return qs
+
     @transaction.atomic
     def perform_create(self, serializer):
+        client_id = self.get_client_id()
+        email = (serializer.validated_data.get("email") or "").strip().lower()
+        if email:
+            existing_emp = Employee.objects.filter(
+                client_id=client_id, email__iexact=email, deleted_at__isnull=True
+            ).first()
+            if existing_emp:
+                raise Conflict(
+                    f"An employee with email '{email}' already exists ({existing_emp.employee_code} - {existing_emp.name}).",
+                    code=Codes.ALREADY_EXISTS,
+                    payload={"existingEmployeeId": str(existing_emp.id), "employeeCode": existing_emp.employee_code},
+                )
+
         serializer.validated_data["employee_code"] = allocate_number(
             self.request.user.client, "EMP"
         )
@@ -863,8 +943,10 @@ class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
                     "You can only view your own attendance.", code="view_team_attendance"
                 )
             self.check_own_employee(target)
+        target = self._resolve_employee(request, employee_id) if employee_id else None
+        target_id = target.id if target else employee_id
         rows = Attendance.objects.filter(
-            client_id=request.client_id, employee_id=employee_id, deleted_at__isnull=True
+            client_id=request.client_id, employee_id=target_id, deleted_at__isnull=True
         ).order_by("work_date")
         date_from = request.query_params.get("date_from")
         date_to = request.query_params.get("date_to")
@@ -1212,8 +1294,60 @@ class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
                 serializer.validated_data["employee"] = resolved
                 employee = resolved
         self.check_own_employee(employee)
+
+        from apps.hrms.models import LeaveRequest, Resignation, Termination
+        from apps.core.exceptions import Conflict, Codes
+
+        if employee:
+            if employee.status in ("Terminated", "Resigned"):
+                raise Conflict(
+                    f"Cannot apply for leave for {employee.name}: employee is {employee.status.lower()}.",
+                    code="EMPLOYEE_EXITED",
+                )
+            exit_rec = (
+                Resignation.objects.filter(
+                    client_id=self.request.client_id, employee=employee, deleted_at__isnull=True
+                ).exclude(status="Cancelled").order_by("-created_at").first() or
+                Termination.objects.filter(
+                    client_id=self.request.client_id, employee=employee, deleted_at__isnull=True
+                ).exclude(status="Cancelled").order_by("-created_at").first()
+            )
+            if exit_rec and exit_rec.last_working_day:
+                from_d = serializer.validated_data.get("from_date")
+                to_d = serializer.validated_data.get("to_date")
+                if (from_d and from_d > exit_rec.last_working_day) or (to_d and to_d > exit_rec.last_working_day):
+                    raise Conflict(
+                        f"Leave cannot be requested beyond effective exit date ({exit_rec.last_working_day}).",
+                        code="EMPLOYEE_EXITED",
+                    )
+
+        from_date = serializer.validated_data.get("from_date")
+        to_date = serializer.validated_data.get("to_date")
+        if employee and from_date and to_date:
+            conflict = (
+                LeaveRequest.objects.filter(
+                    client_id=self.request.client_id,
+                    employee=employee,
+                    deleted_at__isnull=True,
+                    status__in=["Pending Review", "Delegate Confirmed", "Approved"],
+                    from_date__lte=to_date,
+                    to_date__gte=from_date,
+                )
+                .order_by("-created_at")
+                .first()
+            )
+            if conflict:
+                raise Conflict(
+                    f"This overlaps an existing leave request ({conflict.from_date} to {conflict.to_date}).",
+                    code=getattr(Codes, "OVERLAPPING_LEAVE", "OVERLAPPING_LEAVE"),
+                )
+
+        if not serializer.validated_data.get("days") and from_date and to_date:
+            serializer.validated_data["days"] = max(1, (to_date - from_date).days + 1)
+
         request_row = super().perform_create(serializer)
-        services.assert_no_overlap(request_row)
+        from . import workflow_service
+        workflow_service.initialize_request_workflow(request_row, "Leave Management", self.request.user)
         return request_row
 
     @transaction.atomic
@@ -1223,31 +1357,75 @@ class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
         target_status = self.request.data.get("status")
         instance = serializer.instance
 
-        if approved is True or target_status == "Approved":
-            from apps.core.permissions import require_permission
+        delegate_id = (
+            self.request.data.get("delegateId")
+            or self.request.data.get("delegate_employee")
+            or self.request.data.get("delegate_employee_id")
+        )
+        if not delegate_id and self.request.data.get("delegate"):
+            from apps.hrms.models import Employee
+            delegate_name = self.request.data.get("delegate")
+            emp = Employee.objects.filter(
+                client_id=self.request.client_id,
+                name__iexact=str(delegate_name).strip(),
+                deleted_at__isnull=True,
+            ).first()
+            if emp:
+                delegate_id = emp.id
 
-            require_permission(self.request.user, "approve_leave")
-            row = services.approve_leave(
-                instance, user=self.request.user, remark=self.request.data.get("remark")
+        if delegate_id:
+            instance.delegate_employee_id = delegate_id
+            instance.save(update_fields=["delegate_employee_id"])
+
+        if approved is True or target_status == "Approved":
+            from . import workflow_service
+            row, _ = workflow_service.process_approval_action(
+                instance, "Leave Management", self.request.user, "approve",
+                remark=self.request.data.get("remark"),
             )
             self._concurrency_instance = row
-            self.write_audit("approve", row, description="Leave approved")
             return row
 
         if approved is False or target_status == "Rejected":
-            from apps.core.permissions import require_permission
-
-            require_permission(self.request.user, "approve_leave")
-            instance.status = "Rejected"
-            instance.approver = self.request.user
-            instance.decided_at = timezone.now()
-            instance.remark = self.request.data.get("remark")
-            instance.save()
-            self._concurrency_instance = instance
-            self.write_audit("reject", instance, description=instance.remark)
-            return instance
+            from . import workflow_service
+            row, _ = workflow_service.process_approval_action(
+                instance, "Leave Management", self.request.user, "reject",
+                remark=self.request.data.get("remark"),
+            )
+            self._concurrency_instance = row
+            return row
 
         return super().perform_update(serializer)
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        instance = self.get_object()
+        from . import workflow_service
+        updated, _ = workflow_service.process_approval_action(
+            instance, "Leave Management", request.user, "approve",
+            remark=request.data.get("remark"),
+        )
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        instance = self.get_object()
+        from . import workflow_service
+        updated, _ = workflow_service.process_approval_action(
+            instance, "Leave Management", request.user, "reject",
+            remark=request.data.get("remark"),
+        )
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=True, methods=["post"])
+    def resubmit(self, request, pk=None):
+        instance = self.get_object()
+        from . import workflow_service
+        updated, _ = workflow_service.process_approval_action(
+            instance, "Leave Management", request.user, "resubmit",
+            remark=request.data.get("remark"),
+        )
+        return Response(self.get_serializer(updated).data)
 
     @action(detail=True, methods=["post"])
     def cancel(self, request, pk=None):
@@ -1287,11 +1465,21 @@ class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
         leave_type = LeaveType.objects.filter(id=leave_type_id, client_id=request.client_id).first() if leave_type_id else None
         enforce_sandwich = bool(leave_type and leave_type.enforce_sandwich_rule)
 
-        holidays = set(Holiday.objects.filter(
-            client_id=request.client_id,
-            date__gte=start,
-            date__lte=end
-        ).values_list("date", flat=True))
+        from apps.core.models import Setting
+        hrms_settings = Setting.objects.filter(client_id=request.client_id, key="hrms").first()
+        org_sandwich = (hrms_settings.value.get("sandwichRuleEnabled", True) if hrms_settings and isinstance(hrms_settings.value, dict) else True)
+        enforce_sandwich = bool(enforce_sandwich and org_sandwich)
+
+        employee_id = request.data.get("employeeId") or request.data.get("employee_id")
+        employee = None
+        if employee_id:
+            from .models import Employee
+            employee = Employee.objects.filter(client_id=request.client_id, pk=employee_id, deleted_at__isnull=True).first()
+        elif getattr(request.user, "employee_id", None):
+            from .models import Employee
+            employee = Employee.objects.filter(client_id=request.client_id, pk=request.user.employee_id, deleted_at__isnull=True).first()
+
+        schedule = services.get_employee_schedule(request.client_id, employee)
 
         total_calendar_days = (end - start).days + 1
         day_breakdown = []
@@ -1300,8 +1488,8 @@ class LeaveRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
 
         curr = start
         while curr <= end:
-            is_weekend = curr.weekday() in (5, 6)
-            is_holiday = curr in holidays
+            is_weekend = services.is_employee_weekly_off(request.client_id, curr, employee, schedule=schedule)
+            is_holiday = services.is_employee_holiday(request.client_id, curr, employee)
             is_off = is_weekend or is_holiday
             if not is_off:
                 working_days += 1
@@ -1535,7 +1723,7 @@ class JobViewSet(TenantModelViewSet):
     status_field = "status"
     search_fields = ["title", "description"]
     ordering = ["-created_at"]
-    filter_map = {"departmentId": "department_id", "isPublished": "is_published"}
+    filter_map = {"departmentId": "department_id", "isPublished": "is_published", "status": "status"}
     permission_map = {"read": ["view_staff"], "write": ["create_staff"]}
 
     def get_queryset(self):
@@ -1568,6 +1756,191 @@ class JobViewSet(TenantModelViewSet):
         return Response(self.get_serializer(job).data)
 
 
+def hire_candidate_to_employee(candidate, user=None, client_id=None):
+    """
+    Unified transactional helper to convert candidate -> employee.
+    Idempotent: prevents duplicate employee creation across retries and concurrent calls.
+    Maps: name, email, phone, joining date, department, designation, location, employment type, salary, manager.
+    """
+    if candidate.employee_id:
+        return candidate.employee
+
+    client_id = client_id or candidate.client_id
+    existing_emp = None
+    if candidate.email:
+        existing_emp = Employee.objects.filter(
+            client_id=client_id, email__iexact=candidate.email.strip(), deleted_at__isnull=True
+        ).first()
+    if not existing_emp and candidate.phone:
+        existing_emp = Employee.objects.filter(
+            client_id=client_id, phone=candidate.phone.strip(), deleted_at__isnull=True
+        ).first()
+
+    if existing_emp:
+        candidate.employee = existing_emp
+        candidate.stage = "Hired"
+        candidate.is_onboarded = True
+        candidate.save(update_fields=["employee", "stage", "is_onboarded", "updated_at"])
+        return existing_emp
+
+    # Resolve latest offer
+    offer = (
+        Offer.objects.filter(
+            Q(candidate=candidate) | Q(application__candidate=candidate),
+            status="Accepted",
+            deleted_at__isnull=True,
+        )
+        .order_by("-created_at")
+        .first()
+    )
+    if not offer:
+        offer = (
+            Offer.objects.filter(
+                Q(candidate=candidate) | Q(application__candidate=candidate),
+                deleted_at__isnull=True,
+            )
+            .order_by("-created_at")
+            .first()
+        )
+
+    # Resolve application and job
+    application = (
+        Application.objects.filter(candidate=candidate, deleted_at__isnull=True)
+        .select_related("job", "job__department", "job__designation", "job__location")
+        .order_by("-applied_at")
+        .first()
+    )
+
+    # Resolve Department
+    dept_obj = None
+    if application and application.job and application.job.department:
+        dept_obj = application.job.department
+    elif offer and offer.department:
+        dept_obj = Department.objects.filter(
+            client_id=client_id, name__iexact=str(offer.department).strip(), deleted_at__isnull=True
+        ).first()
+
+    # Resolve Designation
+    desig_obj = None
+    if application and application.job and application.job.designation:
+        desig_obj = application.job.designation
+    elif offer and offer.position:
+        desig_obj = Designation.objects.filter(
+            client_id=client_id, name__iexact=str(offer.position).strip(), deleted_at__isnull=True
+        ).first()
+
+    # Resolve Location
+    loc_obj = None
+    if application and application.job and application.job.location:
+        loc_obj = application.job.location
+    elif offer and offer.location:
+        loc_obj = Location.objects.filter(
+            client_id=client_id, name__iexact=str(offer.location).strip(), deleted_at__isnull=True
+        ).first()
+
+    # Resolve Reporting Manager
+    mgr_obj = None
+    if offer and offer.reporting_manager:
+        mgr_name = str(offer.reporting_manager).strip()
+        mgr_obj = Employee.objects.filter(
+            client_id=client_id, deleted_at__isnull=True
+        ).filter(Q(name__iexact=mgr_name) | Q(employee_code__iexact=mgr_name)).first()
+    hiring_mgr = getattr(application.job, "hiring_manager", None) if application and application.job else None
+    if not mgr_obj and hiring_mgr:
+        hm_name = str(hiring_mgr).strip()
+        mgr_obj = Employee.objects.filter(
+            client_id=client_id, deleted_at__isnull=True
+        ).filter(Q(name__iexact=hm_name) | Q(employee_code__iexact=hm_name)).first()
+
+    # Calculate salary
+    salary = ZERO
+    if offer and offer.offered_ctc:
+        salary = offer.offered_ctc / 12
+    elif application and application.job and application.job.salary_range:
+        pass
+
+    # Resolve employment type
+    emp_type = None
+    if offer and offer.job_type in dict(EMPLOYMENT_TYPES):
+        emp_type = offer.job_type
+    elif application and application.job and application.job.employment_type in dict(EMPLOYMENT_TYPES):
+        emp_type = application.job.employment_type
+    else:
+        emp_type = "Full-time"
+
+    client_obj = getattr(user, "client", None)
+    if not client_obj:
+        from apps.accounts.models import Client
+        client_obj = Client.objects.filter(pk=client_id).first()
+
+    from apps.core.models import Setting
+    from .lifecycle_service import calculate_probation_end_date, parse_duration_to_days
+
+    hrms_row = Setting.objects.filter(client_id=client_id, key="hrms").first()
+    hrms_config = dict(DEFAULT_HRMS_SETTINGS)
+    if hrms_row and isinstance(hrms_row.value, dict):
+        hrms_config.update(hrms_row.value)
+
+    probation_cfg = (offer.probation_period if offer and offer.probation_period else None) or hrms_config.get("probationPeriod", "90 Days (3 Months)")
+    notice_cfg = hrms_config.get("noticePeriod", "60 Days (2 Months)")
+    joining_dt = offer.joining_date if offer and offer.joining_date else timezone.localdate()
+    prob_end_dt = calculate_probation_end_date(joining_dt, probation_cfg)
+    notice_days = parse_duration_to_days(notice_cfg, default=60)
+
+    employee = Employee.objects.create(
+        client_id=client_id,
+        employee_code=allocate_number(client_obj, "EMP"),
+        name=candidate.name,
+        email=candidate.email,
+        phone=candidate.phone,
+        joining_date=joining_dt,
+        department=dept_obj,
+        designation=desig_obj,
+        location=loc_obj,
+        manager=mgr_obj,
+        employment_type=emp_type,
+        standard_salary=salary,
+        status="Probation",
+        probation_start_date=joining_dt,
+        probation_period=probation_cfg,
+        probation_end_date=prob_end_dt,
+        confirmation_status="On Probation",
+        notice_period=notice_cfg,
+        notice_period_days=notice_days,
+        created_by=user,
+    )
+    candidate.employee = employee
+    candidate.stage = "Hired"
+    candidate.is_onboarded = True
+    candidate.save(update_fields=["employee", "stage", "is_onboarded", "updated_at"])
+
+    if application and application.stage != "Hired":
+        application.stage = "Hired"
+        application.save(update_fields=["stage", "updated_at"])
+
+    if employee.email:
+        from apps.accounts.models import User
+        login = User.objects.filter(
+            client_id=client_id, email=employee.email.strip().lower(),
+            deleted_at__isnull=True,
+        ).first()
+        if login is not None and not user_link.linked_employee(login):
+            login.employee = employee
+            login.save(update_fields=["employee", "updated_at"])
+            user_link.reconcile(login, employee)
+
+    record_audit(
+        client=client_id,
+        actor=user,
+        action="onboard",
+        entity_type="Employee",
+        entity_id=employee.id,
+        entity_label=employee.employee_code,
+        description=f"Hired from candidate {candidate.name}",
+    )
+    return employee
+
+
 class CandidateViewSet(TenantModelViewSet):
     queryset = Candidate.objects.select_related("resume_file", "employee")
     serializer_class = CandidateSerializer
@@ -1576,8 +1949,15 @@ class CandidateViewSet(TenantModelViewSet):
     status_field = "stage"
     search_fields = ["name", "email", "phone"]
     ordering = ["-created_at"]
-    filter_map = {"stage": "stage", "source": "source"}
+    filter_map = {"stage": "stage", "source": "source", "isOnboarded": "is_onboarded"}
     permission_map = {"read": ["view_staff"], "write": ["create_staff"]}
+
+    @action(detail=True, methods=["post"])
+    @transaction.atomic
+    def hire(self, request, pk=None):
+        candidate = self.get_object()
+        employee = hire_candidate_to_employee(candidate, user=request.user, client_id=request.client_id)
+        return Response(EmployeeSerializer(employee).data, status=status.HTTP_201_CREATED)
 
 
 class ApplicationViewSet(TenantModelViewSet):
@@ -1626,29 +2006,141 @@ class InterviewViewSet(TenantModelViewSet):
 
 
 class OfferViewSet(TenantModelViewSet):
-    queryset = Offer.objects.select_related("application", "application__candidate")
+    queryset = Offer.objects.select_related("application", "application__candidate", "candidate", "approval_chain")
     serializer_class = OfferSerializer
     audit_entity_type = "Offer"
     status_field = "status"
     ordering = ["-created_at"]
-    filter_map = {"applicationId": "application_id"}
-    permission_map = {"read": ["view_staff"], "write": ["create_staff"]}
+    filter_map = {"applicationId": "application_id", "candidateId": "candidate_id", "status": "status"}
+    permission_map = {"read": ["view_staff"], "write": ["create_staff", "edit_staff"]}
+
+    def perform_create(self, serializer):
+        initial_status = serializer.validated_data.get("status") or "Draft"
+        if initial_status == "Sent":
+            serializer.validated_data["sent_at"] = timezone.now()
+        elif initial_status in ("Accepted", "Declined"):
+            serializer.validated_data["responded_at"] = timezone.now()
+
+        offer = super().perform_create(serializer)
+
+        candidate = getattr(offer, "candidate", None) or (
+            offer.application.candidate if offer.application else None
+        )
+        if candidate:
+            target_stage = "Hired" if offer.status == "Accepted" else "Offer"
+            if candidate.stage != target_stage:
+                candidate.stage = target_stage
+                candidate.save(update_fields=["stage", "updated_at"])
+            if offer.application and offer.application.stage != target_stage:
+                offer.application.stage = target_stage
+                offer.application.save(update_fields=["stage", "updated_at"])
+
+        from . import workflow_service
+        workflow_service.initialize_request_workflow(offer, "Offer Letters", self.request.user)
+        return offer
 
     def perform_update(self, serializer):
         previous = serializer.instance.status
         offer = super().perform_update(serializer)
         if previous != offer.status:
+            update_fields = ["updated_at"]
             if offer.status == "Sent" and offer.sent_at is None:
                 offer.sent_at = timezone.now()
+                update_fields.append("sent_at")
             if offer.status in ("Accepted", "Declined") and offer.responded_at is None:
                 offer.responded_at = timezone.now()
-            offer.save(update_fields=["sent_at", "responded_at", "updated_at"])
+                update_fields.append("responded_at")
+            offer.save(update_fields=update_fields)
 
-            if offer.status == "Accepted":
-                candidate = offer.application.candidate
-                candidate.stage = "Offer"
-                candidate.save(update_fields=["stage", "updated_at"])
+            candidate = getattr(offer, "candidate", None) or (
+                offer.application.candidate if offer.application else None
+            )
+            if candidate:
+                if offer.status == "Accepted":
+                    candidate.stage = "Hired"
+                    candidate.save(update_fields=["stage", "updated_at"])
+                    if offer.application:
+                        offer.application.stage = "Hired"
+                        offer.application.save(update_fields=["stage", "updated_at"])
+                elif offer.status in ("Sent", "Pending"):
+                    if candidate.stage not in ("Offer", "Hired"):
+                        candidate.stage = "Offer"
+                        candidate.save(update_fields=["stage", "updated_at"])
+                elif offer.status in ("Declined", "Rejected", "Revoked"):
+                    other_offers = Offer.objects.filter(
+                        client_id=offer.client_id,
+                        deleted_at__isnull=True,
+                        status__in=["Sent", "Pending", "Accepted"],
+                    ).filter(Q(candidate=candidate) | Q(application__candidate=candidate)).exclude(pk=offer.pk).exists()
+                    if not other_offers:
+                        candidate.stage = "Rejected"
+                        candidate.save(update_fields=["stage", "updated_at"])
         return offer
+
+    @action(detail=True, methods=["post"])
+    def send_offer(self, request, pk=None):
+        offer = self.get_object()
+        offer.status = "Sent"
+        offer.sent_at = timezone.now()
+        offer.save(update_fields=["status", "sent_at", "updated_at"])
+        candidate = getattr(offer, "candidate", None) or (
+            offer.application.candidate if offer.application else None
+        )
+        if candidate and candidate.stage != "Offer":
+            candidate.stage = "Offer"
+            candidate.save(update_fields=["stage", "updated_at"])
+        self.write_audit(
+            action="send_offer",
+            instance=offer,
+            description=f"Offer letter sent to {offer.candidate_name or 'candidate'}.",
+            after={"status": "Sent", "sent_at": offer.sent_at.isoformat()},
+        )
+        return Response(self.get_serializer(offer).data)
+
+    @action(detail=True, methods=["post"])
+    def accept_offer(self, request, pk=None):
+        offer = self.get_object()
+        offer.status = "Accepted"
+        offer.responded_at = timezone.now()
+        offer.save(update_fields=["status", "responded_at", "updated_at"])
+        candidate = getattr(offer, "candidate", None) or (
+            offer.application.candidate if offer.application else None
+        )
+        if candidate:
+            candidate.stage = "Hired"
+            candidate.save(update_fields=["stage", "updated_at"])
+            if offer.application:
+                offer.application.stage = "Hired"
+                offer.application.save(update_fields=["stage", "updated_at"])
+        self.write_audit(
+            action="accept_offer",
+            instance=offer,
+            description=f"Offer accepted by {offer.candidate_name or 'candidate'}.",
+            after={"status": "Accepted", "responded_at": offer.responded_at.isoformat()},
+        )
+        return Response(self.get_serializer(offer).data)
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        instance = self.get_object()
+        from . import workflow_service
+        updated, is_final = workflow_service.process_approval_action(
+            instance, "Offer Letters", request.user, "approve",
+            remark=request.data.get("remark"),
+            target_status="Sent" if is_final else None,
+        )
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        instance = self.get_object()
+        from . import workflow_service
+        updated, is_final = workflow_service.process_approval_action(
+            instance, "Offer Letters", request.user, "reject",
+            remark=request.data.get("remark") or request.data.get("reason"),
+            target_status="Rejected",
+        )
+        return Response(self.get_serializer(updated).data)
 
     @action(detail=True, methods=["get"])
     def letter(self, request, pk=None):
@@ -1681,68 +2173,11 @@ class OnboardingViewSet(TenantModelViewSet):
         if candidate is None:
             raise NotFound("That candidate no longer exists.")
         if candidate.employee_id:
-            raise Conflict(
-                "This candidate has already been onboarded.",
-                code=Codes.ALREADY_DONE,
-                payload={"employeeId": str(candidate.employee_id)},
+            return Response(
+                EmployeeSerializer(candidate.employee).data, status=status.HTTP_200_OK
             )
 
-        offer = (
-            Offer.objects.filter(
-                application__candidate=candidate, status="Accepted", deleted_at__isnull=True
-            )
-            .order_by("-created_at")
-            .first()
-        )
-        application = (
-            Application.objects.filter(candidate=candidate, deleted_at__isnull=True)
-            .select_related("job")
-            .order_by("-applied_at")
-            .first()
-        )
-
-        employee = Employee.objects.create(
-            client_id=request.client_id,
-            employee_code=allocate_number(request.user.client, "EMP"),
-            name=candidate.name,
-            email=candidate.email,
-            phone=candidate.phone,
-            joining_date=(
-                offer.joining_date if offer and offer.joining_date else timezone.localdate()
-            ),
-            department=application.job.department if application else None,
-            designation=application.job.designation if application else None,
-            location=application.job.location if application else None,
-            employment_type=application.job.employment_type if application else None,
-            standard_salary=(offer.offered_ctc / 12) if offer and offer.offered_ctc else ZERO,
-            status="Probation",
-            created_by=request.user,
-        )
-        candidate.employee = employee
-        candidate.stage = "Hired"
-        candidate.save(update_fields=["employee", "stage", "updated_at"])
-
-        if employee.email:
-            from apps.accounts.models import User
-
-            login = User.objects.filter(
-                client_id=request.client_id, email=employee.email.strip().lower(),
-                deleted_at__isnull=True,
-            ).first()
-            if login is not None and not user_link.linked_employee(login):
-                login.employee = employee
-                login.save(update_fields=["employee", "updated_at"])
-                user_link.reconcile(login, employee)
-
-        record_audit(
-            client=request.client_id,
-            actor=request.user,
-            action="onboard",
-            entity_type="Employee",
-            entity_id=employee.id,
-            entity_label=employee.employee_code,
-            description=f"Onboarded from candidate {candidate.name}",
-        )
+        employee = hire_candidate_to_employee(candidate, user=request.user, client_id=request.client_id)
         return Response(
             EmployeeSerializer(employee).data, status=status.HTTP_201_CREATED
         )
@@ -1758,11 +2193,13 @@ class OnboardingViewSet(TenantModelViewSet):
         ).first()
         if candidate is None:
             raise NotFound("That candidate no longer exists.")
+        candidate.documents_verified = True
+        candidate.save(update_fields=["documents_verified", "updated_at"])
         OnboardingTask.objects.filter(
             client_id=request.client_id, candidate=candidate,
             title__icontains="document", completed_at__isnull=True,
         ).update(completed_at=timezone.now())
-        return Response({"verified": True})
+        return Response({"verified": True, "documentsVerified": True})
 
 
 # Hidden: Screening Questions out of scope (Sweven spec) -- restore by uncommenting this block.
@@ -1788,31 +2225,42 @@ class RecruitmentFunnelView(APIView):
         rows = applications.values("stage").annotate(count=Count("id"))
         funnel = {row["stage"]: row["count"] for row in rows}
 
+        candidates = Candidate.objects.filter(
+            client_id=client_id, deleted_at__isnull=True
+        )
+        cand_rows = candidates.values("stage").annotate(count=Count("id"))
+        cand_funnel = {row["stage"]: row["count"] for row in cand_rows}
+
+        # Combine or fallback if applications table has fewer/no records
+        stages = ["Applied", "Screening", "Shortlisted", "Interview", "Offer", "Hired", "Rejected"]
+        combined_funnel = {}
+        for st in stages:
+            combined_funnel[st] = max(funnel.get(st, 0), cand_funnel.get(st, 0))
+
         if section == "funnel":
             return Response(
                 envelope(
                     [
-                        {"stage": stage, "count": funnel.get(stage, 0)}
-                        for stage in [
-                            "Applied", "Screening", "Interview", "Offer", "Hired", "Rejected",
-                        ]
+                        {"stage": stage, "count": combined_funnel.get(stage, 0)}
+                        for stage in stages
                     ]
                 )
             )
 
         jobs = Job.objects.filter(client_id=client_id, deleted_at__isnull=True)
+        total_apps = max(applications.count(), candidates.count())
         return Response(
             {
                 "openJobs": jobs.filter(status="Open").count(),
-                "totalApplications": applications.count(),
+                "totalApplications": total_apps,
                 "interviewsScheduled": Interview.objects.filter(
                     client_id=client_id, status="Scheduled", deleted_at__isnull=True
                 ).count(),
                 "offersOut": Offer.objects.filter(
                     client_id=client_id, status="Sent", deleted_at__isnull=True
                 ).count(),
-                "hired": funnel.get("Hired", 0),
-                "funnel": funnel,
+                "hired": combined_funnel.get("Hired", 0),
+                "funnel": combined_funnel,
             }
         )
 
@@ -2101,21 +2549,35 @@ class TrainingViewSet(TenantModelViewSet):
     @action(detail=False, methods=["get"])
     def funnel(self, request):
         rows = self.get_queryset().values("stage").annotate(count=Count("id"))
+        counts = {row["stage"]: row["count"] for row in rows}
+        stages = [stage for stage, _ in TRAINING_STAGES]
         return Response(
-            envelope([{"stage": row["stage"], "count": row["count"]} for row in rows])
+            envelope(
+                [{"stage": stage, "count": counts.get(stage, 0)} for stage in stages]
+            )
         )
 
     @action(detail=False, methods=["get"])
     def dashboard(self, request):
+        from django.db.models import Q
+
         queryset = self.get_queryset()
+        participant_count = TrainingParticipant.objects.filter(
+            client_id=request.client_id, deleted_at__isnull=True
+        ).aggregate(total=Count("id"))["total"] or 0
+        aggregates = queryset.aggregate(
+            total=Count("id"),
+            ongoing=Count("id", filter=Q(stage="Ongoing")),
+            completed=Count(
+                "id", filter=Q(stage__in=["Completed", "Evaluated"])
+            ),
+        )
         return Response(
             {
-                "total": queryset.count(),
-                "ongoing": queryset.filter(stage="Ongoing").count(),
-                "completed": queryset.filter(stage__in=["Completed", "Evaluated"]).count(),
-                "participants": TrainingParticipant.objects.filter(
-                    client_id=request.client_id, deleted_at__isnull=True
-                ).count(),
+                "total": aggregates["total"] or 0,
+                "ongoing": aggregates["ongoing"] or 0,
+                "completed": aggregates["completed"] or 0,
+                "participants": participant_count,
             }
         )
 
@@ -2258,7 +2720,7 @@ class AssetRequestViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
         return super().perform_update(serializer)
 
 
-class HrDocumentViewSet(TenantModelViewSet):
+class HrDocumentViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
     queryset = HrDocument.objects.select_related("employee", "file", "created_by")
     serializer_class = HrDocumentSerializer
     audit_entity_type = "HrDocument"
@@ -2267,7 +2729,71 @@ class HrDocumentViewSet(TenantModelViewSet):
     search_fields = ["title", "description", "category"]
     ordering = ["-created_at"]
     filter_map = {"category": "category", "employeeId": "employee_id"}
-    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+    team_scope_permissions = ("view_staff", "edit_staff")
+    permission_map = {
+        "read": [],
+        "create": [],
+        "download": [],
+        "write": [],
+    }
+
+    def get_queryset(self):
+        queryset = TenantModelViewSet.get_queryset(self)
+        if self.has_team_scope():
+            return queryset
+        employee_id = getattr(self.request.user, "employee_id", None)
+        if not employee_id and hasattr(self, "_resolve_employee"):
+            resolved = self._resolve_employee(self.request)
+            if resolved:
+                employee_id = resolved.id
+        if not employee_id:
+            return queryset.none()
+        return queryset.filter(Q(employee_id=employee_id) | Q(employee__isnull=True))
+
+    def perform_create(self, serializer):
+        from rest_framework.exceptions import PermissionDenied, ValidationError
+
+        # Requirement 4: Automatically derive employee identity from authenticated session;
+        # do not allow employees to submit documents on behalf of another employee.
+        if not self.has_team_scope():
+            resolved = self._resolve_employee(self.request)
+            if not resolved:
+                raise PermissionDenied(
+                    "You must be an active employee to upload personal documents.",
+                    code="NO_EMPLOYEE_LINK",
+                )
+            serializer.validated_data["employee"] = resolved
+        else:
+            # HR Admin with team scope can assign to a specific employee or leave None for company-wide
+            pass
+
+        # Requirement 2 & 3: Require the employee to select a document category:
+        # Identity, Contract, Financial, Compliance, Legal, Educational, General. Save category with document.
+        category = serializer.validated_data.get("category")
+        allowed_categories = {
+            "identity": "Identity",
+            "contract": "Contract",
+            "financial": "Financial",
+            "compliance": "Compliance",
+            "legal": "Legal",
+            "educational": "Educational",
+            "general": "General",
+        }
+        if not category:
+            serializer.validated_data["category"] = "General"
+        else:
+            norm_cat = str(category).strip().lower()
+            if norm_cat in allowed_categories:
+                serializer.validated_data["category"] = allowed_categories[norm_cat]
+            elif self.has_team_scope():
+                # HR Admins can retain legacy categories (e.g. Policy)
+                pass
+            else:
+                raise ValidationError({
+                    "category": f"Invalid document category '{category}'. Allowed categories: {', '.join(allowed_categories.values())}."
+                })
+
+        return super().perform_create(serializer)
 
     def filter_queryset(self, queryset):
         queryset = super().filter_queryset(queryset)
@@ -2288,9 +2814,38 @@ class HrDocumentViewSet(TenantModelViewSet):
         from apps.core.files import public_url
 
         document = self.get_object()
+        # Requirement 1, 2, 6: Employees can download only their own documents; protect download endpoints
+        if not self.has_team_scope():
+            if document.employee_id:
+                self.check_own_employee(document.employee)
+            elif document.is_confidential:
+                raise PermissionDenied("You do not have permission to view or download this confidential document.")
+
         if document.file_id is None:
             raise NotFound("No file is attached to this document.")
         return Response({"downloadUrl": public_url(document.file, request)})
+
+    def perform_update(self, serializer):
+        # Requirement 2, 3: Only HR Admins with edit_staff or the document owner can update their own metadata
+        instance = serializer.instance
+        if not self.has_team_scope():
+            if instance.employee_id:
+                self.check_own_employee(instance.employee)
+            else:
+                raise PermissionDenied("Only authorized HR administrators can update company-wide documents.")
+            # Disallow changing document ownership / employee association
+            serializer.validated_data.pop("employee", None)
+            serializer.validated_data.pop("employee_id", None)
+        return super().perform_update(serializer)
+
+    def perform_destroy(self, instance):
+        # Requirement 2, 3: Only HR Admins with edit_staff or the document owner can delete their own documents
+        if not self.has_team_scope():
+            if instance.employee_id:
+                self.check_own_employee(instance.employee)
+            else:
+                raise PermissionDenied("Only authorized HR administrators can delete company-wide documents.")
+        return super().perform_destroy(instance)
 
 
 class PolicyViewSet(TenantModelViewSet):
@@ -2446,23 +3001,112 @@ class CalendarEventViewSet(TenantModelViewSet):
 
 
 class HolidayViewSet(TenantModelViewSet):
-    queryset = Holiday.objects.select_related("location")
+    queryset = Holiday.objects.select_related("location", "department")
     serializer_class = HolidaySerializer
     audit_entity_type = "Holiday"
     audit_label_field = "name"
-    status_field = None
+    status_field = "status"
     default_date_field = "date"
     ordering = ["date"]
+    search_fields = ["name", "description"]
+    filterset_fields = ["status", "holiday_type", "location", "department"]
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        year = self.request.query_params.get("year")
+        if year:
+            try:
+                qs = qs.filter(date__year=int(year))
+            except (ValueError, TypeError):
+                pass
+        dept = self.request.query_params.get("department") or self.request.query_params.get("departmentId")
+        if dept:
+            qs = qs.filter(department_id=dept)
+        loc = self.request.query_params.get("location") or self.request.query_params.get("locationId")
+        if loc:
+            qs = qs.filter(location_id=loc)
+        return qs
+
+    @action(detail=True, methods=["post"])
+    def publish(self, request, pk=None):
+        instance = self.get_object()
+        instance.status = "Published"
+        instance.save(update_fields=["status", "updated_at"])
+        return Response(self.get_serializer(instance).data)
+
+    @action(detail=True, methods=["post"])
+    def deactivate(self, request, pk=None):
+        instance = self.get_object()
+        instance.status = "Inactive"
+        instance.save(update_fields=["status", "updated_at"])
+        return Response(self.get_serializer(instance).data)
+
+
+class WorkScheduleViewSet(TenantModelViewSet):
+    queryset = WorkSchedule.objects.select_related("department", "team", "location").prefetch_related("employees")
+    serializer_class = WorkScheduleSerializer
+    audit_entity_type = "WorkSchedule"
+    audit_label_field = "name"
+    status_field = "status"
+    search_fields = ["name", "code", "department__name", "team__name"]
+    filterset_fields = ["status", "shift_type", "department", "is_default"]
+    ordering = ["name"]
+    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        dept = self.request.query_params.get("department") or self.request.query_params.get("departmentId")
+        if dept:
+            qs = qs.filter(department_id=dept)
+        status_param = self.request.query_params.get("status")
+        if status_param:
+            qs = qs.filter(status=status_param)
+        return qs
+
+    @action(detail=True, methods=["post"])
+    def activate(self, request, pk=None):
+        instance = self.get_object()
+        instance.status = "Active"
+        instance.save(update_fields=["status", "updated_at"])
+        return Response(self.get_serializer(instance).data)
+
+    @action(detail=True, methods=["post"])
+    def deactivate(self, request, pk=None):
+        instance = self.get_object()
+        instance.status = "Inactive"
+        instance.save(update_fields=["status", "updated_at"])
+        return Response(self.get_serializer(instance).data)
 
 
 class WorkingDayView(APIView):
-    """``GET/PUT /hrms/working-days/``."""
+    """``GET/PUT /hrms/working-days/``.
+
+    The endpoint retains its weekday-row contract for global availability while
+    also acting as the persistence target for the HR Admin work-schedule
+    configuration (`defaultWorkingDays`, `departmentWorkingDays`,
+    `departmentWorkingHours`).  The configuration object is stored as a tenant
+    setting so department-specific values survive refresh/re-login without a
+    new table or endpoint.
+    """
 
     permission_classes = [HasModulePermission]
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
 
+    SETTING_KEY = "hrms_working_days"
+
+    def _load_config(self, request):
+        from apps.core.models import Setting
+
+        row = Setting.objects.filter(
+            client_id=request.client_id, key=self.SETTING_KEY, deleted_at__isnull=True
+        ).first()
+        return row.value if row and isinstance(row.value, dict) else None
+
     def get(self, request):
+        config = self._load_config(request)
+        if config is not None:
+            return Response(config)
         rows = WorkingDay.objects.filter(
             client_id=request.client_id, deleted_at__isnull=True
         ).order_by("weekday")
@@ -2470,10 +3114,30 @@ class WorkingDayView(APIView):
 
     @transaction.atomic
     def put(self, request):
-        days = request.data.get("days") or request.data
+        data = request.data
+        if isinstance(data, dict) and (
+            "defaultWorkingDays" in data
+            or "departmentWorkingDays" in data
+            or "departmentWorkingHours" in data
+        ):
+            from apps.core.models import Setting
+
+            normalised = {
+                "defaultWorkingDays": data.get("defaultWorkingDays", 24),
+                "departmentWorkingDays": data.get("departmentWorkingDays") or {},
+                "departmentWorkingHours": data.get("departmentWorkingHours") or {},
+            }
+            row, _ = Setting.objects.update_or_create(
+                client_id=request.client_id,
+                key=self.SETTING_KEY,
+                defaults={"value": normalised, "updated_by": request.user},
+            )
+            return Response(row.value)
+
+        days = data.get("days") if isinstance(data, dict) else data
         if not isinstance(days, list):
             raise ValidationFailed(
-                "Provide a list of weekday configurations.",
+                "Provide a list of weekday configurations or a work-schedule configuration.",
                 field_errors={"days": ["Expected a list."]},
             )
         for row in days:
@@ -2491,13 +3155,63 @@ class WorkingDayView(APIView):
 
 
 class TeamViewSet(TenantModelViewSet):
-    queryset = Team.objects.select_related("department", "lead").prefetch_related("members")
+    queryset = Team.objects.select_related("department", "lead", "approver").prefetch_related("members")
     serializer_class = TeamSerializer
     audit_entity_type = "Team"
     audit_label_field = "name"
     status_field = "status"
+    search_fields = ["name", "code", "lead_name", "approver_name", "department__name", "lead__name", "approver__name"]
+    filter_map = {"departmentId": "department_id", "status": "status"}
     ordering = ["name"]
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    def perform_destroy(self, instance):
+        # Safe dependency check and detachment
+        instance.members.clear()
+        super().perform_destroy(instance)
+
+    @action(detail=True, methods=["post"], url_path="add-member")
+    def add_member(self, request, pk=None):
+        team = self.get_object()
+        emp_id = request.data.get("employeeId") or request.data.get("employee_id")
+        if not emp_id:
+            raise ValidationFailed("Employee ID is required.", field_errors={"employeeId": ["Required."]})
+        emp = Employee.objects.filter(client_id=request.client_id, id=emp_id, deleted_at__isnull=True).first()
+        if not emp:
+            raise NotFound("Employee not found.")
+        if emp.status in ("Terminated", "Resigned"):
+            raise ValidationFailed(f"Cannot assign {emp.name}: employee is {emp.status.lower()}.")
+        team.members.add(emp)
+        team.headcount = team.members.filter(deleted_at__isnull=True).exclude(status__in=["Terminated", "Resigned"]).count()
+        team.save(update_fields=["headcount", "updated_at"])
+        return Response(TeamSerializer(team, context={"request": request}).data)
+
+    @action(detail=True, methods=["post"], url_path="remove-member")
+    def remove_member(self, request, pk=None):
+        team = self.get_object()
+        emp_id = request.data.get("employeeId") or request.data.get("employee_id")
+        if not emp_id:
+            raise ValidationFailed("Employee ID is required.", field_errors={"employeeId": ["Required."]})
+        emp = Employee.objects.filter(client_id=request.client_id, id=emp_id).first()
+        if emp:
+            team.members.remove(emp)
+            team.headcount = team.members.filter(deleted_at__isnull=True).exclude(status__in=["Terminated", "Resigned"]).count()
+            team.save(update_fields=["headcount", "updated_at"])
+        return Response(TeamSerializer(team, context={"request": request}).data)
+
+
+DEFAULT_HRMS_SETTINGS = {
+    "companyName": "",
+    "workWeek": "Monday - Friday (5 Days)",
+    "timezone": "IST (UTC +05:30) — Asia/Kolkata",
+    "fiscalYearStart": "April 01",
+    "probationPeriod": "90 Days (3 Months)",
+    "noticePeriod": "60 Days (2 Months)",
+    "allowEmployeeDelegation": True,
+    "requireTwoFactorForAdmin": True,
+    "sandwichRuleEnabled": True,
+    "maxCarryForwardDays": 15,
+}
 
 
 class ApprovalChainViewSet(TenantModelViewSet):
@@ -2507,29 +3221,391 @@ class ApprovalChainViewSet(TenantModelViewSet):
     audit_label_field = "name"
     status_field = "status"
     ordering = ["name"]
-    filter_map = {"appliesTo": "applies_to"}
+    filter_map = {"appliesTo": "applies_to", "status": "status"}
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+
+    @action(detail=True, methods=["post"])
+    def activate(self, request, pk=None):
+        chain = self.get_object()
+        chain.status = "Active"
+        chain.save(update_fields=["status", "updated_at"])
+        self.write_audit("activate", chain, description="Approval workflow activated")
+        return Response(self.get_serializer(chain).data)
+
+    @action(detail=True, methods=["post"])
+    def deactivate(self, request, pk=None):
+        chain = self.get_object()
+        chain.status = "Inactive"
+        chain.save(update_fields=["status", "updated_at"])
+        self.write_audit("deactivate", chain, description="Approval workflow deactivated")
+        return Response(self.get_serializer(chain).data)
+
+    @action(detail=False, methods=["get"], url_path="modules")
+    def modules(self, request):
+        from .workflow_service import MODULE_CANONICAL
+        unique_modules = sorted(list(set(MODULE_CANONICAL.values())))
+        standard_roles = [
+            "Direct Line Manager",
+            "Department Head",
+            "Team Leader",
+            "HR Operations Lead",
+            "HR Director",
+            "Finance Lead",
+            "Chief Financial Officer (CFO)",
+            "Managing Director",
+            "Operations Lead",
+            "IT Stock Manager",
+        ]
+        return Response({
+            "modules": unique_modules,
+            "roles": standard_roles,
+        })
 
 
 class TerminationViewSet(TenantModelViewSet):
-    queryset = Termination.objects.select_related("employee")
+    queryset = Termination.objects.select_related("employee", "approval_chain")
     serializer_class = TerminationSerializer
     audit_entity_type = "Termination"
     status_field = "status"
     ordering = ["-created_at"]
-    filter_map = {"employeeId": "employee_id"}
-    permission_map = {"read": ["view_staff"], "write": ["delete_staff"]}
+    filter_map = {"employeeId": "employee_id", "status": "status"}
+    permission_map = {"read": ["view_staff"], "write": ["delete_staff", "edit_staff"]}
+
+    def perform_create(self, serializer):
+        instance = super().perform_create(serializer)
+        from . import workflow_service
+        workflow_service.initialize_request_workflow(instance, "Terminations", self.request.user)
+        return instance
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        instance = self.get_object()
+        from . import workflow_service
+        updated, is_final = workflow_service.process_approval_action(
+            instance, "Terminations", request.user, "approve",
+            remark=request.data.get("remark"),
+            target_status=request.data.get("status") or "In Exit Clearance",
+        )
+        if is_final:
+            from . import lifecycle_service
+            lifecycle_service.execute_employee_offboarding(
+                updated, user=request.user, reason=request.data.get("remark"), force=False
+            )
+            updated.refresh_from_db()
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        instance = self.get_object()
+        from . import workflow_service
+        updated, is_final = workflow_service.process_approval_action(
+            instance, "Terminations", request.user, "reject",
+            remark=request.data.get("remark") or request.data.get("reason"),
+        )
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=True, methods=["post"], url_path="execute-offboarding")
+    def execute_offboarding(self, request, pk=None):
+        instance = self.get_object()
+        from . import lifecycle_service
+        force = bool(request.data.get("force", False))
+        updated, executed, message = lifecycle_service.execute_employee_offboarding(
+            instance, user=request.user, reason=request.data.get("reason") or request.data.get("remark"), force=force
+        )
+        return Response({
+            "success": executed,
+            "message": message,
+            "data": self.get_serializer(updated).data,
+        })
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        instance = self.get_object()
+        from . import lifecycle_service
+        updated = lifecycle_service.cancel_exit_process(
+            instance, user=request.user, reason=request.data.get("reason") or request.data.get("remark")
+        )
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=True, methods=["get", "post"], url_path="checklist")
+    def checklist(self, request, pk=None):
+        instance = self.get_object()
+        from . import lifecycle_service
+        from .models import ResignationChecklistItem
+        if request.method == "POST":
+            item_id = request.data.get("itemId") or request.data.get("id")
+            if item_id:
+                item = ResignationChecklistItem.objects.filter(
+                    client_id=request.client_id, id=item_id, termination=instance
+                ).first()
+                if item:
+                    is_completed = request.data.get("isCompleted")
+                    if is_completed is None:
+                        is_completed = not item.is_completed
+                    item.is_completed = bool(is_completed)
+                    item.completed_at = timezone.now() if item.is_completed else None
+                    if request.data.get("notes"):
+                        item.notes = str(request.data["notes"]).strip()
+                    if request.user and getattr(request.user, "is_authenticated", False):
+                        item.owner = request.user
+                    item.save()
+            else:
+                title = request.data.get("title")
+                dept = request.data.get("department", "HR")
+                notes = request.data.get("notes", "")
+                if title:
+                    ResignationChecklistItem.objects.create(
+                        client_id=request.client_id,
+                        termination=instance,
+                        title=str(title).strip(),
+                        department=dept,
+                        notes=notes,
+                        is_completed=False,
+                    )
+        status_info = lifecycle_service.get_clearance_status(instance)
+        items_data = [
+            {
+                "id": str(i.id),
+                "title": i.title,
+                "department": i.department or "General",
+                "notes": i.notes or "",
+                "isCompleted": i.is_completed,
+                "completedAt": i.completed_at.isoformat() if i.completed_at else None,
+                "ownerName": i.owner.name if i.owner else "",
+            }
+            for i in status_info["items"]
+        ]
+        return Response({
+            "total": status_info["total"],
+            "completed": status_info["completed"],
+            "pending": status_info["pending"],
+            "isCleared": status_info["is_cleared"],
+            "checklist": items_data,
+        })
 
 
-class ResignationViewSet(TenantModelViewSet):
-    queryset = Resignation.objects.select_related("employee").prefetch_related("checklist")
+class ResignationViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
+    queryset = Resignation.objects.select_related("employee", "approval_chain").prefetch_related("checklist")
     serializer_class = ResignationSerializer
     audit_entity_type = "Resignation"
     status_field = "status"
     default_date_field = "submitted_on"
     ordering = ["-submitted_on"]
-    filter_map = {"employeeId": "employee_id"}
-    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+    filter_map = {"employeeId": "employee_id", "status": "status"}
+    team_scope_permissions = ("view_staff", "edit_staff")
+    permission_map = {
+        "read": [],
+        "create": [],
+        "cancel": [],
+        "write": ["edit_staff"],
+        "approve": ["edit_staff"],
+        "reject": ["edit_staff"],
+        "resubmit": ["edit_staff"],
+        "execute_offboarding": ["edit_staff"],
+        "checklist": ["edit_staff"],
+        "waive_notice": ["edit_staff"],
+        "shorten_notice": ["edit_staff"],
+    }
+
+    def perform_create(self, serializer):
+        employee = serializer.validated_data.get("employee")
+        if not employee:
+            resolved = self._resolve_employee(self.request)
+            if resolved:
+                serializer.validated_data["employee"] = resolved
+                employee = resolved
+        self.check_own_employee(employee)
+
+        from apps.core.exceptions import Conflict
+        if employee:
+            if employee.status in ("Terminated", "Resigned"):
+                raise Conflict(
+                    f"Cannot submit resignation for {employee.name}: employee is already {employee.status.lower()}.",
+                    code="EMPLOYEE_EXITED",
+                )
+            active_resignation = Resignation.objects.filter(
+                client_id=self.request.client_id,
+                employee=employee,
+                status__in=["Submitted", "Pending", "Pending Review", "Notice Period", "Exit Interview Scheduled", "Clearance In Progress", "Approved"],
+                deleted_at__isnull=True,
+            ).first()
+            if active_resignation:
+                raise Conflict(
+                    "An active resignation process is already recorded for this employee.",
+                    code="ALREADY_EXISTS",
+                )
+
+        instance = super().perform_create(serializer)
+        from . import workflow_service
+        workflow_service.initialize_request_workflow(instance, "Resignations", self.request.user)
+        return instance
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        instance = self.get_object()
+        from . import workflow_service
+        updated, is_final = workflow_service.process_approval_action(
+            instance, "Resignations", request.user, "approve",
+            remark=request.data.get("remark"),
+            target_status=request.data.get("status") or "Exit Interview Scheduled",
+        )
+        if is_final:
+            from . import lifecycle_service
+            lifecycle_service.execute_employee_offboarding(
+                updated, user=request.user, reason=request.data.get("remark"), force=False
+            )
+            updated.refresh_from_db()
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        instance = self.get_object()
+        from . import workflow_service
+        updated, is_final = workflow_service.process_approval_action(
+            instance, "Resignations", request.user, "reject",
+            remark=request.data.get("remark") or request.data.get("reason"),
+        )
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=True, methods=["post"])
+    def resubmit(self, request, pk=None):
+        instance = self.get_object()
+        from . import workflow_service
+        updated, is_final = workflow_service.process_approval_action(
+            instance, "Resignations", request.user, "resubmit",
+            remark=request.data.get("remark"),
+        )
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=True, methods=["post"], url_path="execute-offboarding")
+    def execute_offboarding(self, request, pk=None):
+        instance = self.get_object()
+        from . import lifecycle_service
+        force = bool(request.data.get("force", False))
+        updated, executed, message = lifecycle_service.execute_employee_offboarding(
+            instance, user=request.user, reason=request.data.get("reason") or request.data.get("remark"), force=force
+        )
+        return Response({
+            "success": executed,
+            "message": message,
+            "data": self.get_serializer(updated).data,
+        })
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        instance = self.get_object()
+        if not self.has_team_scope():
+            self.check_own_employee(instance.employee)
+        from . import lifecycle_service
+        updated = lifecycle_service.cancel_exit_process(
+            instance, user=request.user, reason=request.data.get("reason") or request.data.get("remark")
+        )
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=True, methods=["get", "post"], url_path="checklist")
+    def checklist(self, request, pk=None):
+        instance = self.get_object()
+        from . import lifecycle_service
+        from .models import ResignationChecklistItem
+        if request.method == "POST":
+            item_id = request.data.get("itemId") or request.data.get("id")
+            if item_id:
+                item = ResignationChecklistItem.objects.filter(
+                    client_id=request.client_id, id=item_id, resignation=instance
+                ).first()
+                if item:
+                    is_completed = request.data.get("isCompleted")
+                    if is_completed is None:
+                        is_completed = not item.is_completed
+                    item.is_completed = bool(is_completed)
+                    item.completed_at = timezone.now() if item.is_completed else None
+                    if request.data.get("notes"):
+                        item.notes = str(request.data["notes"]).strip()
+                    if request.user and getattr(request.user, "is_authenticated", False):
+                        item.owner = request.user
+                    item.save()
+            else:
+                title = request.data.get("title")
+                dept = request.data.get("department", "HR")
+                notes = request.data.get("notes", "")
+                if title:
+                    ResignationChecklistItem.objects.create(
+                        client_id=request.client_id,
+                        resignation=instance,
+                        title=str(title).strip(),
+                        department=dept,
+                        notes=notes,
+                        is_completed=False,
+                    )
+        status_info = lifecycle_service.get_clearance_status(instance)
+        items_data = [
+            {
+                "id": str(i.id),
+                "title": i.title,
+                "department": i.department or "General",
+                "notes": i.notes or "",
+                "isCompleted": i.is_completed,
+                "completedAt": i.completed_at.isoformat() if i.completed_at else None,
+                "ownerName": i.owner.name if i.owner else "",
+            }
+            for i in status_info["items"]
+        ]
+        return Response({
+            "total": status_info["total"],
+            "completed": status_info["completed"],
+            "pending": status_info["pending"],
+            "isCleared": status_info["is_cleared"],
+            "checklist": items_data,
+        })
+
+    @action(detail=True, methods=["post"], url_path="waive-notice")
+    def waive_notice(self, request, pk=None):
+        instance = self.get_object()
+        from . import lifecycle_service
+        from datetime import date
+        eff_date = (
+            request.data.get("effectiveLastDay")
+            or request.data.get("effective_last_day")
+            or request.data.get("lastWorkingDay")
+            or request.data.get("last_working_day")
+        )
+        if isinstance(eff_date, str):
+            try:
+                eff_date = date.fromisoformat(eff_date)
+            except ValueError:
+                eff_date = None
+        reason = (
+            request.data.get("reason")
+            or request.data.get("waiverReason")
+            or request.data.get("waiver_reason")
+            or request.data.get("remark")
+        )
+        updated = lifecycle_service.waive_resignation_notice(
+            instance, user=request.user, effective_last_day=eff_date, reason=reason
+        )
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=True, methods=["post"], url_path="shorten-notice")
+    def shorten_notice(self, request, pk=None):
+        instance = self.get_object()
+        from . import lifecycle_service
+        from datetime import date
+        rev_date = (
+            request.data.get("revisedLastWorkingDay")
+            or request.data.get("revised_last_working_day")
+            or request.data.get("lastWorkingDay")
+            or request.data.get("last_working_day")
+        )
+        if isinstance(rev_date, str):
+            try:
+                rev_date = date.fromisoformat(rev_date)
+            except ValueError:
+                rev_date = None
+        reason = request.data.get("reason") or request.data.get("remark")
+        updated = lifecycle_service.shorten_resignation_notice(
+            instance, user=request.user, revised_last_working_day=rev_date, reason=reason
+        )
+        return Response(self.get_serializer(updated).data)
 
 
 class ComplaintViewSet(TenantModelViewSet):
@@ -2537,20 +3613,36 @@ class ComplaintViewSet(TenantModelViewSet):
     endpoint checks alone; this is the endpoint half."""
 
     queryset = Complaint.objects.select_related(
-        "raised_by_employee", "against_employee", "assigned_to"
+        "raised_by_employee", "against_employee", "assigned_to", "approval_chain"
     )
     serializer_class = ComplaintSerializer
     audit_entity_type = "Complaint"
     status_field = "status"
     ordering = ["-created_at"]
-    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+    filter_map = {"category": "category", "priority": "priority", "status": "status"}
+    permission_map = {"read": [], "create": [], "write": ["edit_staff"]}
+
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = getattr(self.request, "user", None)
+        if not user or not user.is_authenticated:
+            return qs.none()
+        from apps.core.permissions import has_permission
+        if not has_permission(user, ("view_staff", "edit_staff")):
+            emp_id = getattr(user, "employee_id", None)
+            qs = qs.filter(Q(raised_by_employee_id=emp_id) | Q(assigned_to=user))
+        return qs
 
     def perform_create(self, serializer):
         if not serializer.validated_data.get("raised_by_employee"):
             employee_id = getattr(self.request.user, "employee_id", None)
             if employee_id:
                 serializer.validated_data["raised_by_employee_id"] = employee_id
-        return super().perform_create(serializer)
+        instance = super().perform_create(serializer)
+        from . import workflow_service
+        workflow_service.initialize_request_workflow(instance, "Grievances", self.request.user)
+        return instance
 
     def perform_update(self, serializer):
         complaint = super().perform_update(serializer)
@@ -2558,6 +3650,94 @@ class ComplaintViewSet(TenantModelViewSet):
             complaint.resolved_at = timezone.now()
             complaint.save(update_fields=["resolved_at", "updated_at"])
         return complaint
+
+    @action(detail=True, methods=["post"])
+    def comment(self, request, pk=None):
+        instance = self.get_object()
+        comment_text = request.data.get("comment") or request.data.get("text")
+        if not comment_text or not str(comment_text).strip():
+            raise ValidationFailed("Comment text cannot be empty.")
+        if not isinstance(instance.comments, list):
+            instance.comments = []
+        import uuid
+        entry = {
+            "id": str(uuid.uuid4()),
+            "author": request.user.name or request.user.email,
+            "text": str(comment_text).strip(),
+            "created_at": timezone.now().isoformat(),
+        }
+        instance.comments.append(entry)
+        instance.save(update_fields=["comments", "updated_at"])
+        self.write_audit(
+            action="comment",
+            instance=instance,
+            description=f"Added investigation comment on grievance {instance.id}.",
+        )
+        return Response(self.get_serializer(instance).data)
+
+    @action(detail=True, methods=["post"])
+    def resolve(self, request, pk=None):
+        instance = self.get_object()
+        resolution_text = request.data.get("resolution") or request.data.get("remark") or ""
+        instance.resolution = resolution_text
+        instance.status = "Resolved"
+        instance.resolved_at = timezone.now()
+        instance.save(update_fields=["resolution", "status", "resolved_at", "updated_at"])
+        try:
+            from apps.core.models import Notification
+            from .user_link import linked_user
+            recipients = []
+            if instance.assigned_to:
+                recipients.append(instance.assigned_to)
+            if not instance.is_anonymous and instance.raised_by_employee:
+                u = linked_user(instance.raised_by_employee)
+                if u and u not in recipients:
+                    recipients.append(u)
+            for r in recipients:
+                Notification.objects.create(
+                    client=instance.client,
+                    recipient=r,
+                    actor=getattr(request, "user", None),
+                    type="hrms.grievance_resolved",
+                    category="hrms",
+                    entity_type="Complaint",
+                    entity_id=instance.id,
+                    title=f"Grievance Resolved: {instance.category or 'General'}",
+                    body=f"Grievance filed on {instance.filed_on} has been resolved: {resolution_text[:120]}",
+                    channels=["in_app"],
+                    payload={"type": "grievance", "complaintId": str(instance.id)},
+                )
+        except Exception:
+            pass
+        self.write_audit(
+            action="resolve",
+            instance=instance,
+            description=f"Resolved grievance {instance.id}.",
+            after={"status": "Resolved", "resolution": resolution_text},
+        )
+        return Response(self.get_serializer(instance).data)
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        instance = self.get_object()
+        from . import workflow_service
+        updated, is_final = workflow_service.process_approval_action(
+            instance, "Grievances", request.user, "approve",
+            remark=request.data.get("remark"),
+            target_status=request.data.get("status") or "Resolved",
+        )
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        instance = self.get_object()
+        from . import workflow_service
+        updated, is_final = workflow_service.process_approval_action(
+            instance, "Grievances", request.user, "reject",
+            remark=request.data.get("remark"),
+            target_status="Dismissed",
+        )
+        return Response(self.get_serializer(updated).data)
 
 
 class HrmsSettingsView(APIView):
@@ -2567,20 +3747,58 @@ class HrmsSettingsView(APIView):
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
 
     def get(self, request):
-        from apps.core.models import Setting
+        from apps.core.models import CompanyProfile, Setting
 
         row = Setting.objects.filter(client_id=request.client_id, key="hrms").first()
-        return Response(row.value if row else {})
+        data = dict(DEFAULT_HRMS_SETTINGS)
+        if row and isinstance(row.value, dict):
+            data.update(row.value)
+
+        if not data.get("companyName"):
+            cp = CompanyProfile.objects.filter(client_id=request.client_id).first()
+            if cp and (cp.legal_name or cp.trade_name):
+                data["companyName"] = cp.legal_name or cp.trade_name
+
+        return Response(data)
 
     def put(self, request):
-        from apps.core.models import Setting
+        from apps.core.models import CompanyProfile, Setting
+        from .serializers import HrmsSettingsSerializer
+
+        serializer = HrmsSettingsSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+
+        row = Setting.objects.filter(client_id=request.client_id, key="hrms").first()
+        merged = dict(DEFAULT_HRMS_SETTINGS)
+        if row and isinstance(row.value, dict):
+            merged.update(row.value)
+        old_probation = merged.get("probationPeriod")
+        merged.update(serializer.validated_data)
+        new_probation = serializer.validated_data.get("probationPeriod")
+
+        if new_probation and new_probation != old_probation:
+            from . import lifecycle_service
+            lifecycle_service.recalculate_probations_for_setting_change(
+                request.client_id, new_probation, user=request.user
+            )
 
         row, _ = Setting.objects.update_or_create(
             client_id=request.client_id,
             key="hrms",
-            defaults={"value": request.data, "updated_by": request.user},
+            defaults={"value": merged, "updated_by": request.user},
         )
-        return Response(row.value)
+
+        c_name = str(merged.get("companyName") or "").strip()
+        if c_name:
+            try:
+                CompanyProfile.objects.update_or_create(
+                    client_id=request.client_id,
+                    defaults={"legal_name": c_name, "trade_name": c_name},
+                )
+            except Exception:
+                pass
+
+        return Response(merged)
 
 
 # ---------------------------------------------------------------------------
@@ -2597,9 +3815,50 @@ class EmployeeTransferViewSet(TenantModelViewSet):
     filter_map = {"employeeId": "employee_id", "status": "status"}
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
 
+    @transaction.atomic
     def perform_create(self, serializer):
         serializer.validated_data["transfer_number"] = allocate_number(self.request.user.client, "TRF")
-        return super().perform_create(serializer)
+        transfer = super().perform_create(serializer)
+        emp = transfer.employee
+        if transfer.to_department:
+            emp.department = transfer.to_department
+        if transfer.to_location:
+            emp.location = transfer.to_location
+        emp.save(update_fields=["department", "location", "updated_at"])
+        try:
+            from . import user_link
+            user_link.push_to_user(emp)
+        except Exception:
+            pass
+
+        # Notify the employee
+        try:
+            from apps.core.models import Notification
+            from apps.accounts.models import User
+            from .user_link import linked_user
+            user = linked_user(emp)
+            if not user and emp.email:
+                user = User.objects.filter(
+                    client=transfer.client, email__iexact=emp.email.strip(), deleted_at__isnull=True
+                ).exclude(status="Deleted").first()
+            if user:
+                dept_name = transfer.to_department.name if transfer.to_department else "New Department"
+                Notification.objects.create(
+                    client=transfer.client,
+                    recipient=user,
+                    actor=getattr(self.request, "user", None),
+                    type="hrms.transfer",
+                    category="hrms",
+                    entity_type="EmployeeTransfer",
+                    entity_id=transfer.id,
+                    title="Department Transfer Notice",
+                    body=f"You have been transferred to {dept_name} effective {transfer.effective_date}. {transfer.reason or ''}".strip(),
+                    channels=["in_app"],
+                    payload={"path": "/portal/employee", "type": "transfer", "transferId": str(transfer.id)},
+                )
+        except Exception:
+            pass
+        return transfer
 
 
 class EmployeePromotionViewSet(TenantModelViewSet):
@@ -2613,9 +3872,51 @@ class EmployeePromotionViewSet(TenantModelViewSet):
     filter_map = {"employeeId": "employee_id", "status": "status"}
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
 
+    @transaction.atomic
     def perform_create(self, serializer):
         serializer.validated_data["promotion_number"] = allocate_number(self.request.user.client, "PRM")
-        return super().perform_create(serializer)
+        promotion = super().perform_create(serializer)
+        emp = promotion.employee
+        if promotion.to_designation:
+            emp.designation = promotion.to_designation
+        if promotion.new_salary:
+            emp.standard_salary = promotion.new_salary
+        emp.save(update_fields=["designation", "standard_salary", "updated_at"])
+        try:
+            from . import user_link
+            user_link.push_to_user(emp)
+        except Exception:
+            pass
+
+        # Notify the employee
+        try:
+            from apps.core.models import Notification
+            from apps.accounts.models import User
+            from .user_link import linked_user
+            user = linked_user(emp)
+            if not user and emp.email:
+                user = User.objects.filter(
+                    client=promotion.client, email__iexact=emp.email.strip(), deleted_at__isnull=True
+                ).exclude(status="Deleted").first()
+            if user:
+                desig_name = promotion.to_designation.title if promotion.to_designation else "New Role"
+                salary_text = f" with revised CTC Rs {promotion.new_salary}" if promotion.new_salary else ""
+                Notification.objects.create(
+                    client=promotion.client,
+                    recipient=user,
+                    actor=getattr(self.request, "user", None),
+                    type="hrms.promotion",
+                    category="hrms",
+                    entity_type="EmployeePromotion",
+                    entity_id=promotion.id,
+                    title=f"Congratulations on Your Promotion to {desig_name}!",
+                    body=f"Your promotion to {desig_name} is effective {promotion.effective_date}{salary_text}.",
+                    channels=["in_app"],
+                    payload={"path": "/portal/employee", "type": "promotion", "promotionId": str(promotion.id)},
+                )
+        except Exception:
+            pass
+        return promotion
 
 
 class EmployeeWarningViewSet(TenantModelViewSet):
@@ -2629,9 +3930,39 @@ class EmployeeWarningViewSet(TenantModelViewSet):
     filter_map = {"employeeId": "employee_id", "status": "status", "severity": "severity"}
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
 
+    @transaction.atomic
     def perform_create(self, serializer):
         serializer.validated_data["warning_number"] = allocate_number(self.request.user.client, "WRN")
-        return super().perform_create(serializer)
+        warning = super().perform_create(serializer)
+
+        # Notify the employee
+        try:
+            from apps.core.models import Notification
+            from apps.accounts.models import User
+            from .user_link import linked_user
+            emp = warning.employee
+            user = linked_user(emp)
+            if not user and emp.email:
+                user = User.objects.filter(
+                    client=warning.client, email__iexact=emp.email.strip(), deleted_at__isnull=True
+                ).exclude(status="Deleted").first()
+            if user:
+                Notification.objects.create(
+                    client=warning.client,
+                    recipient=user,
+                    actor=getattr(self.request, "user", None),
+                    type="hrms.warning",
+                    category="hrms",
+                    entity_type="EmployeeWarning",
+                    entity_id=warning.id,
+                    title=f"Disciplinary Notice ({warning.severity}): {warning.subject}",
+                    body=f"Notice issued on {warning.issue_date} regarding '{warning.subject}'. {warning.description or ''}".strip(),
+                    channels=["in_app"],
+                    payload={"path": "/portal/employee", "type": "warning", "warningId": str(warning.id)},
+                )
+        except Exception:
+            pass
+        return warning
 
 
 class EmployeeAwardViewSet(TenantModelViewSet):
@@ -2645,13 +3976,43 @@ class EmployeeAwardViewSet(TenantModelViewSet):
     filter_map = {"employeeId": "employee_id", "category": "category"}
     permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
 
+    @transaction.atomic
     def perform_create(self, serializer):
         serializer.validated_data["award_number"] = allocate_number(self.request.user.client, "AWD")
-        return super().perform_create(serializer)
+        award = super().perform_create(serializer)
+
+        # Notify the employee
+        try:
+            from apps.core.models import Notification
+            from apps.accounts.models import User
+            from .user_link import linked_user
+            emp = award.employee
+            user = linked_user(emp)
+            if not user and emp.email:
+                user = User.objects.filter(
+                    client=award.client, email__iexact=emp.email.strip(), deleted_at__isnull=True
+                ).exclude(status="Deleted").first()
+            if user:
+                Notification.objects.create(
+                    client=award.client,
+                    recipient=user,
+                    actor=getattr(self.request, "user", None),
+                    type="hrms.award",
+                    category="hrms",
+                    entity_type="EmployeeAward",
+                    entity_id=award.id,
+                    title=f"Award Received: {award.award_name}!",
+                    body=f"Congratulations! You were presented the {award.award_name} award on {award.award_date}. {award.citation or ''}".strip(),
+                    channels=["in_app"],
+                    payload={"path": "/portal/employee", "type": "award", "awardId": str(award.id)},
+                )
+        except Exception:
+            pass
+        return award
 
 
 class TravelRequestViewSet(TenantModelViewSet):
-    queryset = TravelRequest.objects.select_related("employee")
+    queryset = TravelRequest.objects.select_related("employee", "approval_chain")
     serializer_class = TravelRequestSerializer
     audit_entity_type = "TravelRequest"
     audit_label_field = "travel_number"
@@ -2663,7 +4024,91 @@ class TravelRequestViewSet(TenantModelViewSet):
 
     def perform_create(self, serializer):
         serializer.validated_data["travel_number"] = allocate_number(self.request.user.client, "TRV")
-        return super().perform_create(serializer)
+        instance = super().perform_create(serializer)
+        from . import workflow_service
+        workflow_service.initialize_request_workflow(instance, "Travel Requisitions", self.request.user)
+        return instance
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        instance = self.get_object()
+        from . import workflow_service
+        updated, is_final = workflow_service.process_approval_action(
+            instance, "Travel Requisitions", request.user, "approve",
+            remark=request.data.get("remark"),
+            target_status="Approved",
+        )
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        instance = self.get_object()
+        from . import workflow_service
+        updated, is_final = workflow_service.process_approval_action(
+            instance, "Travel Requisitions", request.user, "reject",
+            remark=request.data.get("remark") or request.data.get("reason"),
+        )
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=True, methods=["post"])
+    def resubmit(self, request, pk=None):
+        instance = self.get_object()
+        from . import workflow_service
+        updated, is_final = workflow_service.process_approval_action(
+            instance, "Travel Requisitions", request.user, "resubmit",
+            remark=request.data.get("remark"),
+        )
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=True, methods=["post"])
+    def settle(self, request, pk=None):
+        instance = self.get_object()
+        if instance.status not in ("Approved", "Disbursed", "Settled"):
+            raise Conflict(
+                f"Cannot settle travel requisition {instance.travel_number} with status '{instance.status}'. It must be approved first.",
+                code="NOT_APPROVED",
+            )
+        advance_disbursed = request.data.get("advance_disbursed")
+        actual_expenses = request.data.get("actual_expenses")
+        settlement_notes = request.data.get("settlement_notes")
+        if advance_disbursed is not None:
+            instance.advance_disbursed = advance_disbursed
+        if actual_expenses is not None:
+            instance.actual_expenses = actual_expenses
+        if settlement_notes is not None:
+            instance.settlement_notes = settlement_notes
+        instance.status = "Settled"
+        instance.save(update_fields=["advance_disbursed", "actual_expenses", "settlement_notes", "status", "updated_at"])
+        self.write_audit(
+            action="settle",
+            instance=instance,
+            description=f"Settled travel requisition {instance.travel_number}.",
+            after={
+                "status": "Settled",
+                "advance_disbursed": str(instance.advance_disbursed),
+                "actual_expenses": str(instance.actual_expenses),
+            },
+        )
+        return Response(self.get_serializer(instance).data)
+
+    def perform_update(self, serializer):
+        target_status = self.request.data.get("status")
+        instance = serializer.instance
+        if target_status and str(target_status).lower() == "settled":
+            if instance.status not in ("Approved", "Disbursed", "Settled"):
+                raise Conflict(
+                    f"Cannot settle travel requisition {instance.travel_number} with status '{instance.status}'. It must be approved first.",
+                    code="NOT_APPROVED",
+                )
+        if target_status and str(target_status).lower() in ("approved", "rejected") and str(target_status).capitalize() != instance.status:
+            from . import workflow_service
+            act = "approve" if str(target_status).lower() == "approved" else "reject"
+            updated, _ = workflow_service.process_approval_action(
+                instance, "Travel Requisitions", self.request.user, act,
+                remark=self.request.data.get("remark"),
+            )
+            return updated
+        return super().perform_update(serializer)
 
 
 class AnnouncementViewSet(TenantModelViewSet):
@@ -2671,11 +4116,67 @@ class AnnouncementViewSet(TenantModelViewSet):
     serializer_class = AnnouncementSerializer
     audit_entity_type = "Announcement"
     audit_label_field = "title"
-    status_field = None
+    status_field = "status"
     search_fields = ["title", "content", "author_name"]
     ordering = ["-is_pinned", "-publish_date", "-created_at"]
-    filter_map = {"targetDepartmentId": "target_department_id", "priority": "priority"}
-    permission_map = {"read": ["view_staff"], "write": ["edit_staff"]}
+    filter_map = {"targetDepartmentId": "target_department_id", "priority": "priority", "status": "status"}
+    permission_map = {"read": [], "write": ["edit_staff"]}
+
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        user = getattr(self.request, "user", None)
+        if not user or not user.is_authenticated:
+            return qs.none()
+        from apps.core.permissions import has_permission
+        if not has_permission(user, ("view_staff", "edit_staff")):
+            today = timezone.localdate()
+            qs = qs.filter(
+                status="Published",
+                publish_date__lte=today,
+            ).filter(
+                Q(expiry_date__isnull=True) | Q(expiry_date__gte=today)
+            )
+            emp = getattr(user, "employee", None)
+            if emp and emp.department_id:
+                qs = qs.filter(Q(target_department__isnull=True) | Q(target_department_id=emp.department_id))
+            else:
+                qs = qs.filter(target_department__isnull=True)
+        return qs
+
+    def perform_create(self, serializer):
+        if not serializer.validated_data.get("author_name"):
+            user = getattr(self.request, "user", None)
+            serializer.validated_data["author_name"] = user.name if user and user.name else "HR Department"
+        return super().perform_create(serializer)
+
+    @action(detail=True, methods=["post"])
+    def publish(self, request, pk=None):
+        announcement = self.get_object()
+        announcement.status = "Published"
+        if not announcement.publish_date:
+            announcement.publish_date = timezone.localdate()
+        announcement.save(update_fields=["status", "publish_date", "updated_at"])
+        self.write_audit(
+            action="publish",
+            instance=announcement,
+            description=f"Published announcement '{announcement.title}'.",
+            after={"status": "Published"},
+        )
+        return Response(self.get_serializer(announcement).data)
+
+    @action(detail=True, methods=["post"])
+    def archive(self, request, pk=None):
+        announcement = self.get_object()
+        announcement.status = "Archived"
+        announcement.save(update_fields=["status", "updated_at"])
+        self.write_audit(
+            action="archive",
+            instance=announcement,
+            description=f"Archived announcement '{announcement.title}'.",
+            after={"status": "Archived"},
+        )
+        return Response(self.get_serializer(announcement).data)
 
 
 class ScreeningQuestionViewSet(TenantModelViewSet):

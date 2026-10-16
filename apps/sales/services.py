@@ -45,6 +45,7 @@ from .models import (
     CHALLAN_SHIPPED_STATUSES,
     NON_RESERVING_STAGES,
     CashPaymentReceipt,
+    CreditAllocation,
     DeliveryChallan,
     DeliveryChallanLine,
     PaymentAllocation,
@@ -176,7 +177,7 @@ def assert_client_totals_match(document, claimed):
 # ---------------------------------------------------------------------------
 # Credit limit (api.md §4.1)
 # ---------------------------------------------------------------------------
-def assert_credit_limit(party, additional_amount, *, user=None, override=False):
+def assert_credit_limit(party, additional_amount, *, user=None, override=False, exclude_order_id=None):
     """422 CREDIT_LIMIT_EXCEEDED unless the caller holds the override permission
     **and** passes ``{"overrideCreditLimit": true}``.
 
@@ -188,11 +189,15 @@ def assert_credit_limit(party, additional_amount, *, user=None, override=False):
     if limit is None or D(limit) <= ZERO:
         return
 
-    open_orders = SalesOrder.objects.filter(
+    orders_qs = SalesOrder.objects.filter(
         client_id=party.client_id,
         party_id=party.id,
         deleted_at__isnull=True,
-    ).exclude(stage__in=["Invoiced", "Cancelled"]).aggregate(
+    ).exclude(stage__in=["Draft", "Invoiced", "Cancelled"])
+    if exclude_order_id:
+        orders_qs = orders_qs.exclude(id=exclude_order_id)
+
+    open_orders = orders_qs.aggregate(
         value=Coalesce(
             Sum("total"), Value(Decimal("0.00")),
             output_field=DecimalField(max_digits=18, decimal_places=2),
@@ -225,17 +230,27 @@ def assert_credit_limit(party, additional_amount, *, user=None, override=False):
 # Payment status (api.md §5.7)
 # ---------------------------------------------------------------------------
 def allocated_to(client_id, document_type, document_id):
-    return PaymentAllocation.objects.filter(
+    from apps.sales.models import PaymentIn
+    cancelled_pmt_ids = list(
+        PaymentIn.objects.filter(
+            client_id=client_id, status="Cancelled"
+        ).values_list("id", flat=True)
+    )
+    qs = PaymentAllocation.objects.filter(
         client_id=client_id,
         document_type=document_type,
         document_id=document_id,
         deleted_at__isnull=True,
-    ).aggregate(
+    )
+    if cancelled_pmt_ids:
+        qs = qs.exclude(payment_id__in=cancelled_pmt_ids)
+    return qs.aggregate(
         value=Coalesce(
             Sum("amount"), Value(Decimal("0.00")),
             output_field=DecimalField(max_digits=18, decimal_places=2),
         )
     )["value"]
+
 
 
 def refresh_invoice_payment_status(invoice):
@@ -248,9 +263,11 @@ def refresh_invoice_payment_status(invoice):
         return invoice
 
     invoice.amount_paid = round2(allocated_to(invoice.client_id, "SalesInvoice", invoice.id))
+    applied_credit = round2(invoice.applied_credit)
     finalized = invoice.posted_at is not None
+    effective_paid = round2(invoice.amount_paid + applied_credit)
     invoice.status = derive_payment_status(
-        invoice.total, invoice.amount_paid, finalized=finalized
+        invoice.total, effective_paid, finalized=finalized
     )
     invoice.save(update_fields=["amount_paid", "status", "updated_at"])
 
@@ -283,7 +300,8 @@ def invoice_outstanding(invoice):
     from apps.core.money import ageing_bucket
 
     paid = round2(allocated_to(invoice.client_id, "SalesInvoice", invoice.id))
-    outstanding = round2(D(invoice.total) - paid)
+    applied_credit = round2(invoice.applied_credit)
+    outstanding = round2(D(invoice.total) - paid - applied_credit)
     outstanding = outstanding if outstanding > ZERO else ZERO
     today = timezone.localdate()
     days_overdue = (
@@ -327,14 +345,338 @@ def invoice_outstanding(invoice):
         "gst": round2(invoice.total_tax),
         "paid": paid,
         "paidAgainstInvoice": paid,
+        "appliedCredit": applied_credit,
         "withoutBillCash": without_bill_cash,
         "totalReceived": total_received,
         "outstanding": outstanding,
+        "balanceDue": outstanding,
+        "remainingDue": outstanding,
         "dueDate": invoice.due_date,
         "daysOverdue": max(days_overdue, 0),
         "ageingBucket": ageing_bucket(days_overdue),
     }
 
+
+def get_party_available_credit_sources(client_id, party_id, *, for_update=False):
+    """
+    Retrieve persisted available credit sources for a party (FIFO by date).
+    Tracks original credit, allocated credit, and unused credit separately.
+    Requirements:
+    1. Retrieve from persisted backend data.
+    2. Apply credit only to invoices belonging to that party.
+    3. Never apply the same credit twice.
+    4. Track original credit, allocated credit, and unused credit separately.
+    """
+    sources = []
+
+    # 1. Unallocated / partially allocated PaymentIn (with_bill advances)
+    pmt_qs = PaymentIn.objects.filter(
+        client_id=client_id,
+        party_id=party_id,
+        payment_type="WITH_BILL",
+        status="Active",
+        deleted_at__isnull=True,
+    ).order_by("payment_date", "created_at")
+    if for_update:
+        pmt_qs = pmt_qs.select_for_update()
+
+    for pmt in pmt_qs:
+        direct_alloc = PaymentAllocation.objects.filter(
+            client_id=client_id, payment_id=pmt.id, payment_side="in", deleted_at__isnull=True
+        ).aggregate(val=Coalesce(Sum("amount"), Value(Decimal("0.00")), output_field=DecimalField(max_digits=18, decimal_places=2)))["val"] or ZERO
+
+        credit_alloc = CreditAllocation.objects.filter(
+            client_id=client_id, payment_id=pmt.id, deleted_at__isnull=True
+        ).aggregate(val=Coalesce(Sum("allocated_amount"), Value(Decimal("0.00")), output_field=DecimalField(max_digits=18, decimal_places=2)))["val"] or ZERO
+
+        total_allocated = round2(direct_alloc + credit_alloc)
+        original_credit = round2(pmt.amount)
+        unused_credit = max(ZERO, round2(original_credit - total_allocated))
+
+        if unused_credit > ZERO:
+            sources.append({
+                "type": "PAYMENT_IN",
+                "source": pmt,
+                "id": pmt.id,
+                "reference": pmt.payment_number,
+                "original_credit": original_credit,
+                "allocated_credit": total_allocated,
+                "unused_credit": unused_credit,
+                "date": pmt.payment_date,
+            })
+
+    # 2. Unallocated / standalone SalesReturn (Credit Notes)
+    ret_qs = SalesReturn.objects.filter(
+        client_id=client_id,
+        party_id=party_id,
+        status="Posted",
+        deleted_at__isnull=True,
+    ).order_by("doc_date", "created_at")
+    if for_update:
+        ret_qs = ret_qs.select_for_update()
+
+    for ret in ret_qs:
+        credit_alloc = CreditAllocation.objects.filter(
+            client_id=client_id, sales_return_id=ret.id, deleted_at__isnull=True
+        ).aggregate(val=Coalesce(Sum("allocated_amount"), Value(Decimal("0.00")), output_field=DecimalField(max_digits=18, decimal_places=2)))["val"] or ZERO
+
+        original_credit = round2(ret.total)
+        # Check if already offset against an active parent invoice
+        parent_due = ZERO
+        parent_invoice_active = False
+        if ret.sales_invoice_id:
+            parent_inv = SalesInvoice.objects.filter(
+                id=ret.sales_invoice_id, client_id=client_id, deleted_at__isnull=True
+            ).exclude(status="Cancelled").first()
+            if parent_inv:
+                parent_invoice_active = True
+                parent_due = round2(parent_inv.total - parent_inv.amount_paid)
+
+        used_credit = round2(credit_alloc)
+        if not parent_invoice_active or parent_due <= ZERO:
+            unused_credit = max(ZERO, round2(original_credit - used_credit))
+            if unused_credit > ZERO:
+                sources.append({
+                    "type": "SALES_RETURN",
+                    "source": ret,
+                    "id": ret.id,
+                    "reference": ret.credit_note_number or ret.return_number,
+                    "original_credit": original_credit,
+                    "allocated_credit": used_credit,
+                    "unused_credit": unused_credit,
+                    "date": ret.doc_date,
+                })
+
+    # 3. Opening Advance / Credit Balance on Party
+    from apps.masters.models import Party
+    party_obj = Party.objects.filter(pk=party_id, client_id=client_id).first()
+    if party_obj and party_obj.opening_balance and party_obj.opening_balance < ZERO:
+        orig_credit = abs(round2(party_obj.opening_balance))
+        alloc_val = CreditAllocation.objects.filter(
+            client_id=client_id, party_id=party_id, source_type="PARTY_CREDIT", deleted_at__isnull=True
+        ).aggregate(
+            val=Coalesce(Sum("allocated_amount"), Value(Decimal("0.00")), output_field=DecimalField(max_digits=18, decimal_places=2))
+        )["val"] or ZERO
+        unused = max(ZERO, round2(orig_credit - alloc_val))
+        if unused > ZERO:
+            sources.append({
+                "type": "PARTY_CREDIT",
+                "source": party_obj,
+                "id": party_obj.id,
+                "reference": f"Opening Credit ({party_obj.name})",
+                "original_credit": orig_credit,
+                "allocated_credit": alloc_val,
+                "unused_credit": unused,
+                "date": party_obj.created_at.date() if hasattr(party_obj, "created_at") and party_obj.created_at else None,
+            })
+
+    return sources
+
+
+def get_party_available_credit(client_id, party_id):
+    """Return total available unused credit for a party."""
+    sources = get_party_available_credit_sources(client_id, party_id, for_update=False)
+    return round2(sum((s["unused_credit"] for s in sources), ZERO))
+
+
+@transaction.atomic
+def apply_party_credit_to_invoice(invoice, *, user=None, credit_amount=None):
+    """
+    Connect party/customer available credit with sales invoice creation.
+    Applies eligible, unused credit to the invoice.
+    Requirements:
+    1. Retrieve party available credit from persisted backend data.
+    2. Apply credit only to invoices belonging to that party.
+    3. Never apply the same credit twice.
+    4. Track original credit, allocated credit, and unused credit separately.
+    5. If credit < invoice total, apply available eligible amount.
+    6. If credit >= invoice total, invoice due becomes 0 and is not payable.
+    7. Excess credit remains available for future eligible invoices.
+    8. Support multiple invoices for same party without duplication.
+    9. Locking with select_for_update.
+    10. Consistency on create, edit, cancel, reversals.
+    """
+    from apps.masters.models import Party
+    invoice = SalesInvoice.objects.select_for_update().get(pk=invoice.pk)
+    if invoice.status == "Cancelled":
+        return invoice
+    if not invoice.party_id:
+        return invoice
+
+    party = Party.objects.select_for_update().get(pk=invoice.party_id)
+    invoice_gross = round2(invoice.total)
+    direct_paid = round2(allocated_to(invoice.client_id, "SalesInvoice", invoice.id))
+    existing_credit = invoice.credit_allocations.filter(deleted_at__isnull=True).aggregate(
+        val=Coalesce(Sum("allocated_amount"), Value(Decimal("0.00")), output_field=DecimalField(max_digits=18, decimal_places=2))
+    )["val"] or ZERO
+
+    remaining_due = max(ZERO, round2(invoice_gross - direct_paid - existing_credit))
+    if remaining_due <= ZERO:
+        refresh_invoice_payment_status(invoice)
+        return invoice
+
+    if credit_amount is not None:
+        needed = min(remaining_due, round2(Decimal(str(credit_amount))))
+    else:
+        needed = remaining_due
+
+    if needed <= ZERO:
+        refresh_invoice_payment_status(invoice)
+        return invoice
+
+    sources = get_party_available_credit_sources(invoice.client_id, party.id, for_update=True)
+    remaining_needed = needed
+
+    for s in sources:
+        if remaining_needed <= ZERO:
+            break
+        take = round2(min(s["unused_credit"], remaining_needed))
+        if take <= ZERO:
+            continue
+
+        CreditAllocation.objects.create(
+            client_id=invoice.client_id,
+            party_id=party.id,
+            invoice=invoice,
+            source_type=s["type"],
+            payment=s["source"] if s["type"] == "PAYMENT_IN" else None,
+            sales_return=s["source"] if s["type"] == "SALES_RETURN" else None,
+            source_reference=s["reference"],
+            original_credit=s["original_credit"],
+            allocated_amount=take,
+            allocated_by=user if getattr(user, "is_authenticated", False) else None,
+            notes=f"Auto-applied credit from {s['reference']} to {invoice.invoice_number or invoice.id}",
+        )
+
+        if s["type"] == "PAYMENT_IN":
+            pmt = s["source"]
+            direct_alloc = PaymentAllocation.objects.filter(
+                client_id=invoice.client_id, payment_id=pmt.id, payment_side="in", deleted_at__isnull=True
+            ).aggregate(val=Coalesce(Sum("amount"), Value(Decimal("0.00")), output_field=DecimalField(max_digits=18, decimal_places=2)))["val"] or ZERO
+            credit_alloc = CreditAllocation.objects.filter(
+                client_id=invoice.client_id, payment_id=pmt.id, deleted_at__isnull=True
+            ).aggregate(val=Coalesce(Sum("allocated_amount"), Value(Decimal("0.00")), output_field=DecimalField(max_digits=18, decimal_places=2)))["val"] or ZERO
+            pmt.allocated_amount = round2(direct_alloc + credit_alloc)
+            pmt.save(update_fields=["allocated_amount", "updated_at"])
+
+        remaining_needed = round2(remaining_needed - take)
+
+    refresh_invoice_payment_status(invoice)
+    ledger.recalculate_party_balance(invoice.client_id, party)
+    invoice.refresh_from_db()
+    return invoice
+
+
+@transaction.atomic
+def remove_party_credit_from_invoice(invoice, allocation_id=None, *, user=None):
+    """Reverse or remove credit allocation from an invoice."""
+    invoice = SalesInvoice.objects.select_for_update().get(pk=invoice.pk)
+    qs = invoice.credit_allocations.filter(deleted_at__isnull=True)
+    if allocation_id:
+        qs = qs.filter(pk=allocation_id)
+    allocations = list(qs.select_related("payment"))
+    for alloc in allocations:
+        pmt = alloc.payment
+        alloc.delete()
+        if pmt:
+            direct_alloc = PaymentAllocation.objects.filter(
+                client_id=invoice.client_id, payment_id=pmt.id, payment_side="in", deleted_at__isnull=True
+            ).aggregate(val=Coalesce(Sum("amount"), Value(Decimal("0.00")), output_field=DecimalField(max_digits=18, decimal_places=2)))["val"] or ZERO
+            credit_alloc = CreditAllocation.objects.filter(
+                client_id=invoice.client_id, payment_id=pmt.id, deleted_at__isnull=True
+            ).aggregate(val=Coalesce(Sum("allocated_amount"), Value(Decimal("0.00")), output_field=DecimalField(max_digits=18, decimal_places=2)))["val"] or ZERO
+            pmt.allocated_amount = round2(direct_alloc + credit_alloc)
+            pmt.save(update_fields=["allocated_amount", "updated_at"])
+
+    refresh_invoice_payment_status(invoice)
+    ledger.recalculate_party_balance(invoice.client_id, invoice.party_id)
+    invoice.refresh_from_db()
+    return invoice
+@transaction.atomic
+def allocate_cash_receipt_to_invoice(receipt, invoice, *, amount=None, user=None):
+    """
+    Explicitly allocate an existing unallocated/partially allocated cash receipt
+    to an invoice belonging to the same party.
+    Requirements:
+    - Reduce invoice due exactly once.
+    - Prevent allocating to unrelated party's invoice.
+    - Prevent the same receipt from being allocated more than once (or exceeding receipt amount).
+    - Exclude from future available advance.
+    """
+    receipt = CashPaymentReceipt.objects.select_for_update().get(pk=receipt.pk)
+    if receipt.status in ("CANCELLED", "VOIDED"):
+        raise BusinessRuleViolation("Cannot allocate a cancelled or voided cash receipt.", code=Codes.ALREADY_CANCELLED)
+
+    invoice = SalesInvoice.objects.select_for_update().get(pk=invoice.pk)
+    if invoice.status == "Cancelled":
+        raise BusinessRuleViolation("Cannot allocate cash receipt to a cancelled invoice.", code=Codes.INVOICE_CANCELLED)
+    if invoice.posted_at is None or invoice.status == "Draft":
+        raise BusinessRuleViolation("Cannot allocate cash receipt to a draft invoice. Finalize it first.", code=Codes.PAYMENT_ON_DRAFT)
+
+    if receipt.party_id != invoice.party_id:
+        raise BusinessRuleViolation(
+            f"Cannot allocate cash receipt of customer {receipt.party_id} to invoice of customer {invoice.party_id}.",
+            code="CROSS_CUSTOMER_ALLOCATION_NOT_ALLOWED",
+        )
+
+    # Check already allocated from this receipt / payment
+    already_alloc = CreditAllocation.objects.filter(
+        client_id=receipt.client_id,
+        payment_id=receipt.payment_id,
+        deleted_at__isnull=True,
+    ).aggregate(
+        val=Coalesce(Sum("allocated_amount"), Value(Decimal("0.00")), output_field=DecimalField(max_digits=18, decimal_places=2))
+    )["val"] or ZERO
+
+    avail = max(ZERO, round2(receipt.amount - already_alloc))
+    if avail <= ROUNDING_TOLERANCE:
+        raise BusinessRuleViolation(
+            "This cash receipt has already been fully allocated.",
+            code="RECEIPT_ALREADY_ALLOCATED",
+        )
+
+    rem_inv_due = round2(invoice.balance_due)
+    if rem_inv_due <= ROUNDING_TOLERANCE:
+        raise BusinessRuleViolation("This invoice is already fully paid.", code=Codes.ALREADY_SETTLED)
+
+    requested = round2(amount) if amount is not None else min(avail, rem_inv_due)
+    if requested <= ZERO:
+        raise BusinessRuleViolation("Allocation amount must be greater than zero.", code="INVALID_AMOUNT")
+    if requested > avail + ROUNDING_TOLERANCE:
+        raise BusinessRuleViolation(
+            f"Requested allocation ({requested}) exceeds available cash receipt amount ({avail}).",
+            code="ALLOCATION_EXCEEDS_AVAILABLE",
+        )
+    if requested > rem_inv_due + ROUNDING_TOLERANCE:
+        raise BusinessRuleViolation(
+            f"Requested allocation ({requested}) exceeds remaining invoice due ({rem_inv_due}).",
+            code="ALLOCATION_EXCEEDS_DUE",
+        )
+
+    CreditAllocation.objects.create(
+        client_id=receipt.client_id,
+        party_id=receipt.party_id,
+        invoice=invoice,
+        payment=receipt.payment,
+        source_type="PAYMENT_IN",
+        source_reference=receipt.receipt_number,
+        original_credit=receipt.amount,
+        allocated_amount=requested,
+        allocated_by=user if getattr(user, "is_authenticated", False) else None,
+        notes=f"Allocated cash receipt {receipt.receipt_number} to invoice {invoice.invoice_number or invoice.id}",
+    )
+
+    receipt.invoice = invoice
+    receipt.save(update_fields=["invoice", "updated_at"])
+
+    if receipt.payment:
+        p = receipt.payment
+        p.allocated_amount = round2(already_alloc + requested)
+        p.save(update_fields=["allocated_amount", "updated_at"])
+
+    refresh_invoice_payment_status(invoice)
+    ledger.recalculate_party_balance(receipt.client_id, receipt.party_id)
+    return receipt
 
 @transaction.atomic
 def update_sales_allocation(
@@ -443,9 +785,17 @@ def update_sales_allocation(
         invoice.round_off = round_diff
         recalculate_document(invoice, lines=lines, save=True)
     else:
+        charges = round2(
+            (invoice.freight_charges or ZERO)
+            + (invoice.other_charges or ZERO)
+            + (invoice.round_off or ZERO)
+            - (invoice.total_discount or ZERO)
+            + (invoice.total_tax or ZERO)
+        )
+        invoice.subtotal = round2(formal_inv - charges)
+        invoice.taxable_value = invoice.subtotal
         invoice.total = formal_inv
-        invoice.taxable_value = formal_inv
-        invoice.save(update_fields=["total", "taxable_value", "updated_at"])
+        invoice.save(update_fields=["subtotal", "taxable_value", "total", "updated_at"])
 
     invoice.total_sales_value = total_sales
     invoice.cash_amount = cash
@@ -566,10 +916,11 @@ def display_status(invoice):
     if (
         invoice.due_date
         and invoice.due_date < timezone.localdate()
-        and D(invoice.total) - D(invoice.amount_paid) > ROUNDING_TOLERANCE
+        and invoice.balance_due > ROUNDING_TOLERANCE
     ):
         return "Overdue"
     return invoice.status
+
 
 
 # ---------------------------------------------------------------------------
@@ -634,6 +985,10 @@ def finalize_invoice(invoice, *, user=None, override_credit_limit=False):
     if invoice.sales_order_id:
         _advance_order_stage(invoice.sales_order)
 
+    # 6. Apply available eligible credit from party
+    apply_party_credit_to_invoice(invoice, user=user)
+    invoice.refresh_from_db()
+
     return invoice
 
 
@@ -644,6 +999,8 @@ def _post_invoice_stock(invoice, lines, *, user=None):
     source order line and tracking the exact quantity already dispatched prevents
     both under-depletion on partial challans and double-depletion.
     """
+    from apps.inventory.models import StockBalance
+
     location_id = invoice.location_id
 
     for line in lines:
@@ -680,14 +1037,31 @@ def _post_invoice_stock(invoice, lines, *, user=None):
         if qty_to_deduct <= ZERO:
             continue
 
-        if location_id is None:
-            location_id = _default_location_id(invoice.client_id)
+        # Resolve warehouse location for this line:
+        # 1. Invoice-level location (if specified)
+        # 2. Line item's default location
+        # 3. Warehouse where stock is currently available (>0)
+        # 4. Fallback to client default warehouse
+        line_location_id = location_id or getattr(line.item, "default_location_id", None)
+        if line_location_id is None or not StockBalance.objects.filter(
+            client_id=invoice.client_id, item_id=line.item_id, location_id=line_location_id, on_hand__gt=0, deleted_at__isnull=True
+        ).exists():
+            stock_loc = (
+                StockBalance.objects.filter(
+                    client_id=invoice.client_id,
+                    item_id=line.item_id,
+                    on_hand__gt=0,
+                    deleted_at__isnull=True,
+                )
+                .values_list("location_id", flat=True)
+                .first()
+            )
+            if stock_loc:
+                line_location_id = stock_loc
+            elif line_location_id is None:
+                line_location_id = _default_location_id(invoice.client_id)
 
         stock.assert_not_qc_blocked(invoice.client_id, line.item_id, line.item_name)
-        stock.assert_sufficient_stock(
-            invoice.client_id, line.item, qty_to_deduct, location_id, line.item_name,
-            own_reserved=_own_reservation(line),
-        )
 
         serials = stock.serials_for_lines(
             invoice.client_id, "sales_invoice_lines", [line.id]
@@ -698,7 +1072,7 @@ def _post_invoice_stock(invoice, lines, *, user=None):
         movement = stock.post_movement(
             client_id=invoice.client_id,
             item=line.item_id,
-            location=location_id,
+            location=line_location_id,
             type="SALE",
             quantity=-D(qty_to_deduct),
             unit_cost=line.item.cost_price,
@@ -707,6 +1081,7 @@ def _post_invoice_stock(invoice, lines, *, user=None):
             reference_number=invoice.invoice_number,
             movement_date=invoice.doc_date,
             user=user,
+            allow_negative=True,
         )
         if resolved:
             stock.set_serial_status(resolved, "sold", movement=movement)
@@ -1003,6 +1378,26 @@ def cancel_invoice(invoice, *, reason=None, user=None):
         [("Credit note", invoice.returns.filter(deleted_at__isnull=True).exclude(status="Cancelled"))],
     )
 
+    # Release credit allocations so credit is restored to party available credit
+    credit_allocs = list(invoice.credit_allocations.filter(deleted_at__isnull=True).select_related("payment"))
+    for alloc in credit_allocs:
+        pmt = alloc.payment
+        alloc.delete()
+        if pmt:
+            direct_alloc = PaymentAllocation.objects.filter(
+                client_id=invoice.client_id, payment_id=pmt.id, payment_side="in", deleted_at__isnull=True
+            ).aggregate(val=Coalesce(Sum("amount"), Value(Decimal("0.00")), output_field=DecimalField(max_digits=18, decimal_places=2)))["val"] or ZERO
+            credit_alloc_sum = CreditAllocation.objects.filter(
+                client_id=invoice.client_id, payment_id=pmt.id, deleted_at__isnull=True
+            ).aggregate(val=Coalesce(Sum("allocated_amount"), Value(Decimal("0.00")), output_field=DecimalField(max_digits=18, decimal_places=2)))["val"] or ZERO
+            pmt.allocated_amount = round2(direct_alloc + credit_alloc_sum)
+            pmt.save(update_fields=["allocated_amount", "updated_at"])
+
+    # Unlink any linked cash payment receipts so they don't remain attached to a cancelled invoice
+    CashPaymentReceipt.objects.filter(
+        client_id=invoice.client_id, invoice_id=invoice.id, deleted_at__isnull=True
+    ).update(invoice=None)
+
     _reverse_document(invoice, "SalesInvoice", user=user, reason=reason)
 
     # Release the order rollup.
@@ -1022,6 +1417,10 @@ def cancel_invoice(invoice, *, reason=None, user=None):
             order.stage = "Delivered"
             order.save(update_fields=["stage", "updated_at"])
         refresh_order_payment_status(order)
+
+    if invoice.party_id:
+        ledger.recalculate_party_balance(invoice.client_id, invoice.party_id)
+
 
     return invoice
 
@@ -1169,6 +1568,24 @@ def record_payment_in(
             payment.journal_entry = entry
             payment.save(update_fields=["journal_entry", "updated_at"])
 
+        if invoice is not None:
+            # Allocate cash receipt amount to this invoice via CreditAllocation
+            CreditAllocation.objects.create(
+                client_id=client.id,
+                party_id=party.id,
+                invoice=invoice,
+                payment=payment,
+                source_type="PAYMENT_IN",
+                source_reference=cpr_number,
+                original_credit=amount,
+                allocated_amount=amount,
+                allocated_by=user if getattr(user, "is_authenticated", False) else None,
+                notes=f"Allocated cash receipt {cpr_number} to invoice {invoice.invoice_number or invoice.id}",
+            )
+            payment.allocated_amount = amount
+            payment.save(update_fields=["allocated_amount", "updated_at"])
+            refresh_invoice_payment_status(invoice)
+
         ledger.recalculate_party_balance(client.id, party)
         return payment
 
@@ -1254,8 +1671,22 @@ def allocate_payment_in(payment, allocations, *, user=None):
                 code="CROSS_CUSTOMER_ALLOCATION_NOT_ALLOWED",
             )
 
+        # Prevent double-allocation: If this payment is already applied as credit to this invoice, reject
+        has_credit_alloc = CreditAllocation.objects.filter(
+            client_id=payment.client_id,
+            payment_id=payment.id,
+            invoice_id=invoice.id,
+            deleted_at__isnull=True,
+        ).exists()
+        if has_credit_alloc:
+            raise BusinessRuleViolation(
+                f"This payment has already been applied as credit to invoice {invoice.invoice_number or invoice.id}. Cannot allocate it again as direct payment.",
+                code="PAYMENT_ALREADY_CREDIT_ALLOCATED",
+            )
+
         already = round2(allocated_to(payment.client_id, "SalesInvoice", invoice.id))
-        balance = round2(D(invoice.total) - already)
+        applied_credit = round2(invoice.applied_credit)
+        balance = max(ZERO, round2((invoice.total or ZERO) - already - applied_credit))
         if balance <= ROUNDING_TOLERANCE:
             raise BusinessRuleViolation(
                 "This invoice is already fully paid.", code=Codes.ALREADY_SETTLED
@@ -1268,27 +1699,48 @@ def allocate_payment_in(payment, allocations, *, user=None):
                 payload={"requested": str(requested), "balance": str(balance)},
             )
 
-        PaymentAllocation.objects.create(
+        existing_alloc = PaymentAllocation.objects.filter(
             client_id=payment.client_id,
             payment_id=payment.id,
             payment_side="in",
             document_type="SalesInvoice",
             document_id=invoice.id,
-            amount=requested,
-            allocated_by=user if getattr(user, "is_authenticated", False) else None,
-        )
+            deleted_at__isnull=True,
+        ).first()
+
+        if existing_alloc:
+            existing_alloc.amount = requested
+            existing_alloc.save(update_fields=["amount", "updated_at"])
+        else:
+            PaymentAllocation.objects.create(
+                client_id=payment.client_id,
+                payment_id=payment.id,
+                payment_side="in",
+                document_type="SalesInvoice",
+                document_id=invoice.id,
+                amount=requested,
+                allocated_by=user if getattr(user, "is_authenticated", False) else None,
+            )
         allocated += requested
         refresh_invoice_payment_status(invoice)
 
-    total_allocated = round2(
-        PaymentAllocation.objects.filter(
-            client_id=payment.client_id, payment_side="in", payment_id=payment.id,
-            deleted_at__isnull=True,
-        ).aggregate(
-            value=Coalesce(Sum("amount"), Value(Decimal("0.00")),
-                           output_field=DecimalField(max_digits=18, decimal_places=2))
-        )["value"]
-    )
+    direct_allocated = PaymentAllocation.objects.filter(
+        client_id=payment.client_id, payment_side="in", payment_id=payment.id,
+        deleted_at__isnull=True,
+    ).aggregate(
+        value=Coalesce(Sum("amount"), Value(Decimal("0.00")),
+                       output_field=DecimalField(max_digits=18, decimal_places=2))
+    )["value"] or ZERO
+
+    credit_allocated = CreditAllocation.objects.filter(
+        client_id=payment.client_id, payment_id=payment.id,
+        deleted_at__isnull=True,
+    ).aggregate(
+        value=Coalesce(Sum("allocated_amount"), Value(Decimal("0.00")),
+                       output_field=DecimalField(max_digits=18, decimal_places=2))
+    )["value"] or ZERO
+
+    total_allocated = round2(direct_allocated + credit_allocated)
     if total_allocated > D(payment.amount) + ROUNDING_TOLERANCE:
         raise BusinessRuleViolation(
             "Allocations exceed the payment amount.",
@@ -1313,6 +1765,15 @@ def cancel_payment_in(payment, *, reason=None, user=None):
     )
     PaymentAllocation.objects.filter(
         client_id=payment.client_id, payment_side="in", payment_id=payment.id
+    ).update(deleted_at=timezone.now())
+
+    credit_alloc_invoices = list(
+        CreditAllocation.objects.filter(
+            client_id=payment.client_id, payment_id=payment.id, deleted_at__isnull=True
+        ).values_list("invoice_id", flat=True)
+    )
+    CreditAllocation.objects.filter(
+        client_id=payment.client_id, payment_id=payment.id
     ).update(deleted_at=timezone.now())
 
     payment.status = "Cancelled"
@@ -1345,7 +1806,8 @@ def cancel_payment_in(payment, *, reason=None, user=None):
         source_document_id=payment.id,
         user=user,
     )
-    for invoice in SalesInvoice.objects.filter(pk__in=invoice_ids):
+    all_affected_invoice_ids = set(invoice_ids) | set(credit_alloc_invoices)
+    for invoice in SalesInvoice.objects.filter(pk__in=all_affected_invoice_ids):
         refresh_invoice_payment_status(invoice)
     ledger.recalculate_party_balance(payment.client_id, payment.party_id)
     return payment

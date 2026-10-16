@@ -4,7 +4,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Count, DecimalField, F, Q, Sum, Value
+from django.db.models import Count, DecimalField, F, OuterRef, Q, Subquery, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from rest_framework import status
@@ -31,6 +31,7 @@ from .models import (
     SalesApprovalLink,
     METAL_LINE_FIELDS,
     CashPaymentReceipt,
+    CreditAllocation,
     DeliveryChallan,
     DeliveryChallanLine,
     Estimate,
@@ -244,6 +245,7 @@ class EstimateViewSet(ApprovalLinkActions, SalesDocumentViewSet):
     print_title = "Estimate"
     # An estimate is the draft of a quotation; writing one needs the quotation id.
     permission_map = {"read": ["view_sales"], "write": ["create_quotation"]}
+    draft_values = ("Draft", "Sent", "Rejected")
 
     def perform_create(self, serializer):
         # An estimate is numbered on creation: it is a quoting artefact, not a
@@ -253,35 +255,40 @@ class EstimateViewSet(ApprovalLinkActions, SalesDocumentViewSet):
         )
         return super().perform_create(serializer)
 
-    @action(detail=True, methods=["post"], url_path="convert-to-quotation")
+    @action(detail=True, methods=["post"], url_path="convert-to-order")
     @transaction.atomic
-    def convert_to_quotation(self, request, pk=None):
+    def convert_to_order(self, request, pk=None):
         estimate = self.get_object()
         if estimate.status == "Converted":
             raise Conflict(
                 "This estimate has already been converted.", code=Codes.ALREADY_DONE
             )
 
-        quotation = _clone_document(
+        order = _clone_document(
             estimate,
-            Quotation,
-            {"estimate": estimate, "status": "Draft"},
-            number_field="quotation_number",
-            series="QT",
-            line_model_name="QuotationLine",
-            line_fk="quotation",
+            SalesOrder,
+            {"stage": "Draft"},
+            number_field="order_number",
+            series="SO",
+            line_model_name="SalesOrderLine",
+            line_fk="sales_order",
         )
 
         estimate.status = "Converted"
-        estimate.converted_quotation = quotation
-        estimate.save(update_fields=["status", "converted_quotation", "updated_at"])
+        estimate.save(update_fields=["status", "updated_at"])
         self.write_audit(
-            "convert", estimate, description=f"Converted to {quotation.quotation_number}"
+            "convert", estimate, description=f"Converted to {order.order_number}"
         )
         return Response(
-            QuotationSerializer(quotation, context=self.get_serializer_context()).data,
+            SalesOrderSerializer(order, context=self.get_serializer_context()).data,
             status=status.HTTP_201_CREATED,
         )
+
+    # Quotation conversion commented out per workflow update (Estimates directly convert to Sales Order)
+    # @action(detail=True, methods=["post"], url_path="convert-to-quotation")
+    # @transaction.atomic
+    # def convert_to_quotation(self, request, pk=None):
+    #     ...
 
     @action(detail=True, methods=["post"], url_path="convert-to-challan")
     @transaction.atomic
@@ -536,7 +543,7 @@ class QuotationViewSet(ApprovalLinkActions, SalesDocumentViewSet):
     print_title = "Quotation"
     filter_map = {"customerId": "party_id", "customer_id": "party_id"}
     permission_map = {"read": ["view_sales"], "write": ["create_quotation"]}
-    draft_values = ("Draft", "Sent")
+    draft_values = ("Draft", "Sent", "Rejected")
 
     def perform_create(self, serializer):
         serializer.validated_data["quotation_number"] = allocate_number(
@@ -845,11 +852,17 @@ class SalesOrderViewSet(SalesDocumentViewSet):
     audit_entity_type = "SalesOrder"
     audit_label_field = "order_number"
     status_field = "stage"
+    draft_status_field = "stage"
     print_title = "Sales Order"
     filter_map = {
         "customerId": "party_id",
         "stage": "stage",
         "paymentStatus": "payment_status",
+        # Client portal reorder: ?orderSource=Client%20Portal, ?isPortalOrder=true.
+        "orderSource": "order_source",
+        "order_source": "order_source",
+        "isPortalOrder": "is_portal_order",
+        "is_portal_order": "is_portal_order",
     }
     permission_map = {"read": ["view_sales"], "write": ["create_sales_order"]}
     draft_values = ("Draft",)
@@ -860,6 +873,10 @@ class SalesOrderViewSet(SalesDocumentViewSet):
         )
         return super().perform_create(serializer)
 
+    # Atomic as a whole (client portal reorder fix): the base save commits in
+    # its own atomic block, so without this a refused credit check answered 422
+    # but left the order Confirmed. Now the refusal rolls the stage change back.
+    @transaction.atomic
     def perform_update(self, serializer):
         """Confirming an order reserves stock (api.md §5.4).
 
@@ -876,6 +893,7 @@ class SalesOrderViewSet(SalesDocumentViewSet):
                 order.total,
                 user=self.request.user,
                 override=bool(self.request.data.get("overrideCreditLimit")),
+                exclude_order_id=order.id,
             )
         return order
 
@@ -1083,11 +1101,19 @@ class SalesOrderViewSet(SalesDocumentViewSet):
 
         order = self.get_object()
         if order.pms_project_id:
-            raise Conflict(
-                f"This order already has project {order.pms_project.code}.",
-                code=Codes.ALREADY_DONE,
-                payload={"projectId": str(order.pms_project_id)},
-            )
+            from apps.pms.models import Project
+            active_project = Project.objects.filter(
+                pk=order.pms_project_id, deleted_at__isnull=True
+            ).first()
+            if active_project:
+                raise Conflict(
+                    f"This order already has project {active_project.code}.",
+                    code=Codes.ALREADY_DONE,
+                    payload={"projectId": str(order.pms_project_id)},
+                )
+            else:
+                order.pms_project = None
+                order.save(update_fields=["pms_project", "updated_at"])
         project = create_project_from_order(
             order,
             project_manager_id=request.data.get("projectManagerId"),
@@ -1419,30 +1445,79 @@ class SalesInvoiceViewSet(ApprovalLinkActions, SalesDocumentViewSet):
         "finalize": ["finalize_invoice"],
         "cancel": ["cancel_invoice"],
         "allocate_split": ["create_invoice"],
+        "apply_credit": ["create_invoice"],
+        "remove_credit": ["create_invoice"],
     }
 
     def filter_queryset(self, queryset):
         queryset = super().filter_queryset(queryset)
+        credit_subquery = CreditAllocation.objects.filter(
+            invoice=OuterRef("pk"), deleted_at__isnull=True
+        ).exclude(
+            payment__status="Cancelled"
+        ).exclude(
+            sales_return__status="Cancelled"
+        ).values("invoice").annotate(s=Sum("allocated_amount")).values("s")
+
+        return_subquery = SalesReturn.objects.filter(
+            sales_invoice=OuterRef("pk"), deleted_at__isnull=True
+        ).exclude(
+            status="Cancelled"
+        ).values("sales_invoice").annotate(s=Sum("total")).values("s")
+
+        queryset = queryset.annotate(
+            _credit_applied=Coalesce(Subquery(credit_subquery, output_field=DecimalField(max_digits=18, decimal_places=2)), Value(Decimal("0.00")))
+            + Coalesce(Subquery(return_subquery, output_field=DecimalField(max_digits=18, decimal_places=2)), Value(Decimal("0.00")))
+        )
+
         if self.request.query_params.get("overdue") == "true":
             queryset = queryset.filter(
                 due_date__lt=timezone.localdate(),
-                total__gt=F("amount_paid"),
+                total__gt=F("amount_paid") + F("_credit_applied"),
+            ).exclude(status__in=["Cancelled", "Draft", "Paid"])
+
+        payable = self.request.query_params.get("payable") or self.request.query_params.get("isPayable")
+        if payable in ("true", "1", True):
+            queryset = queryset.filter(
+                posted_at__isnull=False,
+                total__gt=F("amount_paid") + F("_credit_applied"),
             ).exclude(status__in=["Cancelled", "Draft", "Paid"])
         return queryset
 
     def get_aggregates(self, queryset):
-        rows = queryset.aggregate(
+        credit_subquery = CreditAllocation.objects.filter(
+            invoice=OuterRef("pk"), deleted_at__isnull=True
+        ).exclude(
+            payment__status="Cancelled"
+        ).exclude(
+            sales_return__status="Cancelled"
+        ).values("invoice").annotate(s=Sum("allocated_amount")).values("s")
+
+        return_subquery = SalesReturn.objects.filter(
+            sales_invoice=OuterRef("pk"), deleted_at__isnull=True
+        ).exclude(
+            status="Cancelled"
+        ).values("sales_invoice").annotate(s=Sum("total")).values("s")
+
+        annotated_qs = queryset.annotate(
+            _credit_applied=Coalesce(Subquery(credit_subquery, output_field=DecimalField(max_digits=18, decimal_places=2)), Value(Decimal("0.00")))
+            + Coalesce(Subquery(return_subquery, output_field=DecimalField(max_digits=18, decimal_places=2)), Value(Decimal("0.00")))
+        )
+
+        rows = annotated_qs.aggregate(
             count=Count("id"),
             totalValue=money_sum("total"),
             paid=money_sum("amount_paid"),
+            totalCreditApplied=Coalesce(Sum("_credit_applied"), Value(Decimal("0.00")), output_field=DecimalField(max_digits=18, decimal_places=2)),
             draft=Count("id", filter=Q(status="Draft")),
             overdue=Count(
                 "id",
-                filter=Q(due_date__lt=timezone.localdate(), total__gt=F("amount_paid"))
+                filter=Q(due_date__lt=timezone.localdate(), total__gt=F("amount_paid") + F("_credit_applied"))
                 & ~Q(status__in=["Cancelled", "Draft", "Paid"]),
             ),
         )
-        rows["outstanding"] = round2(rows["totalValue"] - rows["paid"])
+        rows["creditApplied"] = round2(rows.get("totalCreditApplied", ZERO))
+        rows["outstanding"] = max(ZERO, round2(rows["totalValue"] - rows["paid"] - rows["creditApplied"]))
         return rows
 
     def perform_create(self, serializer):
@@ -1533,6 +1608,26 @@ class SalesInvoiceViewSet(ApprovalLinkActions, SalesDocumentViewSet):
     def outstanding(self, request, pk=None):
         return Response(services.invoice_outstanding(self.get_object()))
 
+    @action(detail=True, methods=["post"], url_path="apply-credit")
+    def apply_credit(self, request, pk=None):
+        invoice = self.get_object()
+        amount = request.data.get("amount")
+        invoice = services.apply_party_credit_to_invoice(
+            invoice, user=request.user, credit_amount=amount
+        )
+        self.write_audit("apply_credit", invoice, description=f"Applied credit {amount or 'auto'} to invoice")
+        return Response(self.get_serializer(invoice).data)
+
+    @action(detail=True, methods=["post"], url_path="remove-credit")
+    def remove_credit(self, request, pk=None):
+        invoice = self.get_object()
+        allocation_id = request.data.get("allocationId")
+        invoice = services.remove_party_credit_from_invoice(
+            invoice, allocation_id=allocation_id, user=request.user
+        )
+        self.write_audit("remove_credit", invoice, description="Removed credit allocation from invoice")
+        return Response(self.get_serializer(invoice).data)
+
     @action(detail=True, methods=["post"], url_path="e-invoice")
     def e_invoice(self, request, pk=None):
         """IRN / e-way bill hook (api.md §5.7, phase 2)."""
@@ -1582,15 +1677,40 @@ class PaymentInViewSet(TenantModelViewSet):
         description = self.request.data.get("description") or data.get("description")
         allocations = self.request.data.get("allocations") or []
         invoice_id = self.request.data.get("invoiceId")
-        invoice = None
-        if invoice_id:
+        invoice = data.get("invoice")
+        if not invoice and invoice_id:
             invoice = SalesInvoice.objects.filter(
                 pk=invoice_id, client_id=self.get_client_id(), deleted_at__isnull=True
             ).first()
-            if invoice is None and payment_type == "WITH_BILL":
-                raise NotFound("That invoice no longer exists.")
-            if invoice and invoice.party_id != data["party"].id:
-                raise ValidationError({"invoiceId": ["Cannot allocate payment to another customer's invoice."]})
+        if invoice is None and invoice_id and payment_type == "WITH_BILL":
+            raise NotFound("That invoice no longer exists.")
+        if invoice:
+            if invoice.party_id != data["party"].id:
+                raise ValidationFailed(
+                    "Cannot allocate payment to another customer's invoice.",
+                    field_errors={"invoiceId": ["Cannot allocate payment to another customer's invoice."]},
+                )
+            if invoice.status == "Cancelled":
+                raise ValidationFailed(
+                    "Cannot record payment against a cancelled invoice.",
+                    field_errors={"invoiceId": ["Cannot record payment against a cancelled invoice."]},
+                )
+            if invoice.posted_at is None or invoice.status == "Draft":
+                raise ValidationFailed(
+                    "Cannot record payment against a draft invoice. Finalize it first.",
+                    field_errors={"invoiceId": ["Cannot record payment against a draft invoice. Finalize it first."]},
+                )
+            if invoice.balance_due <= Decimal("0.01") or invoice.status == "Paid":
+                raise ValidationFailed(
+                    "This invoice is already fully paid.",
+                    field_errors={"invoiceId": ["This invoice is already fully paid."]},
+                )
+            if payment_type == "WITH_BILL" and data["amount"] > invoice.balance_due + Decimal("0.01"):
+                raise ValidationFailed(
+                    f"Payment amount exceeds the remaining invoice balance ({invoice.balance_due}).",
+                    field_errors={"amount": [f"Payment amount exceeds the remaining invoice balance ({invoice.balance_due})."]},
+                )
+
 
         payment = services.record_payment_in(
             client=self.request.user.client,
@@ -1674,6 +1794,27 @@ class CashPaymentReceiptViewSet(TenantModelViewSet):
         data = serializer.validated_data
         invoice = data.get("invoice")
         party = data.get("party")
+        if invoice:
+            if invoice.party_id != party.id:
+                raise ValidationFailed(
+                    "Cannot link cash receipt to another customer's invoice.",
+                    field_errors={"invoiceId": ["Cannot link cash receipt to another customer's invoice."]},
+                )
+            if invoice.status == "Cancelled":
+                raise ValidationFailed(
+                    "Cannot link cash receipt to a cancelled invoice.",
+                    field_errors={"invoiceId": ["Cannot link cash receipt to a cancelled invoice."]},
+                )
+            if invoice.posted_at is None or invoice.status == "Draft":
+                raise ValidationFailed(
+                    "Cannot link cash receipt to a draft invoice. Finalize it first.",
+                    field_errors={"invoiceId": ["Cannot link cash receipt to a draft invoice. Finalize it first."]},
+                )
+            if invoice.balance_due <= Decimal("0.01") or invoice.status == "Paid":
+                raise ValidationFailed(
+                    "This invoice is already fully paid.",
+                    field_errors={"invoiceId": ["This invoice is already fully paid."]},
+                )
         amount = data.get("amount")
         payment_date = data.get("payment_date")
         mode = data.get("mode") or "Cash"
@@ -1682,7 +1823,7 @@ class CashPaymentReceiptViewSet(TenantModelViewSet):
         reference_number = data.get("reference_number")
 
         payment = services.record_payment_in(
-            client=self.get_client(),
+            client=self.request.user.client,
             party=party,
             amount=amount,
             payment_date=payment_date,
@@ -1720,8 +1861,32 @@ class CashPaymentReceiptViewSet(TenantModelViewSet):
             user=request.user,
             void=True,
         )
-        self.write_audit("void", receipt, description=serializer.validated_data.get("reason"))
-        return Response(self.get_serializer(receipt).data)
+    @action(detail=True, methods=["post"], url_path="allocate-invoice")
+    def allocate_invoice(self, request, pk=None):
+        receipt = self.get_object()
+        invoice_id = request.data.get("invoiceId") or request.data.get("invoice_id")
+        if not invoice_id:
+            raise ValidationFailed("invoiceId is required.", field_errors={"invoiceId": ["Required."]})
+
+        invoice = SalesInvoice.objects.filter(
+            pk=invoice_id, client_id=self.get_client_id(), deleted_at__isnull=True
+        ).first()
+        if not invoice:
+            raise NotFound("That invoice no longer exists.")
+        if invoice.party_id != receipt.party_id:
+            raise ValidationFailed(
+                f"Cannot allocate cash receipt of customer {receipt.party_id} to invoice of customer {invoice.party_id}.",
+                field_errors={"invoiceId": ["Cannot allocate cash receipt to another customer's invoice."]},
+            )
+
+        amount_val = request.data.get("amount")
+        amount = Decimal(str(amount_val)) if amount_val is not None else None
+
+        updated_receipt = services.allocate_cash_receipt_to_invoice(
+            receipt, invoice, amount=amount, user=request.user
+        )
+        self.write_audit("allocate_invoice", updated_receipt, description=f"Allocated to {invoice.invoice_number}")
+        return Response(self.get_serializer(updated_receipt).data)
 
 
 # ---------------------------------------------------------------------------

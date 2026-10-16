@@ -116,8 +116,19 @@ def recalculate_project(project):
                 round(sum(s.completion_pct or 0 for s in stages) / len(stages))
             )
 
+    if project.start_date and project.planned_duration:
+        project.expected_completion_date = stage_expected_completion(
+            project.start_date, project.planned_duration, project.duration_unit or "Days"
+        )
     project.status = derive_project_status(project)
-    project.save(update_fields=["overall_completion_pct", "status", "updated_at"])
+    project.save(
+        update_fields=[
+            "overall_completion_pct",
+            "expected_completion_date",
+            "status",
+            "updated_at",
+        ]
+    )
     return project
 
 
@@ -193,6 +204,122 @@ def stage_expected_completion(start, duration, unit):
     return start + timedelta(hours=hours)
 
 
+@transaction.atomic
+def recalculate_project_timeline(project, now=None):
+    """Dynamically recalculates the project timeline and stage timelines.
+
+    1. Calculates the project expected completion date from project start_date
+       and planned_duration.
+    2. Keeps completed stages completely intact (actual start/completion datetimes,
+       status, progress percentage).
+    3. Chains remaining stages sequentially:
+       - If a stage is already started, preserves its actual/start_datetime and
+         computes its expected_completion_datetime from its planned_duration.
+       - If unstarted, calculates start_datetime from previous stage's expected completion
+         (or project start_date) and expected_completion_datetime from its duration.
+    4. If stage durations are missing, distributes available project duration evenly.
+    5. Re-evaluates project and stage overdue/at-risk statuses.
+    """
+    now = now or timezone.now()
+
+    # 1. Recalculate project expected_completion_date
+    if project.start_date and project.planned_duration:
+        project.expected_completion_date = stage_expected_completion(
+            project.start_date, project.planned_duration, project.duration_unit or "Days"
+        )
+    elif not project.expected_completion_date and project.start_date:
+        # Fallback if no project planned_duration: sum of stages or start_date
+        pass
+
+    # 2. Sequential stage timeline calculation
+    stages = list(
+        ProjectStage.objects.filter(project=project, deleted_at__isnull=True).order_by("sequence")
+    )
+    if stages:
+        cursor_datetime = project.start_date or now
+        for stage in stages:
+            if stage.status in CLOSED_STAGE_STATUSES:
+                # Keep completed stages intact!
+                if stage.actual_completion_datetime:
+                    cursor_datetime = stage.actual_completion_datetime
+                elif stage.expected_completion_datetime:
+                    cursor_datetime = stage.expected_completion_datetime
+                continue
+
+            # Stage is not closed
+            if stage.status == "In Progress" or stage.actual_start_datetime:
+                # If stage already has an actual start datetime, keep it
+                start_dt = stage.actual_start_datetime or stage.start_datetime or cursor_datetime
+            else:
+                # Unstarted / assigned stage follows sequential execution pipeline
+                start_dt = cursor_datetime
+
+            stage.start_datetime = start_dt
+
+            # Ensure stage has planned_duration
+            if not stage.planned_duration or float(stage.planned_duration) <= 0:
+                stage.planned_duration = Decimal("1.00")
+                if not stage.duration_unit:
+                    stage.duration_unit = project.duration_unit or "Days"
+
+            stage.expected_completion_datetime = stage_expected_completion(
+                stage.start_datetime, stage.planned_duration, stage.duration_unit or "Days"
+            )
+
+            if stage.expected_completion_datetime:
+                cursor_datetime = stage.expected_completion_datetime
+
+            stage.save(
+                update_fields=[
+                    "start_datetime",
+                    "expected_completion_datetime",
+                    "planned_duration",
+                    "duration_unit",
+                    "updated_at",
+                ]
+            )
+
+        # The project's final due date is determined by the completion of its stages
+        last_stage = stages[-1]
+        if last_stage.expected_completion_datetime:
+            project.expected_completion_date = last_stage.expected_completion_datetime
+            if project.start_date:
+                total_hours = (project.expected_completion_date - project.start_date).total_seconds() / 3600.0
+                if project.duration_unit == "Hours":
+                    project.planned_duration = Decimal(str(round(total_hours, 2)))
+                else:
+                    project.planned_duration = Decimal(str(round(total_hours / 24.0, 2)))
+    elif project.start_date and project.planned_duration:
+        # Fallback when no stages are configured yet
+        project.expected_completion_date = stage_expected_completion(
+            project.start_date, project.planned_duration, project.duration_unit or "Days"
+        )
+
+    # 3. Recalculate overall completion pct & status
+    total_weight = sum(s.weight_pct for s in stages)
+    if total_weight > 0:
+        weighted_sum = sum((s.completion_pct or 0) * (s.weight_pct or 0) for s in stages)
+        project.overall_completion_pct = int(round(float(weighted_sum) / float(total_weight)))
+    elif stages:
+        project.overall_completion_pct = int(
+            round(sum(s.completion_pct or 0 for s in stages) / len(stages))
+        )
+    else:
+        project.overall_completion_pct = 0
+
+    project.status = derive_project_status(project, now=now)
+    project.save(
+        update_fields=[
+            "expected_completion_date",
+            "planned_duration",
+            "overall_completion_pct",
+            "status",
+            "updated_at",
+        ]
+    )
+    return project
+
+
 # ---------------------------------------------------------------------------
 # The handoff gate (api.md §10.3)
 # ---------------------------------------------------------------------------
@@ -220,9 +347,19 @@ def handoff_blockers(stage, *, settings=None):
             }
         )
 
-    if Task.objects.filter(
-        stage=stage, status="Blocked", deleted_at__isnull=True
-    ).exists():
+    tasks_query = Task.objects.filter(stage=stage, deleted_at__isnull=True)
+    if tasks_query.exists():
+        incomplete_tasks = tasks_query.exclude(status="Completed").count()
+        if incomplete_tasks > 0:
+            blockers.append(
+                {
+                    "code": "INCOMPLETE_TASKS",
+                    "label": f"All tasks must be completed before handoff ({incomplete_tasks} task{'s' if incomplete_tasks > 1 else ''} remaining).",
+                    "hard": True,
+                }
+            )
+
+    if tasks_query.filter(status="Blocked").exists():
         blockers.append(
             {"code": Codes.BLOCKED_TASKS, "label": "A task on this stage is blocked.", "hard": True}
         )

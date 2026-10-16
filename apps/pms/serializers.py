@@ -304,6 +304,7 @@ class ProjectStageSerializer(BaseModelSerializer):
 class ProjectListSerializer(BaseModelSerializer):
     """The list row -- no nested children, so the list stays one query."""
 
+    code = serializers.CharField(required=False, allow_blank=True)
     crmOrderId = serializers.SerializerMethodField()
     crmCustomerId = serializers.CharField(source="party_id", read_only=True)
     customerName = serializers.CharField(source="customer_name", read_only=True)
@@ -315,6 +316,13 @@ class ProjectListSerializer(BaseModelSerializer):
     )
     overallCompletionPct = serializers.IntegerField(
         source="overall_completion_pct", read_only=True
+    )
+    plannedDuration = serializers.DecimalField(
+        source="planned_duration", max_digits=9, decimal_places=2,
+        coerce_to_string=False, required=False, allow_null=True,
+    )
+    durationUnit = serializers.CharField(
+        source="duration_unit", required=False, allow_null=True, default="Days"
     )
     startDate = serializers.DateTimeField(source="start_date", required=False, allow_null=True)
     expectedCompletionDate = serializers.DateTimeField(
@@ -333,10 +341,21 @@ class ProjectListSerializer(BaseModelSerializer):
             "id", "code", "crmOrderId", "crmCustomerId", "customerName",
             "productDetails", "projectManager", "currentStageId",
             "currentDepartment", "priority", "overallCompletionPct",
+            "plannedDuration", "durationUnit",
             "startDate", "expectedCompletionDate", "actualCompletionDate",
             "status", "isOverdue", "createdBy", "createdById",
             "created_at", "updated_at",
         ]
+
+    def validate_plannedDuration(self, value):
+        if value is not None and value <= 0:
+            raise serializers.ValidationError("Planned duration must be greater than zero.")
+        return value
+
+    def validate_durationUnit(self, value):
+        if value is not None and value not in ("Hours", "Days"):
+            raise serializers.ValidationError("Duration unit must be 'Hours' or 'Days'.")
+        return value
 
     def get_createdBy(self, project):
         if not project.created_by_id:
@@ -488,7 +507,9 @@ class LogDelaySerializer(BaseSerializer):
     reason = serializers.CharField()
     category = serializers.CharField()
     responsibleUserId = serializers.CharField(required=False, allow_null=True)
-    expectedRecoveryDate = serializers.DateField()
+    expectedRecoveryDate = serializers.DateField(
+        input_formats=["%Y-%m-%d", "%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "iso-8601"]
+    )
     recoveryPlan = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
 
@@ -543,6 +564,8 @@ class ProofShareSerializer(BaseModelSerializer):
 class ApplyTemplateSerializer(BaseSerializer):
     configIds = serializers.ListField(child=serializers.CharField(), allow_empty=False)
     stageWeights = serializers.DictField(required=False, default=dict)
+    stageDurations = serializers.DictField(required=False, default=dict)
+    stageDurationUnits = serializers.DictField(required=False, default=dict)
 
 
 class CompleteProjectSerializer(BaseSerializer):
@@ -561,9 +584,24 @@ class FromOrderSerializer(BaseSerializer):
         child=serializers.CharField(), required=False, default=list
     )
     stageWeights = serializers.DictField(required=False, default=dict)
+    stageDurations = serializers.DictField(required=False, default=dict)
+    stageDurationUnits = serializers.DictField(required=False, default=dict)
     stages = serializers.ListField(
         child=serializers.DictField(), required=False, default=list
     )
+    plannedDuration = serializers.DecimalField(
+        max_digits=9, decimal_places=2, required=False, allow_null=True
+    )
+    durationUnit = serializers.ChoiceField(
+        choices=["Hours", "Days"], required=False, default="Days"
+    )
+    startDate = serializers.DateTimeField(required=False, allow_null=True)
+    specifications = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+    def validate_plannedDuration(self, value):
+        if value is not None and value <= 0:
+            raise serializers.ValidationError("Planned duration must be greater than zero.")
+        return value
 
     def validate(self, attrs):
         if not attrs.get("salesOrderId"):

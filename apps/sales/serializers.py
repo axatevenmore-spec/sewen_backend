@@ -38,6 +38,7 @@ from .models import (
     SalesInvoiceLine,
     SalesInvoiceRevision,
     SalesOrder,
+    CreditAllocation,
     SalesOrderLine,
     SalesReturn,
     SalesReturnLine,
@@ -268,8 +269,15 @@ class SalesOrderSerializer(DocumentSerializer):
             "total_sales_value", "formal_invoice_amount", "cash_amount",
             "totalSalesValue", "formalInvoiceAmount", "cashAmount",
             "invoice", "cashReceipt",
+            "order_source", "is_portal_order", "portal_client_notes",
         ]
-        read_only_fields = READ_ONLY_HEADER_FIELDS + ["order_number", "payment_status"]
+        # Replaced (client portal reorder): the source fields are written only
+        # by the portal's place-order endpoint, never by a staff create / PATCH.
+        # read_only_fields = READ_ONLY_HEADER_FIELDS + ["order_number", "payment_status"]
+        read_only_fields = READ_ONLY_HEADER_FIELDS + [
+            "order_number", "payment_status",
+            "order_source", "is_portal_order", "portal_client_notes",
+        ]
 
     def get_invoice(self, order):
         inv = order.invoices.filter(deleted_at__isnull=True).exclude(status="Cancelled").first()
@@ -368,6 +376,13 @@ class DeliveryChallanSerializer(DocumentSerializer):
     line_fk_name = "delivery_challan"
     line_table_name = "delivery_challan_lines"
 
+    formal_invoice_amount = serializers.SerializerMethodField()
+
+    def get_formal_invoice_amount(self, obj):
+        if obj.sales_order and obj.sales_order.formal_invoice_amount is not None:
+            return obj.sales_order.formal_invoice_amount
+        return obj.total
+
     class Meta:
         model = DeliveryChallan
         fields = HEADER_FIELDS + [
@@ -376,8 +391,9 @@ class DeliveryChallanSerializer(DocumentSerializer):
             "delivery_location", "location", "delivered_at",
             # Weighbridge (sheet-metal dispatch is by weight).
             "weighbridge_slip", "gross_weight", "tare_weight", "net_weight",
+            "formal_invoice_amount",
         ]
-        read_only_fields = READ_ONLY_HEADER_FIELDS + ["challan_number", "delivered_at"]
+        read_only_fields = READ_ONLY_HEADER_FIELDS + ["challan_number", "delivered_at", "formal_invoice_amount"]
 
     def validate(self, attrs):
         """Net weight is gross - tare whenever both are known."""
@@ -419,6 +435,25 @@ class SalesInvoiceRevisionSerializer(BaseModelSerializer):
         ]
 
 
+class CreditAllocationSerializer(BaseModelSerializer):
+    id = serializers.UUIDField(read_only=True)
+    partyId = serializers.CharField(source="party_id", read_only=True)
+    invoiceId = serializers.CharField(source="invoice_id", read_only=True)
+    sourceType = serializers.CharField(source="source_type", read_only=True)
+    sourceReference = serializers.CharField(source="source_reference", read_only=True)
+    originalCredit = MoneyField(source="original_credit", read_only=True)
+    allocatedAmount = MoneyField(source="allocated_amount", read_only=True)
+    allocatedAt = serializers.DateTimeField(source="allocated_at", read_only=True)
+    notes = serializers.CharField(read_only=True)
+
+    class Meta:
+        model = CreditAllocation
+        fields = [
+            "id", "partyId", "invoiceId", "sourceType", "sourceReference",
+            "originalCredit", "allocatedAmount", "allocatedAt", "notes",
+        ]
+
+
 class SalesInvoiceSerializer(DocumentSerializer):
     line_model = SalesInvoiceLine
     line_serializer = SalesInvoiceLineSerializer
@@ -452,6 +487,12 @@ class SalesInvoiceSerializer(DocumentSerializer):
     totalSalesValue = MoneyField(source="total_sales_value", required=False, allow_null=True)
     formalInvoiceAmount = MoneyField(source="total", read_only=True)
     cashAmount = MoneyField(source="cash_amount", required=False)
+    paidAmount = MoneyField(source="amount_paid", read_only=True)
+    amountPaid = MoneyField(source="amount_paid", read_only=True)
+    appliedCredit = MoneyField(source="applied_credit", read_only=True)
+    creditAllocations = CreditAllocationSerializer(many=True, read_only=True)
+    balanceDue = MoneyField(source="balance_due", read_only=True)
+    remainingDue = MoneyField(source="remaining_due", read_only=True)
     totalAllocated = serializers.SerializerMethodField()
     remainingAmount = serializers.SerializerMethodField()
     revisions = SalesInvoiceRevisionSerializer(many=True, read_only=True)
@@ -464,7 +505,8 @@ class SalesInvoiceSerializer(DocumentSerializer):
             "sales_order", "delivery_challan", "proforma_invoice", "location",
             "salesOrderId", "deliveryChallanId", "proformaInvoiceId",
             "salesOrderNumber", "quotationId", "quotationNumber",
-            "totalSalesValue", "formalInvoiceAmount", "cashAmount",
+            "totalSalesValue", "formalInvoiceAmount", "cashAmount", "paidAmount", "amountPaid",
+            "appliedCredit", "creditAllocations", "balanceDue", "remainingDue",
             "totalAllocated", "remainingAmount", "revisions", "cashReceipt",
             "irn", "eway_bill_number",
         ]
@@ -493,6 +535,7 @@ class InvoiceOutstandingSerializer(BaseSerializer):
     totalSalesValue = MoneyField(required=False)
     formalInvoiceAmount = MoneyField(required=False)
     cashAmount = MoneyField(required=False)
+    appliedCredit = MoneyField(required=False)
     totalAllocated = MoneyField(required=False)
     remaining = MoneyField(required=False)
     taxableAmount = MoneyField(required=False)
@@ -502,9 +545,12 @@ class InvoiceOutstandingSerializer(BaseSerializer):
     withoutBillCash = MoneyField(required=False)
     totalReceived = MoneyField(required=False)
     outstanding = MoneyField()
+    balanceDue = MoneyField(required=False)
+    remainingDue = MoneyField(required=False)
     dueDate = serializers.DateField(allow_null=True)
     daysOverdue = serializers.IntegerField()
     ageingBucket = serializers.CharField()
+
 
 
 # ---------------------------------------------------------------------------
@@ -548,6 +594,16 @@ class CashPaymentReceiptSerializer(BaseModelSerializer):
             "receiptNumber", "paymentId", "status", "createdBy", "cancelledBy",
             "cancelledAt", "cancellationReason", "created_at", "updated_at",
         ]
+
+    def to_internal_value(self, data):
+        data = dict(data)
+        if "paymentDate" in data and "date" not in data:
+            data["date"] = data["paymentDate"]
+        if "mode" in data and "paymentMode" not in data:
+            data["paymentMode"] = data["mode"]
+        if "reference_number" in data and "referenceNumber" not in data:
+            data["referenceNumber"] = data["reference_number"]
+        return super().to_internal_value(data)
 
 
 class PaymentInSerializer(BaseModelSerializer):
@@ -738,3 +794,45 @@ class SalesReturnSerializer(DocumentSerializer):
 
 class ReasonSerializer(BaseSerializer):
     reason = serializers.CharField(required=False, allow_blank=True)
+
+
+# ---------------------------------------------------------------------------
+# Client portal reorder (apps/sales/portal.py)
+# ---------------------------------------------------------------------------
+#: A portal order is a reorder, not a bulk upload.
+PORTAL_MAX_LINES = 100
+
+
+class PortalOrderLineSerializer(BaseSerializer):
+    """One requested line. Only the item and the quantity come from the
+    customer -- rate, discount and tax are the server's."""
+
+    item_id = serializers.UUIDField()
+    quantity = QuantityField(min_value=Decimal("0.0001"))
+    #: Optional; when sent it must be the item's unit.
+    uom = serializers.CharField(required=False, allow_blank=True, max_length=40)
+    notes = serializers.CharField(
+        required=False, allow_blank=True, allow_null=True, max_length=500
+    )
+
+
+class PortalPlaceOrderSerializer(BaseSerializer):
+    delivery_date = serializers.DateField(required=False, allow_null=True)
+    notes = serializers.CharField(
+        required=False, allow_blank=True, allow_null=True, max_length=2000
+    )
+    lines = PortalOrderLineSerializer(many=True, allow_empty=False)
+
+    def validate_lines(self, lines):
+        if len(lines) > PORTAL_MAX_LINES:
+            raise serializers.ValidationError(
+                f"An order can carry at most {PORTAL_MAX_LINES} lines."
+            )
+        seen = set()
+        for line in lines:
+            if line["item_id"] in seen:
+                raise serializers.ValidationError(
+                    "Each item can appear only once. Combine the quantities on one line."
+                )
+            seen.add(line["item_id"])
+        return lines

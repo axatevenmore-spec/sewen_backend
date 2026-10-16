@@ -161,6 +161,8 @@ class File(AuditedModel):
         ("offer_letter", "Offer letter"),
         ("contract", "Contract"),
         ("policy", "Policy"),
+        ("product_image", "Product image"),
+        ("category_image", "Category image"),
         ("import", "Bulk import"),
         ("export", "Export"),
         ("other", "Other"),

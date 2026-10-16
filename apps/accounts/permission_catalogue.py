@@ -232,6 +232,15 @@ CATALOGUE = [
             ("manage_deals", "Create, edit and delete deals and contracts"),
         ],
     ),
+    # ---- Client portal reorder (apps/sales/portal.py). Appended last for the
+    # same reason. ------------------------------------------------------------
+    (
+        "Sales",
+        "Client Portal",
+        [
+            ("place_portal_order", "Reorder purchased items from the client portal"),
+        ],
+    ),
 ]
 
 
@@ -396,7 +405,10 @@ DEFAULT_ROLES = [
         "CU",
         "Customer",
         "Customer portal access to track projects.",
-        ["view_projects"],
+        # Replaced (client portal reorder): customers may also reorder items
+        # they have bought before.
+        # ["view_projects"],
+        ["view_projects", "place_portal_order"],
     ),
 ]
 

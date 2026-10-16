@@ -99,6 +99,19 @@ DEFAULT_LEAVE_TYPES = (
 )
 
 
+DEFAULT_APPROVAL_CHAINS = (
+    ("Leave Management", "Direct Line Manager", "HR Operations Lead", "HR Director", 3),
+    ("Attendance Regularization", "Immediate Supervisor", "Department Head", "—", 2),
+    ("Asset Allocation", "IT Stock Manager", "Operations Lead", "Finance Approver", 4),
+    ("Payroll & Compensation Revisions", "HR Director", "Chief Financial Officer (CFO)", "Managing Director", 5),
+    ("Expense Reimbursement", "Project Manager", "Finance Lead", "Managing Director", 3),
+    ("Travel Requisitions", "Direct Line Manager", "Finance Lead", "Managing Director", 3),
+    ("Grievances", "HR Operations Lead", "HR Director", "Managing Director", 5),
+    ("Resignations", "Direct Line Manager", "Department Head", "HR Director", 3),
+    ("Terminations", "Department Head", "HR Director", "Managing Director", 3),
+)
+
+
 def bootstrap_configuration(client):
     """Create the configuration a tenant needs. Idempotent; never overwrites."""
     from apps.accounting.services import seed_chart_of_accounts
@@ -106,7 +119,7 @@ def bootstrap_configuration(client):
     from apps.core.views import DEFAULT_PREFERENCES, DEFAULT_TAX_SETTINGS
     from apps.crm.models import Stage, StageTask
     from apps.crm.services import seed_crm_configuration
-    from apps.hrms.models import LeaveType, WorkingDay
+    from apps.hrms.models import ApprovalChain, LeaveType, WorkingDay
     from apps.masters.models import Unit
     from apps.pms.models import Department, StageConfig
     from apps.pms.services import get_settings
@@ -182,6 +195,22 @@ def bootstrap_configuration(client):
                 "accrual": accrual,
                 "is_paid": paid,
                 "carry_forward_cap": Decimal("10") if accrual != "None" else None,
+            },
+        )
+    for module, t1, t2, t3, esc in DEFAULT_APPROVAL_CHAINS:
+        steps = [
+            {"tier": 1, "role": t1, "autoEscalateDays": esc},
+            {"tier": 2, "role": t2},
+        ]
+        if t3 and t3 not in ("—", "-"):
+            steps.append({"tier": 3, "role": t3})
+        ApprovalChain.objects.get_or_create(
+            client=client,
+            applies_to=module,
+            defaults={
+                "name": f"{module} Approval Chain",
+                "steps": steps,
+                "status": "Active",
             },
         )
 

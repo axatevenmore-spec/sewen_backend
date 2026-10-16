@@ -370,6 +370,59 @@ class VendorAdvanceSerializer(BaseModelSerializer):
     def get_unallocatedAmount(self, advance):
         return advance.unallocated_amount
 
+    def to_internal_value(self, data):
+        if isinstance(data, dict):
+            data = dict(data)
+            # Accept vendorId, party, vendor_id, party_id, vendor
+            if not data.get("vendorId"):
+                vendor_val = data.get("party") or data.get("vendor_id") or data.get("party_id") or data.get("vendor")
+                if vendor_val:
+                    data["vendorId"] = vendor_val
+
+            # Accept purchaseOrderId, purchase_order, purchase_order_id, po_id
+            if "purchaseOrderId" not in data:
+                po_val = data.get("purchase_order") or data.get("purchase_order_id") or data.get("po_id")
+                if po_val:
+                    data["purchaseOrderId"] = po_val
+                elif "purchase_order" in data and not data["purchase_order"]:
+                    data["purchaseOrderId"] = None
+
+            # Accept mode, payment_mode, paymentMode
+            if "mode" not in data:
+                mode_val = data.get("payment_mode") or data.get("paymentMode")
+                if mode_val:
+                    data["mode"] = mode_val
+
+            # Clean empty strings for optional fields
+            if data.get("reference_number") == "":
+                data["reference_number"] = None
+            if data.get("referenceNumber") == "":
+                data["referenceNumber"] = None
+            if data.get("notes") == "":
+                data["notes"] = None
+            if data.get("purchaseOrderId") == "":
+                data["purchaseOrderId"] = None
+
+        return super().to_internal_value(data)
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        if isinstance(data, dict):
+            data["advance_number"] = data.get("advanceNumber")
+            data["party"] = data.get("vendorId")
+            data["party_id"] = data.get("vendorId")
+            data["party_name"] = data.get("vendorName")
+            data["vendor_name"] = data.get("vendorName")
+            data["purchase_order"] = data.get("purchaseOrderId")
+            data["purchase_order_id"] = data.get("purchaseOrderId")
+            data["po_number"] = data.get("poNumber")
+            data["advance_date"] = data.get("advanceDate")
+            data["payment_mode"] = data.get("mode")
+            data["reference_number"] = data.get("referenceNumber")
+            data["unallocated_amount"] = data.get("unallocatedAmount")
+            data["reconciled_amount"] = data.get("reconciledAmount")
+        return data
+
 
 
 class BillOutstandingSerializer(BaseSerializer):

@@ -151,6 +151,10 @@ class ItemType(TenantModel, LegacyIdMixin):
     shape_profile = models.TextField(null=True, blank=True)
     dimension_schema = models.JSONField(default=dict, blank=True)
     is_active = models.BooleanField(default=True)
+    image_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    image_url = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "item_types"
@@ -195,6 +199,10 @@ class ItemCategory(TenantModel, LegacyIdMixin):
     )
     default_uom = models.TextField(null=True, blank=True)
     is_active = models.BooleanField(default=True)
+    image_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    image_url = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "item_categories"
@@ -439,6 +447,11 @@ class Item(TenantModel, LegacyIdMixin):
     leg_b = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)  # Angle leg 2 or Channel web height
     web_thickness = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
     flange_thickness = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+
+    image_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    image_url = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "items"

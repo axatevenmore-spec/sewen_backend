@@ -158,6 +158,12 @@ class Project(TenantModel, LegacyIdMixin):
     priority = models.TextField(choices=PRIORITIES, default="Medium")
     #: DERIVED from the stage rollup on every task write (db.md §12).
     overall_completion_pct = models.SmallIntegerField(default=0)
+    planned_duration = models.DecimalField(
+        max_digits=9, decimal_places=2, null=True, blank=True
+    )
+    duration_unit = models.TextField(
+        choices=DURATION_UNITS, default="Days", null=True, blank=True
+    )
     start_date = models.DateTimeField(null=True, blank=True)
     expected_completion_date = models.DateTimeField(null=True, blank=True)
     actual_completion_date = models.DateTimeField(null=True, blank=True)
@@ -178,6 +184,11 @@ class Project(TenantModel, LegacyIdMixin):
                 ),
                 name="ck_pms_project_pct",
             ),
+            models.CheckConstraint(
+                condition=models.Q(planned_duration__isnull=True)
+                | models.Q(planned_duration__gt=0),
+                name="ck_pms_project_planned_duration_gt_zero",
+            ),
         ]
         indexes = [
             models.Index(
@@ -197,6 +208,20 @@ class Project(TenantModel, LegacyIdMixin):
         else its code. There is no stored name column; several views and
         serializers read ``project.name``."""
         return self.product_name or self.customer_name or self.code
+
+    def soft_delete(self, user=None):
+        from apps.sales.models import SalesOrder
+        SalesOrder.objects.filter(pms_project=self).update(pms_project=None)
+        if self.sales_order_id:
+            SalesOrder.objects.filter(pk=self.sales_order_id).update(pms_project=None)
+        super().soft_delete(user=user)
+
+    def delete(self, *args, **kwargs):
+        from apps.sales.models import SalesOrder
+        SalesOrder.objects.filter(pms_project=self).update(pms_project=None)
+        if self.sales_order_id:
+            SalesOrder.objects.filter(pk=self.sales_order_id).update(pms_project=None)
+        return super().delete(*args, **kwargs)
 
 
 class ProjectMember(TenantModel):

@@ -260,6 +260,18 @@ def retain_user_locations(command):
     return {"message": f"{deleted} location ping(s) purged"}
 
 
+def process_due_exits_job(command):
+    """Processes terminations and resignations reaching their effective last working day."""
+    from apps.hrms.lifecycle_service import process_due_exits as run_exits
+    return run_exits()
+
+
+def evaluate_employee_lifecycle_job(command):
+    """Evaluates employee probation deadlines, confirmation statuses, and due exits."""
+    from apps.hrms.lifecycle_service import evaluate_employee_lifecycle
+    return evaluate_employee_lifecycle()
+
+
 JOBS = {
     "expire_shares": ("hourly", expire_shares),
     "sweep_pending_files": ("hourly", sweep_pending_files),
@@ -270,4 +282,6 @@ JOBS = {
     "reconcile_serials": ("nightly", reconcile_serials),
     "accrue_leave": ("nightly", accrue_leave),
     "retain_user_locations": ("nightly", retain_user_locations),
+    "process_due_exits": ("nightly", process_due_exits_job),
+    "evaluate_employee_lifecycle": ("nightly", evaluate_employee_lifecycle_job),
 }

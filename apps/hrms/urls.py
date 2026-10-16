@@ -95,6 +95,7 @@ router.register(
     "calendar/events", views.CalendarEventViewSet, basename="hrms-calendar-events"
 )
 router.register("holidays", views.HolidayViewSet, basename="hrms-holidays")
+router.register("work-schedules", views.WorkScheduleViewSet, basename="hrms-work-schedules")
 
 router.register("teams", views.TeamViewSet, basename="hrms-teams")
 router.register(

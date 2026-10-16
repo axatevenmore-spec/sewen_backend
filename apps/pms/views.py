@@ -325,9 +325,20 @@ class PmsSettingsView(APIView):
 # Projects (api.md §10.2)
 # ---------------------------------------------------------------------------
 def create_project_from_order(order, *, project_manager_id=None, priority="Medium",
-                              stage_config_ids=None, stage_weights=None, user=None):
+                              stage_config_ids=None, stage_weights=None,
+                              stage_durations=None, stage_duration_units=None,
+                              user=None, planned_duration=None, duration_unit="Days",
+                              start_date=None, specifications=None):
     """``POST /pms/projects/from-order/`` -- pulls customer + product from the order."""
     first_line = order.line_items.filter(deleted_at__isnull=True).order_by("line_no").first()
+
+    if start_date is None:
+        start_date = timezone.now()
+    expected_completion_date = None
+    if planned_duration is not None:
+        expected_completion_date = services.stage_expected_completion(
+            start_date, planned_duration, duration_unit or "Days"
+        )
 
     project = Project.objects.create(
         client_id=order.client_id,
@@ -338,10 +349,14 @@ def create_project_from_order(order, *, project_manager_id=None, priority="Mediu
         product_name=first_line.item_name if first_line else None,
         order_value=order.total,
         quantity=first_line.qty if first_line else None,
+        specifications=specifications or (getattr(first_line, "description", None) or getattr(first_line, "item_description", None) if first_line else None),
         project_manager_id=project_manager_id,
         priority=priority,
         status="Draft",
-        start_date=timezone.now(),
+        planned_duration=planned_duration,
+        duration_unit=duration_unit or "Days",
+        start_date=start_date,
+        expected_completion_date=expected_completion_date,
         created_by=user if getattr(user, "is_authenticated", False) else None,
     )
     order.pms_project = project
@@ -349,7 +364,12 @@ def create_project_from_order(order, *, project_manager_id=None, priority="Mediu
 
     if stage_config_ids:
         apply_stage_template(
-            project, stage_config_ids, stage_weights=stage_weights, user=user
+            project,
+            stage_config_ids,
+            stage_weights=stage_weights,
+            stage_durations=stage_durations,
+            stage_duration_units=stage_duration_units,
+            user=user,
         )
 
     record_audit(
@@ -361,11 +381,33 @@ def create_project_from_order(order, *, project_manager_id=None, priority="Mediu
         entity_label=project.code,
         description=f"Project created from order {order.order_number}",
     )
+    notif_recipients = [project.project_manager_id, getattr(user, "id", None)]
+    if not any(notif_recipients):
+        if getattr(order, "created_by_id", None):
+            notif_recipients.append(order.created_by_id)
+        else:
+            from django.contrib.auth import get_user_model
+            fallback_user = get_user_model().objects.filter(client_id=order.client_id, is_active=True).first()
+            if fallback_user:
+                notif_recipients.append(fallback_user.id)
+
+    notify(
+        client=order.client_id,
+        recipients=notif_recipients,
+        type="pms.project_arrived",
+        category="pms",
+        title=f"New Project Arrived: {project.code}",
+        body=f"Project {project.code} for {project.customer_name} has arrived and is ready for stage execution.",
+        entity_type="PmsProject",
+        entity_id=project.id,
+        actor=user if getattr(user, "is_authenticated", False) else None,
+        payload={"path": f"/pms/projects/{project.code}"},
+    )
     return project
 
 
 @transaction.atomic
-def apply_stage_template(project, config_ids, *, stage_weights=None, user=None):
+def apply_stage_template(project, config_ids, *, stage_weights=None, stage_durations=None, stage_duration_units=None, user=None):
     """Instantiate stages from templates, copying the fields that matter.
 
     db.md §10.2: configs are copied, not referenced, for name, gates and
@@ -421,6 +463,26 @@ def apply_stage_template(project, config_ids, *, stage_weights=None, user=None):
             else:
                 weight = Decimal(str(equal_pct))
 
+        # Check for stage-specific planned duration override
+        custom_duration = None
+        custom_unit = None
+        if stage_durations:
+            custom_duration = stage_durations.get(str(config.id))
+            if custom_duration is None:
+                custom_duration = stage_durations.get(config.name)
+        if stage_duration_units:
+            custom_unit = stage_duration_units.get(str(config.id)) or stage_duration_units.get(config.name)
+
+        if custom_duration is not None and str(custom_duration).strip() != "":
+            try:
+                stage_planned_duration = Decimal(str(custom_duration))
+                if stage_planned_duration <= 0:
+                    stage_planned_duration = config.default_duration or Decimal("1.00")
+            except (ValueError, TypeError):
+                stage_planned_duration = config.default_duration or Decimal("1.00")
+        else:
+            stage_planned_duration = config.default_duration or Decimal("1.00")
+
         stage_assignee = services.resolve_stage_assignee(
             project.client_id, config.name, config.department, project.project_manager
         )
@@ -432,8 +494,8 @@ def apply_stage_template(project, config_ids, *, stage_weights=None, user=None):
             sequence=start_sequence + offset,
             department=config.department,
             assigned_user=stage_assignee,
-            planned_duration=config.default_duration,
-            duration_unit=config.duration_unit,
+            planned_duration=stage_planned_duration,
+            duration_unit=custom_unit or config.duration_unit or "Days",
             required_approval=config.required_approval,
             required_document=config.required_document,
             weight_pct=weight,
@@ -441,7 +503,7 @@ def apply_stage_template(project, config_ids, *, stage_weights=None, user=None):
             created_by=user if getattr(user, "is_authenticated", False) else None,
         )
         created.append(stage_obj)
-        services.populate_default_stage_tasks(stage_obj, project.client_id, user=user)
+        # Tasks are project-specific and only added when explicitly created by users for this project.
 
     if project.current_stage_id is None and created:
         project.current_stage = created[0]
@@ -449,7 +511,7 @@ def apply_stage_template(project, config_ids, *, stage_weights=None, user=None):
         project.status = "In Progress" if project.status == "Draft" else project.status
         project.save(update_fields=["current_stage", "current_department", "status", "updated_at"])
 
-    services.recalculate_project(project)
+    services.recalculate_project_timeline(project)
     chat.ensure_conversations(project)
     record_audit(
         client=project.client_id,
@@ -529,6 +591,14 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
     #: Writes that do not change what a project screen shows. Chat announces
     #: its own events (``chat.py``).
     REALTIME_QUIET_ACTIONS = frozenset(CHAT_PERMISSIONS) | {"document_comments"}
+
+    @transaction.atomic
+    def perform_destroy(self, instance):
+        from apps.sales.models import SalesOrder
+        SalesOrder.objects.filter(pms_project=instance).update(pms_project=None)
+        if instance.sales_order_id:
+            SalesOrder.objects.filter(pk=instance.sales_order_id).update(pms_project=None)
+        super().perform_destroy(instance)
 
     def finalize_response(self, request, response, *args, **kwargs):
         """Tell every PMS screen in the tenant that this project changed.
@@ -641,7 +711,63 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
         serializer.validated_data["code"] = allocate_number(
             self.request.user.client, "PRJ", unique_in=(Project, "code")
         )
-        return super().perform_create(serializer)
+        if "start_date" not in serializer.validated_data or not serializer.validated_data["start_date"]:
+            serializer.validated_data["start_date"] = timezone.now()
+        planned_duration = serializer.validated_data.get("planned_duration")
+        duration_unit = serializer.validated_data.get("duration_unit", "Days")
+        if planned_duration and "expected_completion_date" not in serializer.validated_data:
+            serializer.validated_data["expected_completion_date"] = services.stage_expected_completion(
+                serializer.validated_data["start_date"], planned_duration, duration_unit
+            )
+        project = super().perform_create(serializer)
+        if project:
+            notify(
+                client=project.client_id,
+                recipients=[project.project_manager_id, getattr(self.request.user, "id", None)],
+                type="pms.project_arrived",
+                category="pms",
+                title=f"New Project Arrived: {project.code}",
+                body=f"Project {project.code} for {project.customer_name} has arrived.",
+                entity_type="PmsProject",
+                entity_id=project.id,
+                actor=self.request.user if getattr(self.request.user, "is_authenticated", False) else None,
+                payload={"path": f"/pms/projects/{project.code}"},
+            )
+        return project
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        old_status = instance.status
+        if instance.status == "Completed":
+            if (
+                "planned_duration" in serializer.validated_data
+                or "duration_unit" in serializer.validated_data
+            ):
+                raise ValidationFailed("Cannot edit duration of a completed project.")
+        updated = super().perform_update(serializer)
+        if (
+            "planned_duration" in serializer.validated_data
+            or "duration_unit" in serializer.validated_data
+            or "start_date" in serializer.validated_data
+        ):
+            services.recalculate_project_timeline(updated)
+            updated.refresh_from_db()
+
+        if old_status != updated.status and updated.status == "Delayed":
+            notify(
+                client=updated.client_id,
+                recipients=[updated.project_manager_id, getattr(self.request.user, "id", None)],
+                type="pms.project_delayed",
+                category="pms",
+                title=f"Project Delayed: {updated.code}",
+                body=f"Project {updated.code} ({updated.customer_name}) is marked as Delayed.",
+                entity_type="PmsProject",
+                entity_id=updated.id,
+                actor=self.request.user if getattr(self.request.user, "is_authenticated", False) else None,
+                payload={"path": f"/pms/projects/{updated.code}"},
+            )
+        return updated
 
     @action(detail=False, methods=["post"], url_path="from-order")
     @transaction.atomic
@@ -666,22 +792,87 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
             ).first()
         if order is None:
             raise NotFound("That sales order no longer exists.")
+
+        existing_active = None
         if order.pms_project_id:
-            raise Conflict(
-                "That order already has a project.",
-                code=Codes.ALREADY_DONE,
-                payload={"projectId": str(order.pms_project_id)},
-            )
+            existing_active = Project.objects.filter(
+                pk=order.pms_project_id, deleted_at__isnull=True
+            ).first()
+            if not existing_active:
+                order.pms_project = None
+                order.save(update_fields=["pms_project", "updated_at"])
+
+        if not existing_active:
+            existing_active = Project.objects.filter(
+                sales_order=order, deleted_at__isnull=True
+            ).first()
+
+        planned_duration = data.get("plannedDuration")
+        duration_unit = data.get("durationUnit", "Days")
 
         stage_weights = data.get("stageWeights") or {}
-        if not stage_weights and data.get("stages"):
+        stage_durations = data.get("stageDurations") or {}
+        stage_duration_units = data.get("stageDurationUnits") or {}
+        if data.get("stages"):
             for s in data["stages"]:
-                cid = s.get("configId") or s.get("stageConfigId") or s.get("id")
+                cid = s.get("configId") or s.get("stageConfigId") or s.get("id") or s.get("stageId")
                 pct = s.get("percentage")
                 if pct is None:
-                    pct = s.get("weightPct") or s.get("weight") or 0
-                if cid:
+                    pct = s.get("weightPct") or s.get("weight")
+                if cid and pct is not None and str(cid) not in stage_weights:
                     stage_weights[str(cid)] = pct
+
+                dur = s.get("plannedDuration") or s.get("duration")
+                if cid and dur is not None and str(cid) not in stage_durations:
+                    stage_durations[str(cid)] = dur
+
+                unit = s.get("durationUnit") or s.get("unit")
+                if cid and unit and str(cid) not in stage_duration_units:
+                    stage_duration_units[str(cid)] = unit
+
+        if existing_active:
+            # If a project already exists for that Sales Order, update its stage durations / planned duration
+            # if provided, and load its saved duration instead of creating a duplicate project.
+            if existing_active.status != "Completed":
+                stages_updated = False
+                if stage_durations:
+                    for stage in existing_active.stages.filter(deleted_at__isnull=True):
+                        dur = (
+                            stage_durations.get(str(stage.id))
+                            or (stage.stage_config_id and stage_durations.get(str(stage.stage_config_id)))
+                            or stage_durations.get(stage.name)
+                        )
+                        if dur is not None:
+                            try:
+                                d_val = Decimal(str(dur))
+                                if d_val > 0 and stage.status not in services.CLOSED_STAGE_STATUSES:
+                                    stage.planned_duration = d_val
+                                    unit = (
+                                        stage_duration_units.get(str(stage.id))
+                                        or (stage.stage_config_id and stage_duration_units.get(str(stage.stage_config_id)))
+                                        or stage_duration_units.get(stage.name)
+                                    )
+                                    if unit:
+                                        stage.duration_unit = unit
+                                    stage.save(update_fields=["planned_duration", "duration_unit", "updated_at"])
+                                    stages_updated = True
+                            except (ValueError, TypeError):
+                                pass
+                if planned_duration is not None:
+                    existing_active.planned_duration = planned_duration
+                    if duration_unit:
+                        existing_active.duration_unit = duration_unit
+                    existing_active.save(update_fields=["planned_duration", "duration_unit", "updated_at"])
+                    stages_updated = True
+
+                if stages_updated:
+                    services.recalculate_project_timeline(existing_active)
+                    existing_active.refresh_from_db()
+
+            return Response(
+                ProjectDetailSerializer(existing_active, context=self._detail_context(existing_active)).data,
+                status=status.HTTP_200_OK,
+            )
 
         project = create_project_from_order(
             order,
@@ -689,7 +880,13 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
             priority=data.get("priority", "Medium"),
             stage_config_ids=data.get("stageConfigIds") or list(stage_weights.keys()),
             stage_weights=stage_weights or None,
+            stage_durations=stage_durations or None,
+            stage_duration_units=stage_duration_units or None,
             user=request.user,
+            planned_duration=planned_duration,
+            duration_unit=duration_unit,
+            start_date=data.get("startDate"),
+            specifications=data.get("specifications"),
         )
         return Response(
             ProjectDetailSerializer(project, context=self._detail_context(project)).data,
@@ -705,6 +902,8 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
             project,
             serializer.validated_data["configIds"],
             stage_weights=serializer.validated_data.get("stageWeights"),
+            stage_durations=serializer.validated_data.get("stageDurations"),
+            stage_duration_units=serializer.validated_data.get("stageDurationUnits"),
             user=request.user,
         )
         project.refresh_from_db()
@@ -1020,10 +1219,13 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
         serializer.is_valid(raise_exception=True)
         serializer.save()
 
-        if any(k in request.data for k in ("percentage", "weightPct", "weight", "weight_pct")):
+        if any(k in request.data for k in ("plannedDuration", "planned_duration", "durationUnit", "duration_unit", "startDateTime", "start_datetime")):
+            services.recalculate_project_timeline(project)
+        elif any(k in request.data for k in ("percentage", "weightPct", "weight", "weight_pct")):
             services.recalculate_project(project)
 
-        return Response(serializer.data)
+        stage.refresh_from_db()
+        return Response(ProjectStageSerializer(stage, context=self.get_serializer_context()).data)
 
     @action(detail=True, methods=["post"], url_path=r"stages/(?P<stage_id>[^/.]+)/assign")
     @transaction.atomic
@@ -1153,7 +1355,19 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
 
         previous = stage.status
         stage.status = serializer.validated_data["status"]
-        stage.save(update_fields=["status", "updated_at"])
+        update_fields = ["status", "updated_at"]
+        if stage.status in ("Submitted", "Completed"):
+            now = timezone.now()
+            Task.objects.filter(stage=stage, deleted_at__isnull=True).update(
+                status="Completed", completion_pct=100, updated_at=now
+            )
+            stage.completion_pct = 100
+            update_fields.append("completion_pct")
+            if not stage.actual_completion_datetime:
+                stage.actual_completion_datetime = now
+                update_fields.append("actual_completion_datetime")
+
+        stage.save(update_fields=update_fields)
         services.recalculate_project(project)
 
         record_audit(
@@ -1163,7 +1377,7 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
             from_value=previous, to_value=stage.status,
         )
         return Response(
-            ProjectStageSerializer(stage, context=self.get_serializer_context()).data
+            ProjectStageSerializer(stage, context=self._detail_context(project)).data
         )
 
     @action(
@@ -1537,7 +1751,10 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
                 raise NotFound("There is no open delay on this stage.")
             open_delay.recovery_plan = request.data.get("recoveryPlan", open_delay.recovery_plan)
             if request.data.get("expectedRecoveryDate"):
-                open_delay.expected_recovery_date = request.data["expectedRecoveryDate"]
+                rec_date = request.data["expectedRecoveryDate"]
+                if isinstance(rec_date, str) and "T" in rec_date:
+                    rec_date = rec_date.split("T")[0]
+                open_delay.expected_recovery_date = rec_date
             open_delay.save()
             record_audit(
                 client=request.client_id, actor=request.user,
@@ -1564,9 +1781,9 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
             stage=stage,
             reason=data["reason"],
             category=data["category"],
-            responsible_user_id=data.get("responsibleUserId"),
+            responsible_user_id=data.get("responsibleUserId") or None,
             expected_recovery_date=data["expectedRecoveryDate"],
-            recovery_plan=data.get("recoveryPlan"),
+            recovery_plan=data.get("recoveryPlan") or "",
             created_by=request.user,
         )
         stage.status = "Delayed"
@@ -1589,6 +1806,7 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
                 entity_type="PmsStage",
                 entity_id=stage.id,
                 actor=request.user,
+                payload={"path": f"/pms/projects/{project.code}"},
             )
         return Response(DelaySerializer(delay).data, status=status.HTTP_201_CREATED)
 
@@ -2391,9 +2609,19 @@ def is_pms_manager(user):
     return has_permission(user, PMS_MANAGERS)
 
 
+#: A timesheet still taking hours. Submitted / Approved sheets are closed.
+OPEN_TIMESHEET_STATUSES = ("Draft", "Rejected")
+
+
 def week_timesheet(user, day):
-    """The signed-in user's timesheet for the week of ``day`` (Mon-Sun), made
-    on first use. Hours can only be added while it is still open."""
+    """The signed-in user's open timesheet for the week of ``day`` (Mon-Sun),
+    made on first use.
+
+    Hours only ever join an open sheet. When the week's sheet is already
+    Submitted or Approved, the new hours start a second sheet for the same
+    week that is submitted and approved on its own -- the hours (and labour
+    cost) already approved are never reopened or changed.
+    """
     employee_id = getattr(user, "employee_id", None)
     if not employee_id:
         raise ValidationFailed(
@@ -2401,10 +2629,28 @@ def week_timesheet(user, day):
             code="NO_EMPLOYEE",
         )
     week_start = day - timedelta(days=day.weekday())
-    sheet = Timesheet.objects.filter(
-        client_id=user.client_id, employee_id=employee_id,
-        week_start=week_start, deleted_at__isnull=True,
-    ).first()
+    # Replaced (extra sheet per closed week): a closed week no longer refuses
+    # new hours with 400 TIMESHEET_CLOSED.
+    # sheet = Timesheet.objects.filter(
+    #     client_id=user.client_id, employee_id=employee_id,
+    #     week_start=week_start, deleted_at__isnull=True,
+    # ).first()
+    # if sheet is None:
+    #     sheet = Timesheet.objects.create(...)
+    # elif sheet.status not in ("Draft", "Rejected"):
+    #     raise ValidationFailed(
+    #         f"Your timesheet for the week of {week_start:%d-%m-%Y} is already {sheet.status.lower()}.",
+    #         code="TIMESHEET_CLOSED",
+    #     )
+    sheet = (
+        Timesheet.objects.filter(
+            client_id=user.client_id, employee_id=employee_id,
+            week_start=week_start, deleted_at__isnull=True,
+            status__in=OPEN_TIMESHEET_STATUSES,
+        )
+        .order_by("-created_at")
+        .first()
+    )
     if sheet is None:
         sheet = Timesheet.objects.create(
             client_id=user.client_id,
@@ -2413,12 +2659,29 @@ def week_timesheet(user, day):
             week_start=week_start,
             week_end=week_start + timedelta(days=6),
         )
-    elif sheet.status not in ("Draft", "Rejected"):
-        raise ValidationFailed(
-            f"Your timesheet for the week of {week_start:%d-%m-%Y} is already {sheet.status.lower()}.",
-            code="TIMESHEET_CLOSED",
-        )
     return sheet
+
+
+def finish_timer(entry, now, *, minimum=None):
+    """Stop a running timer and book its hours.
+
+    The hours join the week's *open* sheet: if the sheet the timer started on
+    was submitted or approved while it ran, that sheet is left as approved and
+    the entry moves to the week's open (or a new) sheet instead.
+    """
+    delta = now - entry.start_time if entry.start_time else timedelta(seconds=0)
+    hours = Decimal(str(round(delta.total_seconds() / 3600, 2)))
+    if minimum is not None:
+        hours = max(minimum, hours)
+    entry.duration_hours = hours
+    entry.end_time = now
+    entry.is_running = False
+    fields = ["duration_hours", "end_time", "is_running", "updated_at"]
+    if entry.timesheet is not None and entry.timesheet.status not in OPEN_TIMESHEET_STATUSES:
+        entry.timesheet = week_timesheet(entry.user, entry.date)
+        fields.append("timesheet")
+    entry.save(update_fields=fields)
+    recount_timesheet(entry.timesheet)
 
 
 def recount_timesheet(sheet):
@@ -2557,8 +2820,12 @@ class TimesheetEntryViewSet(TenantModelViewSet):
         return Response(self.get_serializer(entry).data, status=status.HTTP_201_CREATED)
 
     @action(detail=False, methods=["post"], url_path="start-timer")
+    @transaction.atomic
     def start_timer(self, request):
         """Starts a live timer for a task/project."""
+        # Resolve the week's open sheet first (and in the same transaction), so
+        # a refusal (no employee link) cannot leave a running timer stopped.
+        sheet = week_timesheet(request.user, timezone.localdate())
         # Stop any existing running timer for this user
         now = timezone.now()
         running = TimesheetEntry.objects.filter(
@@ -2568,21 +2835,33 @@ class TimesheetEntryViewSet(TenantModelViewSet):
             deleted_at__isnull=True,
         )
         for r in running:
-            delta = now - r.start_time if r.start_time else timedelta(seconds=0)
-            hours = Decimal(str(round(delta.total_seconds() / 3600, 2)))
-            r.duration_hours = hours
-            r.end_time = now
-            r.is_running = False
-            r.save(update_fields=["duration_hours", "end_time", "is_running", "updated_at"])
+            # Replaced (extra sheet per closed week): finish_timer also moves the
+            # hours off a sheet that closed while the timer ran, and recounts.
+            # delta = now - r.start_time if r.start_time else timedelta(seconds=0)
+            # hours = Decimal(str(round(delta.total_seconds() / 3600, 2)))
+            # r.duration_hours = hours
+            # r.end_time = now
+            # r.is_running = False
+            # r.save(update_fields=["duration_hours", "end_time", "is_running", "updated_at"])
+            finish_timer(r, now)
+
+        rate = request.data.get("hourlyRate") or request.data.get("hourly_rate")
+        try:
+            rate = Decimal(str(rate)) if rate not in (None, "") else None
+        except Exception:
+            rate = None
 
         entry = TimesheetEntry.objects.create(
             client_id=request.client_id,
-            timesheet=week_timesheet(request.user, timezone.localdate()),
+            # Replaced: resolved once above, before any running timer is stopped.
+            # timesheet=week_timesheet(request.user, timezone.localdate()),
+            timesheet=sheet,
             user=request.user,
             project_id=request.data.get("projectId") or request.data.get("project_id"),
             task_id=request.data.get("taskId") or request.data.get("task_id"),
             date=timezone.localdate(),
             start_time=now,
+            hourly_rate=rate,
             is_running=True,
             is_billable=request.data.get("isBillable", True),
             description=request.data.get("description", "Working..."),
@@ -2590,20 +2869,23 @@ class TimesheetEntryViewSet(TenantModelViewSet):
         return Response(self.get_serializer(entry).data, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["post"], url_path="stop-timer")
+    @transaction.atomic
     def stop_timer(self, request, pk=None):
         """Stops the specified live timer and finalizes duration."""
         entry = self.get_object()
         if not entry.is_running:
             return Response(self.get_serializer(entry).data)
 
-        now = timezone.now()
-        delta = now - entry.start_time if entry.start_time else timedelta(seconds=0)
-        hours = Decimal(str(round(delta.total_seconds() / 3600, 2)))
-        entry.duration_hours = max(Decimal("0.01"), hours)
-        entry.end_time = now
-        entry.is_running = False
-        entry.save(update_fields=["duration_hours", "end_time", "is_running", "updated_at"])
-        recount_timesheet(entry.timesheet)
+        # Replaced (extra sheet per closed week): see finish_timer.
+        # now = timezone.now()
+        # delta = now - entry.start_time if entry.start_time else timedelta(seconds=0)
+        # hours = Decimal(str(round(delta.total_seconds() / 3600, 2)))
+        # entry.duration_hours = max(Decimal("0.01"), hours)
+        # entry.end_time = now
+        # entry.is_running = False
+        # entry.save(update_fields=["duration_hours", "end_time", "is_running", "updated_at"])
+        # recount_timesheet(entry.timesheet)
+        finish_timer(entry, timezone.now(), minimum=Decimal("0.01"))
         return Response(self.get_serializer(entry).data)
 
     @action(detail=False, methods=["get"], url_path="active-timer")

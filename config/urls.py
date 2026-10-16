@@ -15,6 +15,7 @@ from drf_spectacular.views import (
 
 from apps.accounts.urls import admin_urlpatterns, auth_urlpatterns
 from apps.reports.urls import dashboard_urlpatterns, public_urlpatterns, report_urlpatterns
+from apps.sales.urls import portal_urlpatterns
 
 api_v1 = [
     # Identity and administration (api.md §2, §3)
@@ -22,6 +23,7 @@ api_v1 = [
     path("admin/", include(admin_urlpatterns)),
     # Shared masters (api.md §4)
     path("parties/", include("apps.masters.urls")),
+    path("masters/parties/", include("apps.masters.urls")),
     path("masters/", include("apps.inventory.urls")),
     path("inventory/", include("apps.inventory.urls")),
     # Documents (api.md §5, §6)
@@ -29,6 +31,7 @@ api_v1 = [
     path("purchase/", include("apps.purchase.urls")),
     # Accounts (api.md §8)
     path("accounts/", include("apps.accounting.urls")),
+    path("accounting/", include("apps.accounting.urls")),
     # Modules (api.md §9, §10, §11)
     path("crm/", include("apps.crm.urls")),
     path("pms/", include("apps.pms.urls")),
@@ -39,6 +42,8 @@ api_v1 = [
     # Unauthenticated surfaces (api.md §5.3, §9.7, §10.6, §11.5)
     path("public/", include(public_urlpatterns)),
     path("vendor-portal/", include("apps.purchase.urls")),
+    # Client (customer) portal -- authenticated, scoped to the user's party.
+    path("portal/client/", include(portal_urlpatterns)),
     # Platform: files, notifications, audit, settings, search, support
     path("", include("apps.core.urls")),
     # OpenAPI 3.1, generated from the models so it cannot drift (db.md §14.2)
