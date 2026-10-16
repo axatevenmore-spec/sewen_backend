@@ -325,9 +325,20 @@ class PmsSettingsView(APIView):
 # Projects (api.md §10.2)
 # ---------------------------------------------------------------------------
 def create_project_from_order(order, *, project_manager_id=None, priority="Medium",
-                              stage_config_ids=None, stage_weights=None, user=None):
+                              stage_config_ids=None, stage_weights=None,
+                              stage_durations=None, stage_duration_units=None,
+                              user=None, planned_duration=None, duration_unit="Days",
+                              start_date=None, specifications=None):
     """``POST /pms/projects/from-order/`` -- pulls customer + product from the order."""
     first_line = order.line_items.filter(deleted_at__isnull=True).order_by("line_no").first()
+
+    if start_date is None:
+        start_date = timezone.now()
+    expected_completion_date = None
+    if planned_duration is not None:
+        expected_completion_date = services.stage_expected_completion(
+            start_date, planned_duration, duration_unit or "Days"
+        )
 
     project = Project.objects.create(
         client_id=order.client_id,
@@ -338,10 +349,14 @@ def create_project_from_order(order, *, project_manager_id=None, priority="Mediu
         product_name=first_line.item_name if first_line else None,
         order_value=order.total,
         quantity=first_line.qty if first_line else None,
+        specifications=specifications or (getattr(first_line, "description", None) or getattr(first_line, "item_description", None) if first_line else None),
         project_manager_id=project_manager_id,
         priority=priority,
         status="Draft",
-        start_date=timezone.now(),
+        planned_duration=planned_duration,
+        duration_unit=duration_unit or "Days",
+        start_date=start_date,
+        expected_completion_date=expected_completion_date,
         created_by=user if getattr(user, "is_authenticated", False) else None,
     )
     order.pms_project = project
@@ -349,7 +364,12 @@ def create_project_from_order(order, *, project_manager_id=None, priority="Mediu
 
     if stage_config_ids:
         apply_stage_template(
-            project, stage_config_ids, stage_weights=stage_weights, user=user
+            project,
+            stage_config_ids,
+            stage_weights=stage_weights,
+            stage_durations=stage_durations,
+            stage_duration_units=stage_duration_units,
+            user=user,
         )
 
     record_audit(
@@ -365,7 +385,7 @@ def create_project_from_order(order, *, project_manager_id=None, priority="Mediu
 
 
 @transaction.atomic
-def apply_stage_template(project, config_ids, *, stage_weights=None, user=None):
+def apply_stage_template(project, config_ids, *, stage_weights=None, stage_durations=None, stage_duration_units=None, user=None):
     """Instantiate stages from templates, copying the fields that matter.
 
     db.md §10.2: configs are copied, not referenced, for name, gates and
@@ -421,6 +441,26 @@ def apply_stage_template(project, config_ids, *, stage_weights=None, user=None):
             else:
                 weight = Decimal(str(equal_pct))
 
+        # Check for stage-specific planned duration override
+        custom_duration = None
+        custom_unit = None
+        if stage_durations:
+            custom_duration = stage_durations.get(str(config.id))
+            if custom_duration is None:
+                custom_duration = stage_durations.get(config.name)
+        if stage_duration_units:
+            custom_unit = stage_duration_units.get(str(config.id)) or stage_duration_units.get(config.name)
+
+        if custom_duration is not None and str(custom_duration).strip() != "":
+            try:
+                stage_planned_duration = Decimal(str(custom_duration))
+                if stage_planned_duration <= 0:
+                    stage_planned_duration = config.default_duration or Decimal("1.00")
+            except (ValueError, TypeError):
+                stage_planned_duration = config.default_duration or Decimal("1.00")
+        else:
+            stage_planned_duration = config.default_duration or Decimal("1.00")
+
         stage_assignee = services.resolve_stage_assignee(
             project.client_id, config.name, config.department, project.project_manager
         )
@@ -432,8 +472,8 @@ def apply_stage_template(project, config_ids, *, stage_weights=None, user=None):
             sequence=start_sequence + offset,
             department=config.department,
             assigned_user=stage_assignee,
-            planned_duration=config.default_duration,
-            duration_unit=config.duration_unit,
+            planned_duration=stage_planned_duration,
+            duration_unit=custom_unit or config.duration_unit or "Days",
             required_approval=config.required_approval,
             required_document=config.required_document,
             weight_pct=weight,
@@ -449,7 +489,7 @@ def apply_stage_template(project, config_ids, *, stage_weights=None, user=None):
         project.status = "In Progress" if project.status == "Draft" else project.status
         project.save(update_fields=["current_stage", "current_department", "status", "updated_at"])
 
-    services.recalculate_project(project)
+    services.recalculate_project_timeline(project)
     chat.ensure_conversations(project)
     record_audit(
         client=project.client_id,
@@ -649,7 +689,34 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
         serializer.validated_data["code"] = allocate_number(
             self.request.user.client, "PRJ", unique_in=(Project, "code")
         )
+        if "start_date" not in serializer.validated_data or not serializer.validated_data["start_date"]:
+            serializer.validated_data["start_date"] = timezone.now()
+        planned_duration = serializer.validated_data.get("planned_duration")
+        duration_unit = serializer.validated_data.get("duration_unit", "Days")
+        if planned_duration and "expected_completion_date" not in serializer.validated_data:
+            serializer.validated_data["expected_completion_date"] = services.stage_expected_completion(
+                serializer.validated_data["start_date"], planned_duration, duration_unit
+            )
         return super().perform_create(serializer)
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        if instance.status == "Completed":
+            if (
+                "planned_duration" in serializer.validated_data
+                or "duration_unit" in serializer.validated_data
+            ):
+                raise ValidationFailed("Cannot edit duration of a completed project.")
+        updated = super().perform_update(serializer)
+        if (
+            "planned_duration" in serializer.validated_data
+            or "duration_unit" in serializer.validated_data
+            or "start_date" in serializer.validated_data
+        ):
+            services.recalculate_project_timeline(updated)
+            updated.refresh_from_db()
+        return updated
 
     @action(detail=False, methods=["post"], url_path="from-order")
     @transaction.atomic
@@ -674,39 +741,87 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
             ).first()
         if order is None:
             raise NotFound("That sales order no longer exists.")
+
+        existing_active = None
         if order.pms_project_id:
-            active_project = Project.objects.filter(
+            existing_active = Project.objects.filter(
                 pk=order.pms_project_id, deleted_at__isnull=True
             ).first()
-            if active_project:
-                raise Conflict(
-                    "That order already has a project.",
-                    code=Codes.ALREADY_DONE,
-                    payload={"projectId": str(order.pms_project_id)},
-                )
-            else:
+            if not existing_active:
                 order.pms_project = None
                 order.save(update_fields=["pms_project", "updated_at"])
 
-        existing_active = Project.objects.filter(
-            sales_order=order, deleted_at__isnull=True
-        ).first()
-        if existing_active:
-            raise Conflict(
-                "That order already has a project.",
-                code=Codes.ALREADY_DONE,
-                payload={"projectId": str(existing_active.id)},
-            )
+        if not existing_active:
+            existing_active = Project.objects.filter(
+                sales_order=order, deleted_at__isnull=True
+            ).first()
+
+        planned_duration = data.get("plannedDuration")
+        duration_unit = data.get("durationUnit", "Days")
 
         stage_weights = data.get("stageWeights") or {}
-        if not stage_weights and data.get("stages"):
+        stage_durations = data.get("stageDurations") or {}
+        stage_duration_units = data.get("stageDurationUnits") or {}
+        if data.get("stages"):
             for s in data["stages"]:
-                cid = s.get("configId") or s.get("stageConfigId") or s.get("id")
+                cid = s.get("configId") or s.get("stageConfigId") or s.get("id") or s.get("stageId")
                 pct = s.get("percentage")
                 if pct is None:
-                    pct = s.get("weightPct") or s.get("weight") or 0
-                if cid:
+                    pct = s.get("weightPct") or s.get("weight")
+                if cid and pct is not None and str(cid) not in stage_weights:
                     stage_weights[str(cid)] = pct
+
+                dur = s.get("plannedDuration") or s.get("duration")
+                if cid and dur is not None and str(cid) not in stage_durations:
+                    stage_durations[str(cid)] = dur
+
+                unit = s.get("durationUnit") or s.get("unit")
+                if cid and unit and str(cid) not in stage_duration_units:
+                    stage_duration_units[str(cid)] = unit
+
+        if existing_active:
+            # If a project already exists for that Sales Order, update its stage durations / planned duration
+            # if provided, and load its saved duration instead of creating a duplicate project.
+            if existing_active.status != "Completed":
+                stages_updated = False
+                if stage_durations:
+                    for stage in existing_active.stages.filter(deleted_at__isnull=True):
+                        dur = (
+                            stage_durations.get(str(stage.id))
+                            or (stage.stage_config_id and stage_durations.get(str(stage.stage_config_id)))
+                            or stage_durations.get(stage.name)
+                        )
+                        if dur is not None:
+                            try:
+                                d_val = Decimal(str(dur))
+                                if d_val > 0 and stage.status not in services.CLOSED_STAGE_STATUSES:
+                                    stage.planned_duration = d_val
+                                    unit = (
+                                        stage_duration_units.get(str(stage.id))
+                                        or (stage.stage_config_id and stage_duration_units.get(str(stage.stage_config_id)))
+                                        or stage_duration_units.get(stage.name)
+                                    )
+                                    if unit:
+                                        stage.duration_unit = unit
+                                    stage.save(update_fields=["planned_duration", "duration_unit", "updated_at"])
+                                    stages_updated = True
+                            except (ValueError, TypeError):
+                                pass
+                if planned_duration is not None:
+                    existing_active.planned_duration = planned_duration
+                    if duration_unit:
+                        existing_active.duration_unit = duration_unit
+                    existing_active.save(update_fields=["planned_duration", "duration_unit", "updated_at"])
+                    stages_updated = True
+
+                if stages_updated:
+                    services.recalculate_project_timeline(existing_active)
+                    existing_active.refresh_from_db()
+
+            return Response(
+                ProjectDetailSerializer(existing_active, context=self._detail_context(existing_active)).data,
+                status=status.HTTP_200_OK,
+            )
 
         project = create_project_from_order(
             order,
@@ -714,7 +829,13 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
             priority=data.get("priority", "Medium"),
             stage_config_ids=data.get("stageConfigIds") or list(stage_weights.keys()),
             stage_weights=stage_weights or None,
+            stage_durations=stage_durations or None,
+            stage_duration_units=stage_duration_units or None,
             user=request.user,
+            planned_duration=planned_duration,
+            duration_unit=duration_unit,
+            start_date=data.get("startDate"),
+            specifications=data.get("specifications"),
         )
         return Response(
             ProjectDetailSerializer(project, context=self._detail_context(project)).data,
@@ -730,6 +851,8 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
             project,
             serializer.validated_data["configIds"],
             stage_weights=serializer.validated_data.get("stageWeights"),
+            stage_durations=serializer.validated_data.get("stageDurations"),
+            stage_duration_units=serializer.validated_data.get("stageDurationUnits"),
             user=request.user,
         )
         project.refresh_from_db()
@@ -1045,10 +1168,13 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
         serializer.is_valid(raise_exception=True)
         serializer.save()
 
-        if any(k in request.data for k in ("percentage", "weightPct", "weight", "weight_pct")):
+        if any(k in request.data for k in ("plannedDuration", "planned_duration", "durationUnit", "duration_unit", "startDateTime", "start_datetime")):
+            services.recalculate_project_timeline(project)
+        elif any(k in request.data for k in ("percentage", "weightPct", "weight", "weight_pct")):
             services.recalculate_project(project)
 
-        return Response(serializer.data)
+        stage.refresh_from_db()
+        return Response(ProjectStageSerializer(stage, context=self.get_serializer_context()).data)
 
     @action(detail=True, methods=["post"], url_path=r"stages/(?P<stage_id>[^/.]+)/assign")
     @transaction.atomic
