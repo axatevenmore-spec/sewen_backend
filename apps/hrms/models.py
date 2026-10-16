@@ -15,6 +15,7 @@ from django.contrib.postgres.constraints import ExclusionConstraint
 from django.contrib.postgres.fields import DateTimeRangeField, RangeOperators
 from django.db import models
 from django.db.models import Func, Q, F, Value
+from django.utils import timezone
 
 from apps.core.models import LegacyIdMixin, TenantModel
 
@@ -22,6 +23,7 @@ EMPLOYEE_STATUSES = [
     ("Active", "Active"),
     ("On Leave", "On Leave"),
     ("Probation", "Probation"),
+    ("Notice Period", "Notice Period"),
     ("Resigned", "Resigned"),
     ("Terminated", "Terminated"),
 ]
@@ -65,10 +67,13 @@ CANDIDATE_STAGES = [
 ]
 OFFER_STATUSES = [
     ("Draft", "Draft"),
+    ("Pending", "Pending"),
     ("Sent", "Sent"),
     ("Accepted", "Accepted"),
     ("Declined", "Declined"),
+    ("Rejected", "Rejected"),
     ("Revoked", "Revoked"),
+    ("Expired", "Expired"),
 ]
 APPRAISAL_STAGES = [
     ("Self Review", "Self Review"),
@@ -244,6 +249,9 @@ class Employee(TenantModel, LegacyIdMixin):
     joining_date = models.DateField()
     employment_type = models.TextField(choices=EMPLOYMENT_TYPES, null=True, blank=True)
     shift = models.TextField(default="General")  # General | Flexible | Night
+    work_schedule = models.ForeignKey(
+        "WorkSchedule", null=True, blank=True, on_delete=models.SET_NULL, related_name="employees"
+    )
     salary_structure = models.ForeignKey(
         "SalaryStructure", null=True, blank=True, on_delete=models.SET_NULL, related_name="employees"
     )
@@ -452,6 +460,11 @@ class LeaveRequest(TenantModel, LegacyIdMixin):
     )
     decided_at = models.DateTimeField(null=True, blank=True)
     remark = models.TextField(null=True, blank=True)
+    approval_chain = models.ForeignKey(
+        "hrms.ApprovalChain", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    current_step = models.IntegerField(default=1)
+    approval_history = models.JSONField(default=list, blank=True)
 
     class Meta:
         db_table = "hrms_leave_requests"
@@ -782,13 +795,38 @@ class Interview(TenantModel):
 
 
 class Offer(TenantModel):
-    application = models.ForeignKey(Application, on_delete=models.CASCADE, related_name="offers")
+    application = models.ForeignKey(
+        Application, null=True, blank=True, on_delete=models.CASCADE, related_name="offers"
+    )
+    candidate = models.ForeignKey(
+        Candidate, null=True, blank=True, on_delete=models.SET_NULL, related_name="direct_offers"
+    )
+    candidate_name = models.TextField(null=True, blank=True)
+    email = models.EmailField(null=True, blank=True)
+    position = models.TextField(null=True, blank=True)
+    department = models.TextField(null=True, blank=True)
+    location = models.TextField(null=True, blank=True)
+    job_type = models.TextField(null=True, blank=True, default="Full-time")
+    work_mode = models.TextField(null=True, blank=True, default="Hybrid")
     offered_ctc = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
     joining_date = models.DateField(null=True, blank=True)
+    expiry_date = models.DateField(null=True, blank=True)
+    reporting_manager = models.TextField(null=True, blank=True)
+    probation_period = models.TextField(null=True, blank=True, default="3 Months")
     status = models.TextField(choices=OFFER_STATUSES, default="Draft")
+    approval_chain = models.ForeignKey(
+        "hrms.ApprovalChain", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    current_step = models.IntegerField(default=1)
+    approval_history = models.JSONField(default=list, blank=True)
+    approver = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
     letter_file = models.ForeignKey(
         "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
+    letter_content = models.JSONField(default=dict, blank=True)
     sent_at = models.DateTimeField(null=True, blank=True)
     responded_at = models.DateTimeField(null=True, blank=True)
     notes = models.TextField(null=True, blank=True)
@@ -1271,7 +1309,13 @@ class Holiday(TenantModel, LegacyIdMixin):
     location = models.ForeignKey(
         Location, null=True, blank=True, on_delete=models.CASCADE, related_name="holidays"
     )
+    department = models.ForeignKey(
+        Department, null=True, blank=True, on_delete=models.SET_NULL, related_name="holidays"
+    )
+    holiday_type = models.CharField(max_length=50, default="National Gazetted")
     is_optional = models.BooleanField(default=False)
+    status = models.CharField(max_length=20, default="Published")
+    description = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "hrms_holidays"
@@ -1290,6 +1334,38 @@ class Holiday(TenantModel, LegacyIdMixin):
         ]
 
 
+class WorkSchedule(TenantModel, LegacyIdMixin):
+    """Enterprise Work Schedule / Shift configuration (api.md §11.8)."""
+
+    name = models.CharField(max_length=100)
+    code = models.CharField(max_length=50, null=True, blank=True, db_index=True)
+    shift_type = models.CharField(max_length=50, default="Regular")  # Regular | Flexible | Rotational | Night
+    shift_start = models.TimeField(default="09:30")
+    shift_end = models.TimeField(default="18:30")
+    break_duration_minutes = models.PositiveIntegerField(default=60)
+    working_hours = models.DecimalField(max_digits=4, decimal_places=2, default=8.0)
+    working_days = models.JSONField(default=list, blank=True)  # [0, 1, 2, 3, 4]
+    weekly_offs = models.JSONField(default=list, blank=True)   # [5, 6]
+    department = models.ForeignKey(
+        Department, null=True, blank=True, on_delete=models.SET_NULL, related_name="work_schedules"
+    )
+    team = models.ForeignKey(
+        "Team", null=True, blank=True, on_delete=models.SET_NULL, related_name="work_schedules"
+    )
+    location = models.ForeignKey(
+        Location, null=True, blank=True, on_delete=models.SET_NULL, related_name="work_schedules"
+    )
+    is_default = models.BooleanField(default=False)
+    status = models.CharField(max_length=20, default="Active")  # Active | Inactive
+    effective_from = models.DateField(null=True, blank=True)
+    effective_to = models.DateField(null=True, blank=True)
+    description = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "hrms_work_schedules"
+        ordering = ["name"]
+
+
 class WorkingDay(TenantModel):
     weekday = models.SmallIntegerField()  # 0 = Monday
     is_working = models.BooleanField(default=True)
@@ -1304,9 +1380,10 @@ class WorkingDay(TenantModel):
         ordering = ["weekday"]
 
 
-class Team(TenantModel):
+class Team(TenantModel, LegacyIdMixin):
     """HR Admin -> Teams tab (api.md §11.8)."""
 
+    code = models.CharField(max_length=50, null=True, blank=True, db_index=True)
     name = models.TextField()
     department = models.ForeignKey(
         Department, null=True, blank=True, on_delete=models.SET_NULL, related_name="teams"
@@ -1314,6 +1391,12 @@ class Team(TenantModel):
     lead = models.ForeignKey(
         Employee, null=True, blank=True, on_delete=models.SET_NULL, related_name="led_teams"
     )
+    lead_name = models.TextField(null=True, blank=True)
+    approver = models.ForeignKey(
+        Employee, null=True, blank=True, on_delete=models.SET_NULL, related_name="approved_teams"
+    )
+    approver_name = models.TextField(null=True, blank=True)
+    headcount = models.PositiveIntegerField(default=1)
     members = models.ManyToManyField(Employee, blank=True, related_name="teams")
     description = models.TextField(null=True, blank=True)
     status = models.TextField(default="Active")
@@ -1338,15 +1421,29 @@ class ApprovalChain(TenantModel):
 
 class Termination(TenantModel):
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="terminations")
+    termination_type = models.TextField(null=True, blank=True)
+    notice_date = models.DateField(null=True, blank=True)
     reason = models.TextField(null=True, blank=True)
     last_working_day = models.DateField(null=True, blank=True)
     letter_file = models.ForeignKey(
         "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
+    letter_content = models.JSONField(default=dict, blank=True)
+    severance = models.TextField(null=True, blank=True)
     settlement_amount = models.DecimalField(
         max_digits=18, decimal_places=2, null=True, blank=True
     )
     status = models.TextField(default="Initiated")
+    approval_chain = models.ForeignKey(
+        "hrms.ApprovalChain", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    current_step = models.IntegerField(default=1)
+    approval_history = models.JSONField(default=list, blank=True)
+    approver = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    remark = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "hrms_terminations"
@@ -1357,10 +1454,25 @@ class Resignation(TenantModel):
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="resignations")
     submitted_on = models.DateField()
     notice_period_days = models.IntegerField(default=30)
+    notice_period = models.TextField(null=True, blank=True)
     last_working_day = models.DateField(null=True, blank=True)
+    handover_to = models.ForeignKey(
+        Employee, null=True, blank=True, on_delete=models.SET_NULL, related_name="handover_resignations"
+    )
+    handover_name = models.TextField(null=True, blank=True)
     exit_interview_at = models.DateTimeField(null=True, blank=True)
     reason = models.TextField(null=True, blank=True)
     status = models.TextField(default="Submitted")
+    approval_chain = models.ForeignKey(
+        "hrms.ApprovalChain", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    current_step = models.IntegerField(default=1)
+    approval_history = models.JSONField(default=list, blank=True)
+    approver = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    remark = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "hrms_resignations"
@@ -1369,9 +1481,15 @@ class Resignation(TenantModel):
 
 class ResignationChecklistItem(TenantModel):
     resignation = models.ForeignKey(
-        Resignation, on_delete=models.CASCADE, related_name="checklist"
+        Resignation, null=True, blank=True, on_delete=models.CASCADE, related_name="checklist"
+    )
+    termination = models.ForeignKey(
+        Termination, null=True, blank=True, on_delete=models.CASCADE, related_name="checklist"
     )
     title = models.TextField()
+    department = models.TextField(null=True, blank=True)
+    notes = models.TextField(null=True, blank=True)
+    is_completed = models.BooleanField(default=False)
     owner = models.ForeignKey(
         "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
@@ -1404,13 +1522,22 @@ class Complaint(TenantModel):
     )
     category = models.TextField(null=True, blank=True)
     description = models.TextField()
+    priority = models.TextField(default="Medium")
     is_anonymous = models.BooleanField(default=False)
     status = models.TextField(choices=STATUSES, default="Open")
     assigned_to = models.ForeignKey(
         "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
+    assigned_investigator_name = models.TextField(null=True, blank=True)
+    filed_on = models.DateField(default=timezone.localdate)
     resolution = models.TextField(null=True, blank=True)
     resolved_at = models.DateTimeField(null=True, blank=True)
+    approval_chain = models.ForeignKey(
+        "hrms.ApprovalChain", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    current_step = models.IntegerField(default=1)
+    approval_history = models.JSONField(default=list, blank=True)
+    comments = models.JSONField(default=list, blank=True)
 
     class Meta:
         db_table = "hrms_complaints"
@@ -1542,6 +1669,16 @@ class TravelRequest(TenantModel, LegacyIdMixin):
     actual_expenses = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     settlement_notes = models.TextField(null=True, blank=True)
     status = models.TextField(choices=STATUSES, default="Submitted")
+    approval_chain = models.ForeignKey(
+        "hrms.ApprovalChain", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    current_step = models.IntegerField(default=1)
+    approval_history = models.JSONField(default=list, blank=True)
+    approver = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    decided_at = models.DateTimeField(null=True, blank=True)
+    remark = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "hrms_travel_requests"
@@ -1572,6 +1709,7 @@ class Announcement(TenantModel, LegacyIdMixin):
     publish_date = models.DateField()
     expiry_date = models.DateField(null=True, blank=True)
     author_name = models.TextField(null=True, blank=True)
+    status = models.TextField(default="Published")
 
     class Meta:
         db_table = "hrms_announcements"

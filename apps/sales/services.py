@@ -176,7 +176,7 @@ def assert_client_totals_match(document, claimed):
 # ---------------------------------------------------------------------------
 # Credit limit (api.md §4.1)
 # ---------------------------------------------------------------------------
-def assert_credit_limit(party, additional_amount, *, user=None, override=False):
+def assert_credit_limit(party, additional_amount, *, user=None, override=False, exclude_order_id=None):
     """422 CREDIT_LIMIT_EXCEEDED unless the caller holds the override permission
     **and** passes ``{"overrideCreditLimit": true}``.
 
@@ -188,11 +188,15 @@ def assert_credit_limit(party, additional_amount, *, user=None, override=False):
     if limit is None or D(limit) <= ZERO:
         return
 
-    open_orders = SalesOrder.objects.filter(
+    orders_qs = SalesOrder.objects.filter(
         client_id=party.client_id,
         party_id=party.id,
         deleted_at__isnull=True,
-    ).exclude(stage__in=["Invoiced", "Cancelled"]).aggregate(
+    ).exclude(stage__in=["Draft", "Invoiced", "Cancelled"])
+    if exclude_order_id:
+        orders_qs = orders_qs.exclude(id=exclude_order_id)
+
+    open_orders = orders_qs.aggregate(
         value=Coalesce(
             Sum("total"), Value(Decimal("0.00")),
             output_field=DecimalField(max_digits=18, decimal_places=2),

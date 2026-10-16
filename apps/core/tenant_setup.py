@@ -105,6 +105,10 @@ DEFAULT_APPROVAL_CHAINS = (
     ("Asset Allocation", "IT Stock Manager", "Operations Lead", "Finance Approver", 4),
     ("Payroll & Compensation Revisions", "HR Director", "Chief Financial Officer (CFO)", "Managing Director", 5),
     ("Expense Reimbursement", "Project Manager", "Finance Lead", "Managing Director", 3),
+    ("Travel Requisitions", "Direct Line Manager", "Finance Lead", "Managing Director", 3),
+    ("Grievances", "HR Operations Lead", "HR Director", "Managing Director", 5),
+    ("Resignations", "Direct Line Manager", "Department Head", "HR Director", 3),
+    ("Terminations", "Department Head", "HR Director", "Managing Director", 3),
 )
 
 

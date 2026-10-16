@@ -846,6 +846,7 @@ class SalesOrderViewSet(SalesDocumentViewSet):
     audit_entity_type = "SalesOrder"
     audit_label_field = "order_number"
     status_field = "stage"
+    draft_status_field = "stage"
     print_title = "Sales Order"
     filter_map = {
         "customerId": "party_id",
@@ -886,6 +887,7 @@ class SalesOrderViewSet(SalesDocumentViewSet):
                 order.total,
                 user=self.request.user,
                 override=bool(self.request.data.get("overrideCreditLimit")),
+                exclude_order_id=order.id,
             )
         return order
 
