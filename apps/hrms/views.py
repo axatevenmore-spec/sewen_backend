@@ -46,6 +46,7 @@ from .models import (
     Department,
     Designation,
     Employee,
+    EMPLOYMENT_TYPES,
     Goal,
     Holiday,
     HrDocument,
@@ -338,7 +339,51 @@ class EmployeeViewSet(TenantModelViewSet):
         "colleagues": [LEAVE_READERS],
         # Every signed-in employee may read their own record.
         "me": [],
+        "confirm_probation": ["edit_staff", "create_staff"],
+        "extend_probation": ["edit_staff", "create_staff"],
+        "evaluate_lifecycle": ["edit_staff", "create_staff"],
     }
+
+    @action(detail=True, methods=["post"], url_path="confirm-probation")
+    def confirm_probation(self, request, pk=None):
+        employee = self.get_object()
+        from . import lifecycle_service
+        from datetime import date
+        eff_date = request.data.get("effectiveDate") or request.data.get("confirmationDate")
+        if isinstance(eff_date, str):
+            try:
+                eff_date = date.fromisoformat(eff_date)
+            except ValueError:
+                eff_date = None
+        remarks = request.data.get("remarks") or request.data.get("reason")
+        updated = lifecycle_service.confirm_employee_probation(
+            employee, user=request.user, effective_date=eff_date, remarks=remarks
+        )
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=True, methods=["post"], url_path="extend-probation")
+    def extend_probation(self, request, pk=None):
+        employee = self.get_object()
+        from . import lifecycle_service
+        from datetime import date
+        ext_days = request.data.get("extensionDays") or request.data.get("days")
+        new_end = request.data.get("newEndDate")
+        if isinstance(new_end, str):
+            try:
+                new_end = date.fromisoformat(new_end)
+            except ValueError:
+                new_end = None
+        reason = request.data.get("reason") or request.data.get("remarks")
+        updated = lifecycle_service.extend_employee_probation(
+            employee, user=request.user, extension_days=ext_days, new_end_date=new_end, reason=reason
+        )
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=False, methods=["post"], url_path="evaluate-lifecycle")
+    def evaluate_lifecycle(self, request):
+        from . import lifecycle_service
+        res = lifecycle_service.evaluate_employee_lifecycle(client_id=request.client_id)
+        return Response(res)
 
 
     @action(detail=False, methods=["get"])
@@ -1678,7 +1723,7 @@ class JobViewSet(TenantModelViewSet):
     status_field = "status"
     search_fields = ["title", "description"]
     ordering = ["-created_at"]
-    filter_map = {"departmentId": "department_id", "isPublished": "is_published"}
+    filter_map = {"departmentId": "department_id", "isPublished": "is_published", "status": "status"}
     permission_map = {"read": ["view_staff"], "write": ["create_staff"]}
 
     def get_queryset(self):
@@ -1711,6 +1756,191 @@ class JobViewSet(TenantModelViewSet):
         return Response(self.get_serializer(job).data)
 
 
+def hire_candidate_to_employee(candidate, user=None, client_id=None):
+    """
+    Unified transactional helper to convert candidate -> employee.
+    Idempotent: prevents duplicate employee creation across retries and concurrent calls.
+    Maps: name, email, phone, joining date, department, designation, location, employment type, salary, manager.
+    """
+    if candidate.employee_id:
+        return candidate.employee
+
+    client_id = client_id or candidate.client_id
+    existing_emp = None
+    if candidate.email:
+        existing_emp = Employee.objects.filter(
+            client_id=client_id, email__iexact=candidate.email.strip(), deleted_at__isnull=True
+        ).first()
+    if not existing_emp and candidate.phone:
+        existing_emp = Employee.objects.filter(
+            client_id=client_id, phone=candidate.phone.strip(), deleted_at__isnull=True
+        ).first()
+
+    if existing_emp:
+        candidate.employee = existing_emp
+        candidate.stage = "Hired"
+        candidate.is_onboarded = True
+        candidate.save(update_fields=["employee", "stage", "is_onboarded", "updated_at"])
+        return existing_emp
+
+    # Resolve latest offer
+    offer = (
+        Offer.objects.filter(
+            Q(candidate=candidate) | Q(application__candidate=candidate),
+            status="Accepted",
+            deleted_at__isnull=True,
+        )
+        .order_by("-created_at")
+        .first()
+    )
+    if not offer:
+        offer = (
+            Offer.objects.filter(
+                Q(candidate=candidate) | Q(application__candidate=candidate),
+                deleted_at__isnull=True,
+            )
+            .order_by("-created_at")
+            .first()
+        )
+
+    # Resolve application and job
+    application = (
+        Application.objects.filter(candidate=candidate, deleted_at__isnull=True)
+        .select_related("job", "job__department", "job__designation", "job__location")
+        .order_by("-applied_at")
+        .first()
+    )
+
+    # Resolve Department
+    dept_obj = None
+    if application and application.job and application.job.department:
+        dept_obj = application.job.department
+    elif offer and offer.department:
+        dept_obj = Department.objects.filter(
+            client_id=client_id, name__iexact=str(offer.department).strip(), deleted_at__isnull=True
+        ).first()
+
+    # Resolve Designation
+    desig_obj = None
+    if application and application.job and application.job.designation:
+        desig_obj = application.job.designation
+    elif offer and offer.position:
+        desig_obj = Designation.objects.filter(
+            client_id=client_id, name__iexact=str(offer.position).strip(), deleted_at__isnull=True
+        ).first()
+
+    # Resolve Location
+    loc_obj = None
+    if application and application.job and application.job.location:
+        loc_obj = application.job.location
+    elif offer and offer.location:
+        loc_obj = Location.objects.filter(
+            client_id=client_id, name__iexact=str(offer.location).strip(), deleted_at__isnull=True
+        ).first()
+
+    # Resolve Reporting Manager
+    mgr_obj = None
+    if offer and offer.reporting_manager:
+        mgr_name = str(offer.reporting_manager).strip()
+        mgr_obj = Employee.objects.filter(
+            client_id=client_id, deleted_at__isnull=True
+        ).filter(Q(name__iexact=mgr_name) | Q(employee_code__iexact=mgr_name)).first()
+    hiring_mgr = getattr(application.job, "hiring_manager", None) if application and application.job else None
+    if not mgr_obj and hiring_mgr:
+        hm_name = str(hiring_mgr).strip()
+        mgr_obj = Employee.objects.filter(
+            client_id=client_id, deleted_at__isnull=True
+        ).filter(Q(name__iexact=hm_name) | Q(employee_code__iexact=hm_name)).first()
+
+    # Calculate salary
+    salary = ZERO
+    if offer and offer.offered_ctc:
+        salary = offer.offered_ctc / 12
+    elif application and application.job and application.job.salary_range:
+        pass
+
+    # Resolve employment type
+    emp_type = None
+    if offer and offer.job_type in dict(EMPLOYMENT_TYPES):
+        emp_type = offer.job_type
+    elif application and application.job and application.job.employment_type in dict(EMPLOYMENT_TYPES):
+        emp_type = application.job.employment_type
+    else:
+        emp_type = "Full-time"
+
+    client_obj = getattr(user, "client", None)
+    if not client_obj:
+        from apps.accounts.models import Client
+        client_obj = Client.objects.filter(pk=client_id).first()
+
+    from apps.core.models import Setting
+    from .lifecycle_service import calculate_probation_end_date, parse_duration_to_days
+
+    hrms_row = Setting.objects.filter(client_id=client_id, key="hrms").first()
+    hrms_config = dict(DEFAULT_HRMS_SETTINGS)
+    if hrms_row and isinstance(hrms_row.value, dict):
+        hrms_config.update(hrms_row.value)
+
+    probation_cfg = (offer.probation_period if offer and offer.probation_period else None) or hrms_config.get("probationPeriod", "90 Days (3 Months)")
+    notice_cfg = hrms_config.get("noticePeriod", "60 Days (2 Months)")
+    joining_dt = offer.joining_date if offer and offer.joining_date else timezone.localdate()
+    prob_end_dt = calculate_probation_end_date(joining_dt, probation_cfg)
+    notice_days = parse_duration_to_days(notice_cfg, default=60)
+
+    employee = Employee.objects.create(
+        client_id=client_id,
+        employee_code=allocate_number(client_obj, "EMP"),
+        name=candidate.name,
+        email=candidate.email,
+        phone=candidate.phone,
+        joining_date=joining_dt,
+        department=dept_obj,
+        designation=desig_obj,
+        location=loc_obj,
+        manager=mgr_obj,
+        employment_type=emp_type,
+        standard_salary=salary,
+        status="Probation",
+        probation_start_date=joining_dt,
+        probation_period=probation_cfg,
+        probation_end_date=prob_end_dt,
+        confirmation_status="On Probation",
+        notice_period=notice_cfg,
+        notice_period_days=notice_days,
+        created_by=user,
+    )
+    candidate.employee = employee
+    candidate.stage = "Hired"
+    candidate.is_onboarded = True
+    candidate.save(update_fields=["employee", "stage", "is_onboarded", "updated_at"])
+
+    if application and application.stage != "Hired":
+        application.stage = "Hired"
+        application.save(update_fields=["stage", "updated_at"])
+
+    if employee.email:
+        from apps.accounts.models import User
+        login = User.objects.filter(
+            client_id=client_id, email=employee.email.strip().lower(),
+            deleted_at__isnull=True,
+        ).first()
+        if login is not None and not user_link.linked_employee(login):
+            login.employee = employee
+            login.save(update_fields=["employee", "updated_at"])
+            user_link.reconcile(login, employee)
+
+    record_audit(
+        client=client_id,
+        actor=user,
+        action="onboard",
+        entity_type="Employee",
+        entity_id=employee.id,
+        entity_label=employee.employee_code,
+        description=f"Hired from candidate {candidate.name}",
+    )
+    return employee
+
+
 class CandidateViewSet(TenantModelViewSet):
     queryset = Candidate.objects.select_related("resume_file", "employee")
     serializer_class = CandidateSerializer
@@ -1719,108 +1949,14 @@ class CandidateViewSet(TenantModelViewSet):
     status_field = "stage"
     search_fields = ["name", "email", "phone"]
     ordering = ["-created_at"]
-    filter_map = {"stage": "stage", "source": "source"}
+    filter_map = {"stage": "stage", "source": "source", "isOnboarded": "is_onboarded"}
     permission_map = {"read": ["view_staff"], "write": ["create_staff"]}
-
-    def _hire_candidate_to_employee(self, candidate):
-        if candidate.employee_id:
-            return candidate.employee
-        client_id = candidate.client_id
-        existing_emp = None
-        if candidate.email:
-            existing_emp = Employee.objects.filter(
-                client_id=client_id, email__iexact=candidate.email.strip(), deleted_at__isnull=True
-            ).first()
-        if existing_emp:
-            candidate.employee = existing_emp
-            candidate.stage = "Hired"
-            candidate.save(update_fields=["employee", "stage", "updated_at"])
-            return existing_emp
-
-        offer = (
-            Offer.objects.filter(
-                application__candidate=candidate, status="Accepted", deleted_at__isnull=True
-            )
-            .order_by("-created_at")
-            .first()
-        )
-        if not offer:
-            offer = (
-                Offer.objects.filter(
-                    application__candidate=candidate, deleted_at__isnull=True
-                )
-                .order_by("-created_at")
-                .first()
-            )
-        application = (
-            Application.objects.filter(candidate=candidate, deleted_at__isnull=True)
-            .select_related("job")
-            .order_by("-applied_at")
-            .first()
-        )
-
-        employee = Employee.objects.create(
-            client_id=client_id,
-            employee_code=allocate_number(self.request.user.client, "EMP"),
-            name=candidate.name,
-            email=candidate.email,
-            phone=candidate.phone,
-            joining_date=(
-                offer.joining_date if offer and offer.joining_date else timezone.localdate()
-            ),
-            department=application.job.department if application and application.job else None,
-            designation=application.job.designation if application and application.job else None,
-            location=application.job.location if application and application.job else None,
-            employment_type=application.job.employment_type if application and application.job else None,
-            standard_salary=(offer.offered_ctc / 12) if offer and offer.offered_ctc else ZERO,
-            status="Probation",
-            created_by=getattr(self.request, "user", None),
-        )
-        candidate.employee = employee
-        candidate.stage = "Hired"
-        candidate.save(update_fields=["employee", "stage", "updated_at"])
-
-        if employee.email:
-            from apps.accounts.models import User
-            login = User.objects.filter(
-                client_id=client_id, email=employee.email.strip().lower(),
-                deleted_at__isnull=True,
-            ).first()
-            if login is not None and not user_link.linked_employee(login):
-                login.employee = employee
-                login.save(update_fields=["employee", "updated_at"])
-                user_link.reconcile(login, employee)
-
-        record_audit(
-            client=client_id,
-            actor=getattr(self.request, "user", None),
-            action="onboard",
-            entity_type="Employee",
-            entity_id=employee.id,
-            entity_label=employee.employee_code,
-            description=f"Hired from candidate {candidate.name}",
-        )
-        return employee
-
-    @transaction.atomic
-    def perform_create(self, serializer):
-        candidate = super().perform_create(serializer)
-        if candidate.stage == "Hired" and not candidate.employee_id:
-            self._hire_candidate_to_employee(candidate)
-        return candidate
-
-    @transaction.atomic
-    def perform_update(self, serializer):
-        candidate = super().perform_update(serializer)
-        if candidate.stage == "Hired" and not candidate.employee_id:
-            self._hire_candidate_to_employee(candidate)
-        return candidate
 
     @action(detail=True, methods=["post"])
     @transaction.atomic
     def hire(self, request, pk=None):
         candidate = self.get_object()
-        employee = self._hire_candidate_to_employee(candidate)
+        employee = hire_candidate_to_employee(candidate, user=request.user, client_id=request.client_id)
         return Response(EmployeeSerializer(employee).data, status=status.HTTP_201_CREATED)
 
 
@@ -2037,70 +2173,11 @@ class OnboardingViewSet(TenantModelViewSet):
         if candidate is None:
             raise NotFound("That candidate no longer exists.")
         if candidate.employee_id:
-            raise Conflict(
-                "This candidate has already been onboarded.",
-                code=Codes.ALREADY_DONE,
-                payload={"employeeId": str(candidate.employee_id)},
+            return Response(
+                EmployeeSerializer(candidate.employee).data, status=status.HTTP_200_OK
             )
 
-        offer = (
-            Offer.objects.filter(
-                Q(candidate=candidate) | Q(application__candidate=candidate),
-                status="Accepted",
-                deleted_at__isnull=True,
-            )
-            .order_by("-created_at")
-            .first()
-        )
-        application = (
-            Application.objects.filter(candidate=candidate, deleted_at__isnull=True)
-            .select_related("job")
-            .order_by("-applied_at")
-            .first()
-        )
-
-        employee = Employee.objects.create(
-            client_id=request.client_id,
-            employee_code=allocate_number(request.user.client, "EMP"),
-            name=candidate.name,
-            email=candidate.email,
-            phone=candidate.phone,
-            joining_date=(
-                offer.joining_date if offer and offer.joining_date else timezone.localdate()
-            ),
-            department=application.job.department if application else None,
-            designation=application.job.designation if application else None,
-            location=application.job.location if application else None,
-            employment_type=application.job.employment_type if application else None,
-            standard_salary=(offer.offered_ctc / 12) if offer and offer.offered_ctc else ZERO,
-            status="Probation",
-            created_by=request.user,
-        )
-        candidate.employee = employee
-        candidate.stage = "Hired"
-        candidate.save(update_fields=["employee", "stage", "updated_at"])
-
-        if employee.email:
-            from apps.accounts.models import User
-
-            login = User.objects.filter(
-                client_id=request.client_id, email=employee.email.strip().lower(),
-                deleted_at__isnull=True,
-            ).first()
-            if login is not None and not user_link.linked_employee(login):
-                login.employee = employee
-                login.save(update_fields=["employee", "updated_at"])
-                user_link.reconcile(login, employee)
-
-        record_audit(
-            client=request.client_id,
-            actor=request.user,
-            action="onboard",
-            entity_type="Employee",
-            entity_id=employee.id,
-            entity_label=employee.employee_code,
-            description=f"Onboarded from candidate {candidate.name}",
-        )
+        employee = hire_candidate_to_employee(candidate, user=request.user, client_id=request.client_id)
         return Response(
             EmployeeSerializer(employee).data, status=status.HTTP_201_CREATED
         )
@@ -2116,11 +2193,13 @@ class OnboardingViewSet(TenantModelViewSet):
         ).first()
         if candidate is None:
             raise NotFound("That candidate no longer exists.")
+        candidate.documents_verified = True
+        candidate.save(update_fields=["documents_verified", "updated_at"])
         OnboardingTask.objects.filter(
             client_id=request.client_id, candidate=candidate,
             title__icontains="document", completed_at__isnull=True,
         ).update(completed_at=timezone.now())
-        return Response({"verified": True})
+        return Response({"verified": True, "documentsVerified": True})
 
 
 # Hidden: Screening Questions out of scope (Sweven spec) -- restore by uncommenting this block.
@@ -2146,31 +2225,42 @@ class RecruitmentFunnelView(APIView):
         rows = applications.values("stage").annotate(count=Count("id"))
         funnel = {row["stage"]: row["count"] for row in rows}
 
+        candidates = Candidate.objects.filter(
+            client_id=client_id, deleted_at__isnull=True
+        )
+        cand_rows = candidates.values("stage").annotate(count=Count("id"))
+        cand_funnel = {row["stage"]: row["count"] for row in cand_rows}
+
+        # Combine or fallback if applications table has fewer/no records
+        stages = ["Applied", "Screening", "Shortlisted", "Interview", "Offer", "Hired", "Rejected"]
+        combined_funnel = {}
+        for st in stages:
+            combined_funnel[st] = max(funnel.get(st, 0), cand_funnel.get(st, 0))
+
         if section == "funnel":
             return Response(
                 envelope(
                     [
-                        {"stage": stage, "count": funnel.get(stage, 0)}
-                        for stage in [
-                            "Applied", "Screening", "Interview", "Offer", "Hired", "Rejected",
-                        ]
+                        {"stage": stage, "count": combined_funnel.get(stage, 0)}
+                        for stage in stages
                     ]
                 )
             )
 
         jobs = Job.objects.filter(client_id=client_id, deleted_at__isnull=True)
+        total_apps = max(applications.count(), candidates.count())
         return Response(
             {
                 "openJobs": jobs.filter(status="Open").count(),
-                "totalApplications": applications.count(),
+                "totalApplications": total_apps,
                 "interviewsScheduled": Interview.objects.filter(
                     client_id=client_id, status="Scheduled", deleted_at__isnull=True
                 ).count(),
                 "offersOut": Offer.objects.filter(
                     client_id=client_id, status="Sent", deleted_at__isnull=True
                 ).count(),
-                "hired": funnel.get("Hired", 0),
-                "funnel": funnel,
+                "hired": combined_funnel.get("Hired", 0),
+                "funnel": combined_funnel,
             }
         )
 
@@ -3313,6 +3403,8 @@ class ResignationViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
         "resubmit": ["edit_staff"],
         "execute_offboarding": ["edit_staff"],
         "checklist": ["edit_staff"],
+        "waive_notice": ["edit_staff"],
+        "shorten_notice": ["edit_staff"],
     }
 
     def perform_create(self, serializer):
@@ -3465,6 +3557,55 @@ class ResignationViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
             "isCleared": status_info["is_cleared"],
             "checklist": items_data,
         })
+
+    @action(detail=True, methods=["post"], url_path="waive-notice")
+    def waive_notice(self, request, pk=None):
+        instance = self.get_object()
+        from . import lifecycle_service
+        from datetime import date
+        eff_date = (
+            request.data.get("effectiveLastDay")
+            or request.data.get("effective_last_day")
+            or request.data.get("lastWorkingDay")
+            or request.data.get("last_working_day")
+        )
+        if isinstance(eff_date, str):
+            try:
+                eff_date = date.fromisoformat(eff_date)
+            except ValueError:
+                eff_date = None
+        reason = (
+            request.data.get("reason")
+            or request.data.get("waiverReason")
+            or request.data.get("waiver_reason")
+            or request.data.get("remark")
+        )
+        updated = lifecycle_service.waive_resignation_notice(
+            instance, user=request.user, effective_last_day=eff_date, reason=reason
+        )
+        return Response(self.get_serializer(updated).data)
+
+    @action(detail=True, methods=["post"], url_path="shorten-notice")
+    def shorten_notice(self, request, pk=None):
+        instance = self.get_object()
+        from . import lifecycle_service
+        from datetime import date
+        rev_date = (
+            request.data.get("revisedLastWorkingDay")
+            or request.data.get("revised_last_working_day")
+            or request.data.get("lastWorkingDay")
+            or request.data.get("last_working_day")
+        )
+        if isinstance(rev_date, str):
+            try:
+                rev_date = date.fromisoformat(rev_date)
+            except ValueError:
+                rev_date = None
+        reason = request.data.get("reason") or request.data.get("remark")
+        updated = lifecycle_service.shorten_resignation_notice(
+            instance, user=request.user, revised_last_working_day=rev_date, reason=reason
+        )
+        return Response(self.get_serializer(updated).data)
 
 
 class ComplaintViewSet(TenantModelViewSet):
@@ -3631,7 +3772,15 @@ class HrmsSettingsView(APIView):
         merged = dict(DEFAULT_HRMS_SETTINGS)
         if row and isinstance(row.value, dict):
             merged.update(row.value)
+        old_probation = merged.get("probationPeriod")
         merged.update(serializer.validated_data)
+        new_probation = serializer.validated_data.get("probationPeriod")
+
+        if new_probation and new_probation != old_probation:
+            from . import lifecycle_service
+            lifecycle_service.recalculate_probations_for_setting_change(
+                request.client_id, new_probation, user=request.user
+            )
 
         row, _ = Setting.objects.update_or_create(
             client_id=request.client_id,

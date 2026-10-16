@@ -61,6 +61,7 @@ CANDIDATE_STAGES = [
     ("Applied", "Applied"),
     ("Screening", "Screening"),
     ("Interview", "Interview"),
+    ("Shortlisted", "Shortlisted"),
     ("Offer", "Offer"),
     ("Hired", "Hired"),
     ("Rejected", "Rejected"),
@@ -273,6 +274,19 @@ class Employee(TenantModel, LegacyIdMixin):
 
     last_working_day = models.DateField(null=True, blank=True)
     termination_reason = models.TextField(null=True, blank=True)
+
+    # Probation & Lifecycle Tracking
+    probation_start_date = models.DateField(null=True, blank=True)
+    probation_period = models.TextField(null=True, blank=True, default="90 Days (3 Months)")
+    probation_end_date = models.DateField(null=True, blank=True)
+    confirmation_status = models.TextField(default="On Probation", null=True, blank=True)
+    confirmation_date = models.DateField(null=True, blank=True)
+    confirmation_remarks = models.TextField(null=True, blank=True)
+    probation_history = models.JSONField(default=list, blank=True)
+
+    # Standard & Allocated Notice Period
+    notice_period = models.TextField(null=True, blank=True, default="60 Days (2 Months)")
+    notice_period_days = models.IntegerField(null=True, blank=True, default=60)
 
     class Meta:
         db_table = "hrms_employees"
@@ -685,7 +699,7 @@ class SalaryAdvance(TenantModel):
 # db.md §11.5 -- Recruitment
 # ---------------------------------------------------------------------------
 class Job(TenantModel, LegacyIdMixin):
-    STATUSES = [("Open", "Open"), ("On Hold", "On Hold"), ("Closed", "Closed")]
+    STATUSES = [("Draft", "Draft"), ("Open", "Open"), ("On Hold", "On Hold"), ("Closed", "Closed")]
 
     title = models.TextField()
     department = models.ForeignKey(
@@ -731,11 +745,16 @@ class Candidate(TenantModel, LegacyIdMixin):
         "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     source = models.TextField(null=True, blank=True)  # 'careers_portal' for public applies
+    location = models.TextField(null=True, blank=True)
+    experience = models.TextField(null=True, blank=True)
+    skills = models.TextField(null=True, blank=True)
     current_ctc = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
     expected_ctc = models.DecimalField(max_digits=18, decimal_places=2, null=True, blank=True)
     notice_period_days = models.IntegerField(null=True, blank=True)
     stage = models.TextField(choices=CANDIDATE_STAGES, default="Applied")
     rating = models.DecimalField(max_digits=3, decimal_places=1, null=True, blank=True)
+    is_onboarded = models.BooleanField(default=False)
+    documents_verified = models.BooleanField(default=False)
     #: The hiring trail must survive the conversion to employee (db.md §11.5).
     employee = models.ForeignKey(
         Employee, null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
@@ -783,6 +802,8 @@ class Interview(TenantModel):
     round = models.IntegerField(default=1)
     scheduled_at = models.DateTimeField()
     mode = models.TextField(null=True, blank=True)
+    location = models.TextField(null=True, blank=True)
+    interview_type = models.TextField(null=True, blank=True)
     panel_user_ids = models.JSONField(default=list, blank=True)
     status = models.TextField(choices=STATUSES, default="Scheduled")
     rating = models.DecimalField(max_digits=3, decimal_places=1, null=True, blank=True)
@@ -1473,6 +1494,9 @@ class Resignation(TenantModel):
     )
     decided_at = models.DateTimeField(null=True, blank=True)
     remark = models.TextField(null=True, blank=True)
+    notice_waived = models.BooleanField(default=False)
+    waiver_reason = models.TextField(null=True, blank=True)
+    original_last_working_day = models.DateField(null=True, blank=True)
 
     class Meta:
         db_table = "hrms_resignations"

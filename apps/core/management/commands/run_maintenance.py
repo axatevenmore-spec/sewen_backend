@@ -266,6 +266,12 @@ def process_due_exits_job(command):
     return run_exits()
 
 
+def evaluate_employee_lifecycle_job(command):
+    """Evaluates employee probation deadlines, confirmation statuses, and due exits."""
+    from apps.hrms.lifecycle_service import evaluate_employee_lifecycle
+    return evaluate_employee_lifecycle()
+
+
 JOBS = {
     "expire_shares": ("hourly", expire_shares),
     "sweep_pending_files": ("hourly", sweep_pending_files),
@@ -277,4 +283,5 @@ JOBS = {
     "accrue_leave": ("nightly", accrue_leave),
     "retain_user_locations": ("nightly", retain_user_locations),
     "process_due_exits": ("nightly", process_due_exits_job),
+    "evaluate_employee_lifecycle": ("nightly", evaluate_employee_lifecycle_job),
 }
