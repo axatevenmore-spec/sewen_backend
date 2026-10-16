@@ -3,6 +3,8 @@ import re
 
 from rest_framework import serializers
 
+from apps.core.files import public_url
+
 from apps.core.serializers import (
     BaseModelSerializer,
     BaseSerializer,
@@ -408,6 +410,23 @@ class ItemSerializer(BaseModelSerializer):
         coerce_to_string=False, required=False,
     )
 
+    image = serializers.SerializerMethodField()
+    imageUrl = serializers.SerializerMethodField()
+    imageFileId = TenantPrimaryKeyRelatedField(
+        source="image_file",
+        model="core.File",
+        required=False,
+        allow_null=True,
+        write_only=True,
+    )
+    imageUrlInput = serializers.CharField(
+        source="image_url",
+        required=False,
+        allow_null=True,
+        allow_blank=True,
+        write_only=True,
+    )
+
     # -- derived, read-only -------------------------------------------------
     availableQty = serializers.SerializerMethodField()
     reservedQty = serializers.SerializerMethodField()
@@ -423,6 +442,7 @@ class ItemSerializer(BaseModelSerializer):
             "itemType", "itemTypeCode", "itemTypeId", "gradeName", "gradeId",
             "item_kind", "vendor", "vendorId",
             "uom", "purchase_unit", "sales_unit", "unitConversionFactor",
+            "image", "imageUrl", "imageFileId", "imageUrlInput",
             "availableQty", "reservedQty", "onHandQty", "damagedQty",
             "reorder_level", "location", "locationId", "status", "lifecycle_status",
             "cost_price", "selling_price", "hsn_code", "tax_pct",
@@ -439,7 +459,7 @@ class ItemSerializer(BaseModelSerializer):
             "custom_field_values",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["created_at", "updated_at"]
+        read_only_fields = ["created_at", "updated_at", "image", "imageUrl"]
 
     def to_internal_value(self, data):
         data = dict(data)
@@ -489,10 +509,29 @@ class ItemSerializer(BaseModelSerializer):
         for c_key, s_key in camel_map.items():
             if c_key in data and s_key not in data:
                 data[s_key] = data[c_key]
+
+        if "imageFileId" in data:
+            if not data["imageFileId"]:
+                data["imageFileId"] = None
+                if not data.get("imageUrlInput"):
+                    data["imageUrlInput"] = ""
+        elif "image" in data and not data["image"]:
+            data["imageFileId"] = None
+            data["imageUrlInput"] = ""
+        elif "imageUrl" in data and not data["imageUrl"]:
+            data["imageFileId"] = None
+            data["imageUrlInput"] = ""
+
+        if "imageUrl" in data and "imageUrlInput" not in data:
+            val = data["imageUrl"]
+            if val and not (isinstance(val, str) and "/api/v1/files/" in val):
+                data["imageUrlInput"] = val
+
         return super().to_internal_value(data)
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
+        data["imageFileId"] = str(instance.image_file_id) if instance.image_file_id else None
         data["itemTypeId"] = str(instance.item_type_id) if instance.item_type_id else None
         data["gradeId"] = str(instance.grade_id) if instance.grade_id else None
         data["metalGrade"] = instance.grade.code if instance.grade else (instance.metal_grade or "")
@@ -525,6 +564,14 @@ class ItemSerializer(BaseModelSerializer):
         data["weightUnit"] = instance.weight_unit or "kg"
         data["tolerancePct"] = instance.tolerance_pct
         return data
+
+    def get_image(self, item):
+        if getattr(item, "image_file_id", None) and item.image_file:
+            return public_url(item.image_file, self.context.get("request"))
+        return item.image_url or None
+
+    def get_imageUrl(self, item):
+        return self.get_image(item)
 
     def get_availableQty(self, item):
         return getattr(item, "available_qty", None)

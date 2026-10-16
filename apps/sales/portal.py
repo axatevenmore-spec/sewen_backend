@@ -35,6 +35,7 @@ from rest_framework.views import APIView
 from apps.core import idempotency
 from apps.core.audit import record_audit, request_ip, snapshot
 from apps.core.exceptions import PermissionDenied, ValidationFailed
+from apps.core.files import public_url
 from apps.core.money import DEFAULT_TAX_PCT, round4
 from apps.core.naming import camelize
 from apps.core.numbering import allocate_number
@@ -146,7 +147,7 @@ def _tax_rate(item, history_row):
     return DEFAULT_TAX_PCT
 
 
-def orderable_items(client_id, party):
+def orderable_items(client_id, party, request=None):
     history = purchase_history(client_id, party.id)
     if not history:
         return []
@@ -156,19 +157,33 @@ def orderable_items(client_id, party):
             pk__in=list(history),
             deleted_at__isnull=True,
             lifecycle_status="Active",
-        ).order_by("name", "sku")
+        ).select_related("image_file", "category", "grade").order_by("name", "sku")
     )
     stock.annotate_items_with_stock(client_id, [item for item in items if item.holds_stock])
 
     rows = []
     for item in items:
         last = history[item.id]
+        img_url = None
+        if getattr(item, "image_file_id", None) and item.image_file:
+            img_url = public_url(item.image_file, request)
+        elif item.image_url:
+            img_url = item.image_url
+
+        category_name = item.category.name if getattr(item, "category", None) else None
+        grade_name = item.grade.name if getattr(item, "grade", None) else (item.metal_grade or None)
+
         rows.append(
             {
                 "id": str(item.id),
                 "name": item.name,
                 "itemCode": item.sku,
+                "category": category_name,
+                "description": item.description or "",
+                "metalGrade": grade_name,
                 "uom": item.uom,
+                "image": img_url,
+                "imageUrl": img_url,
                 "taxRate": _tax_rate(item, last),
                 "lastOrderedRate": last["rate"],
                 "lastDiscountPct": last["discount_pct"],
@@ -369,7 +384,7 @@ class PortalOrderableItemsView(APIView):
 
     def get(self, request):
         party = portal_party(request)
-        return Response(envelope(orderable_items(request.client_id, party)))
+        return Response(envelope(orderable_items(request.client_id, party, request=request)))
 
 
 class PortalPlaceOrderView(APIView):

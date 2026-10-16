@@ -163,6 +163,7 @@ class File(AuditedModel):
         ("policy", "Policy"),
         ("import", "Bulk import"),
         ("export", "Export"),
+        ("product_image", "Product image"),
         ("other", "Other"),
     ]
     STATUSES = [("pending", "pending"), ("committed", "committed"), ("deleted", "deleted")]

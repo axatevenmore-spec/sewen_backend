@@ -395,6 +395,10 @@ class Item(TenantModel, LegacyIdMixin):
     )
     tax_pct = models.DecimalField(max_digits=7, decimal_places=4, null=True, blank=True)
     lifecycle_status = models.TextField(choices=LIFECYCLE, default="Active")
+    image_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    image_url = models.TextField(null=True, blank=True)
     custom_field_values = models.JSONField(default=dict, blank=True)
 
     # Metal / Fabrication specs (Sheets & Tubes)

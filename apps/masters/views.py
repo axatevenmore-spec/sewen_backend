@@ -295,7 +295,7 @@ class PartyViewSet(TenantModelViewSet):
 # Items (api.md §4.2)
 # ---------------------------------------------------------------------------
 class ItemViewSet(TenantModelViewSet):
-    queryset = Item.objects.select_related("category", "vendor", "default_location")
+    queryset = Item.objects.select_related("category", "vendor", "default_location", "image_file")
     serializer_class = ItemSerializer
     audit_entity_type = "Item"
     audit_label_field = "sku"
