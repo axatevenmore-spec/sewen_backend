@@ -254,35 +254,40 @@ class EstimateViewSet(ApprovalLinkActions, SalesDocumentViewSet):
         )
         return super().perform_create(serializer)
 
-    @action(detail=True, methods=["post"], url_path="convert-to-quotation")
+    @action(detail=True, methods=["post"], url_path="convert-to-order")
     @transaction.atomic
-    def convert_to_quotation(self, request, pk=None):
+    def convert_to_order(self, request, pk=None):
         estimate = self.get_object()
         if estimate.status == "Converted":
             raise Conflict(
                 "This estimate has already been converted.", code=Codes.ALREADY_DONE
             )
 
-        quotation = _clone_document(
+        order = _clone_document(
             estimate,
-            Quotation,
-            {"estimate": estimate, "status": "Draft"},
-            number_field="quotation_number",
-            series="QT",
-            line_model_name="QuotationLine",
-            line_fk="quotation",
+            SalesOrder,
+            {"stage": "Draft"},
+            number_field="order_number",
+            series="SO",
+            line_model_name="SalesOrderLine",
+            line_fk="sales_order",
         )
 
         estimate.status = "Converted"
-        estimate.converted_quotation = quotation
-        estimate.save(update_fields=["status", "converted_quotation", "updated_at"])
+        estimate.save(update_fields=["status", "updated_at"])
         self.write_audit(
-            "convert", estimate, description=f"Converted to {quotation.quotation_number}"
+            "convert", estimate, description=f"Converted to {order.order_number}"
         )
         return Response(
-            QuotationSerializer(quotation, context=self.get_serializer_context()).data,
+            SalesOrderSerializer(order, context=self.get_serializer_context()).data,
             status=status.HTTP_201_CREATED,
         )
+
+    # Quotation conversion commented out per workflow update (Estimates directly convert to Sales Order)
+    # @action(detail=True, methods=["post"], url_path="convert-to-quotation")
+    # @transaction.atomic
+    # def convert_to_quotation(self, request, pk=None):
+    #     ...
 
     @action(detail=True, methods=["post"], url_path="convert-to-challan")
     @transaction.atomic

@@ -375,6 +375,13 @@ class DeliveryChallanSerializer(DocumentSerializer):
     line_fk_name = "delivery_challan"
     line_table_name = "delivery_challan_lines"
 
+    formal_invoice_amount = serializers.SerializerMethodField()
+
+    def get_formal_invoice_amount(self, obj):
+        if obj.sales_order and obj.sales_order.formal_invoice_amount is not None:
+            return obj.sales_order.formal_invoice_amount
+        return obj.total
+
     class Meta:
         model = DeliveryChallan
         fields = HEADER_FIELDS + [
@@ -383,8 +390,9 @@ class DeliveryChallanSerializer(DocumentSerializer):
             "delivery_location", "location", "delivered_at",
             # Weighbridge (sheet-metal dispatch is by weight).
             "weighbridge_slip", "gross_weight", "tare_weight", "net_weight",
+            "formal_invoice_amount",
         ]
-        read_only_fields = READ_ONLY_HEADER_FIELDS + ["challan_number", "delivered_at"]
+        read_only_fields = READ_ONLY_HEADER_FIELDS + ["challan_number", "delivered_at", "formal_invoice_amount"]
 
     def validate(self, attrs):
         """Net weight is gross - tare whenever both are known."""
