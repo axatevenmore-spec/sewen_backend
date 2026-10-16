@@ -150,11 +150,11 @@ class ItemType(TenantModel, LegacyIdMixin):
     description = models.TextField(null=True, blank=True)
     shape_profile = models.TextField(null=True, blank=True)
     dimension_schema = models.JSONField(default=dict, blank=True)
+    is_active = models.BooleanField(default=True)
     image_file = models.ForeignKey(
         "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     image_url = models.TextField(null=True, blank=True)
-    is_active = models.BooleanField(default=True)
 
     class Meta:
         db_table = "item_types"
@@ -198,11 +198,11 @@ class ItemCategory(TenantModel, LegacyIdMixin):
         "masters.Unit", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     default_uom = models.TextField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
     image_file = models.ForeignKey(
         "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
     )
     image_url = models.TextField(null=True, blank=True)
-    is_active = models.BooleanField(default=True)
 
     class Meta:
         db_table = "item_categories"
@@ -403,10 +403,6 @@ class Item(TenantModel, LegacyIdMixin):
     )
     tax_pct = models.DecimalField(max_digits=7, decimal_places=4, null=True, blank=True)
     lifecycle_status = models.TextField(choices=LIFECYCLE, default="Active")
-    image_file = models.ForeignKey(
-        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
-    )
-    image_url = models.TextField(null=True, blank=True)
     custom_field_values = models.JSONField(default=dict, blank=True)
 
     # Metal / Fabrication specs (Sheets & Tubes)
@@ -451,6 +447,11 @@ class Item(TenantModel, LegacyIdMixin):
     leg_b = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)  # Angle leg 2 or Channel web height
     web_thickness = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
     flange_thickness = models.DecimalField(max_digits=18, decimal_places=4, null=True, blank=True)
+
+    image_file = models.ForeignKey(
+        "core.File", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    image_url = models.TextField(null=True, blank=True)
 
     class Meta:
         db_table = "items"

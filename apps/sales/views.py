@@ -4,7 +4,7 @@ from datetime import timedelta
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Count, DecimalField, F, Q, Sum, Value
+from django.db.models import Count, DecimalField, F, OuterRef, Q, Subquery, Sum, Value
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 from rest_framework import status
@@ -31,6 +31,7 @@ from .models import (
     SalesApprovalLink,
     METAL_LINE_FIELDS,
     CashPaymentReceipt,
+    CreditAllocation,
     DeliveryChallan,
     DeliveryChallanLine,
     Estimate,
@@ -1444,30 +1445,79 @@ class SalesInvoiceViewSet(ApprovalLinkActions, SalesDocumentViewSet):
         "finalize": ["finalize_invoice"],
         "cancel": ["cancel_invoice"],
         "allocate_split": ["create_invoice"],
+        "apply_credit": ["create_invoice"],
+        "remove_credit": ["create_invoice"],
     }
 
     def filter_queryset(self, queryset):
         queryset = super().filter_queryset(queryset)
+        credit_subquery = CreditAllocation.objects.filter(
+            invoice=OuterRef("pk"), deleted_at__isnull=True
+        ).exclude(
+            payment__status="Cancelled"
+        ).exclude(
+            sales_return__status="Cancelled"
+        ).values("invoice").annotate(s=Sum("allocated_amount")).values("s")
+
+        return_subquery = SalesReturn.objects.filter(
+            sales_invoice=OuterRef("pk"), deleted_at__isnull=True
+        ).exclude(
+            status="Cancelled"
+        ).values("sales_invoice").annotate(s=Sum("total")).values("s")
+
+        queryset = queryset.annotate(
+            _credit_applied=Coalesce(Subquery(credit_subquery, output_field=DecimalField(max_digits=18, decimal_places=2)), Value(Decimal("0.00")))
+            + Coalesce(Subquery(return_subquery, output_field=DecimalField(max_digits=18, decimal_places=2)), Value(Decimal("0.00")))
+        )
+
         if self.request.query_params.get("overdue") == "true":
             queryset = queryset.filter(
                 due_date__lt=timezone.localdate(),
-                total__gt=F("amount_paid"),
+                total__gt=F("amount_paid") + F("_credit_applied"),
+            ).exclude(status__in=["Cancelled", "Draft", "Paid"])
+
+        payable = self.request.query_params.get("payable") or self.request.query_params.get("isPayable")
+        if payable in ("true", "1", True):
+            queryset = queryset.filter(
+                posted_at__isnull=False,
+                total__gt=F("amount_paid") + F("_credit_applied"),
             ).exclude(status__in=["Cancelled", "Draft", "Paid"])
         return queryset
 
     def get_aggregates(self, queryset):
-        rows = queryset.aggregate(
+        credit_subquery = CreditAllocation.objects.filter(
+            invoice=OuterRef("pk"), deleted_at__isnull=True
+        ).exclude(
+            payment__status="Cancelled"
+        ).exclude(
+            sales_return__status="Cancelled"
+        ).values("invoice").annotate(s=Sum("allocated_amount")).values("s")
+
+        return_subquery = SalesReturn.objects.filter(
+            sales_invoice=OuterRef("pk"), deleted_at__isnull=True
+        ).exclude(
+            status="Cancelled"
+        ).values("sales_invoice").annotate(s=Sum("total")).values("s")
+
+        annotated_qs = queryset.annotate(
+            _credit_applied=Coalesce(Subquery(credit_subquery, output_field=DecimalField(max_digits=18, decimal_places=2)), Value(Decimal("0.00")))
+            + Coalesce(Subquery(return_subquery, output_field=DecimalField(max_digits=18, decimal_places=2)), Value(Decimal("0.00")))
+        )
+
+        rows = annotated_qs.aggregate(
             count=Count("id"),
             totalValue=money_sum("total"),
             paid=money_sum("amount_paid"),
+            totalCreditApplied=Coalesce(Sum("_credit_applied"), Value(Decimal("0.00")), output_field=DecimalField(max_digits=18, decimal_places=2)),
             draft=Count("id", filter=Q(status="Draft")),
             overdue=Count(
                 "id",
-                filter=Q(due_date__lt=timezone.localdate(), total__gt=F("amount_paid"))
+                filter=Q(due_date__lt=timezone.localdate(), total__gt=F("amount_paid") + F("_credit_applied"))
                 & ~Q(status__in=["Cancelled", "Draft", "Paid"]),
             ),
         )
-        rows["outstanding"] = round2(rows["totalValue"] - rows["paid"])
+        rows["creditApplied"] = round2(rows.get("totalCreditApplied", ZERO))
+        rows["outstanding"] = max(ZERO, round2(rows["totalValue"] - rows["paid"] - rows["creditApplied"]))
         return rows
 
     def perform_create(self, serializer):
@@ -1558,6 +1608,26 @@ class SalesInvoiceViewSet(ApprovalLinkActions, SalesDocumentViewSet):
     def outstanding(self, request, pk=None):
         return Response(services.invoice_outstanding(self.get_object()))
 
+    @action(detail=True, methods=["post"], url_path="apply-credit")
+    def apply_credit(self, request, pk=None):
+        invoice = self.get_object()
+        amount = request.data.get("amount")
+        invoice = services.apply_party_credit_to_invoice(
+            invoice, user=request.user, credit_amount=amount
+        )
+        self.write_audit("apply_credit", invoice, description=f"Applied credit {amount or 'auto'} to invoice")
+        return Response(self.get_serializer(invoice).data)
+
+    @action(detail=True, methods=["post"], url_path="remove-credit")
+    def remove_credit(self, request, pk=None):
+        invoice = self.get_object()
+        allocation_id = request.data.get("allocationId")
+        invoice = services.remove_party_credit_from_invoice(
+            invoice, allocation_id=allocation_id, user=request.user
+        )
+        self.write_audit("remove_credit", invoice, description="Removed credit allocation from invoice")
+        return Response(self.get_serializer(invoice).data)
+
     @action(detail=True, methods=["post"], url_path="e-invoice")
     def e_invoice(self, request, pk=None):
         """IRN / e-way bill hook (api.md §5.7, phase 2)."""
@@ -1607,15 +1677,40 @@ class PaymentInViewSet(TenantModelViewSet):
         description = self.request.data.get("description") or data.get("description")
         allocations = self.request.data.get("allocations") or []
         invoice_id = self.request.data.get("invoiceId")
-        invoice = None
-        if invoice_id:
+        invoice = data.get("invoice")
+        if not invoice and invoice_id:
             invoice = SalesInvoice.objects.filter(
                 pk=invoice_id, client_id=self.get_client_id(), deleted_at__isnull=True
             ).first()
-            if invoice is None and payment_type == "WITH_BILL":
-                raise NotFound("That invoice no longer exists.")
-            if invoice and invoice.party_id != data["party"].id:
-                raise ValidationError({"invoiceId": ["Cannot allocate payment to another customer's invoice."]})
+        if invoice is None and invoice_id and payment_type == "WITH_BILL":
+            raise NotFound("That invoice no longer exists.")
+        if invoice:
+            if invoice.party_id != data["party"].id:
+                raise ValidationFailed(
+                    "Cannot allocate payment to another customer's invoice.",
+                    field_errors={"invoiceId": ["Cannot allocate payment to another customer's invoice."]},
+                )
+            if invoice.status == "Cancelled":
+                raise ValidationFailed(
+                    "Cannot record payment against a cancelled invoice.",
+                    field_errors={"invoiceId": ["Cannot record payment against a cancelled invoice."]},
+                )
+            if invoice.posted_at is None or invoice.status == "Draft":
+                raise ValidationFailed(
+                    "Cannot record payment against a draft invoice. Finalize it first.",
+                    field_errors={"invoiceId": ["Cannot record payment against a draft invoice. Finalize it first."]},
+                )
+            if invoice.balance_due <= Decimal("0.01") or invoice.status == "Paid":
+                raise ValidationFailed(
+                    "This invoice is already fully paid.",
+                    field_errors={"invoiceId": ["This invoice is already fully paid."]},
+                )
+            if payment_type == "WITH_BILL" and data["amount"] > invoice.balance_due + Decimal("0.01"):
+                raise ValidationFailed(
+                    f"Payment amount exceeds the remaining invoice balance ({invoice.balance_due}).",
+                    field_errors={"amount": [f"Payment amount exceeds the remaining invoice balance ({invoice.balance_due})."]},
+                )
+
 
         payment = services.record_payment_in(
             client=self.request.user.client,
@@ -1699,6 +1794,27 @@ class CashPaymentReceiptViewSet(TenantModelViewSet):
         data = serializer.validated_data
         invoice = data.get("invoice")
         party = data.get("party")
+        if invoice:
+            if invoice.party_id != party.id:
+                raise ValidationFailed(
+                    "Cannot link cash receipt to another customer's invoice.",
+                    field_errors={"invoiceId": ["Cannot link cash receipt to another customer's invoice."]},
+                )
+            if invoice.status == "Cancelled":
+                raise ValidationFailed(
+                    "Cannot link cash receipt to a cancelled invoice.",
+                    field_errors={"invoiceId": ["Cannot link cash receipt to a cancelled invoice."]},
+                )
+            if invoice.posted_at is None or invoice.status == "Draft":
+                raise ValidationFailed(
+                    "Cannot link cash receipt to a draft invoice. Finalize it first.",
+                    field_errors={"invoiceId": ["Cannot link cash receipt to a draft invoice. Finalize it first."]},
+                )
+            if invoice.balance_due <= Decimal("0.01") or invoice.status == "Paid":
+                raise ValidationFailed(
+                    "This invoice is already fully paid.",
+                    field_errors={"invoiceId": ["This invoice is already fully paid."]},
+                )
         amount = data.get("amount")
         payment_date = data.get("payment_date")
         mode = data.get("mode") or "Cash"
@@ -1707,7 +1823,7 @@ class CashPaymentReceiptViewSet(TenantModelViewSet):
         reference_number = data.get("reference_number")
 
         payment = services.record_payment_in(
-            client=self.get_client(),
+            client=self.request.user.client,
             party=party,
             amount=amount,
             payment_date=payment_date,
@@ -1745,8 +1861,32 @@ class CashPaymentReceiptViewSet(TenantModelViewSet):
             user=request.user,
             void=True,
         )
-        self.write_audit("void", receipt, description=serializer.validated_data.get("reason"))
-        return Response(self.get_serializer(receipt).data)
+    @action(detail=True, methods=["post"], url_path="allocate-invoice")
+    def allocate_invoice(self, request, pk=None):
+        receipt = self.get_object()
+        invoice_id = request.data.get("invoiceId") or request.data.get("invoice_id")
+        if not invoice_id:
+            raise ValidationFailed("invoiceId is required.", field_errors={"invoiceId": ["Required."]})
+
+        invoice = SalesInvoice.objects.filter(
+            pk=invoice_id, client_id=self.get_client_id(), deleted_at__isnull=True
+        ).first()
+        if not invoice:
+            raise NotFound("That invoice no longer exists.")
+        if invoice.party_id != receipt.party_id:
+            raise ValidationFailed(
+                f"Cannot allocate cash receipt of customer {receipt.party_id} to invoice of customer {invoice.party_id}.",
+                field_errors={"invoiceId": ["Cannot allocate cash receipt to another customer's invoice."]},
+            )
+
+        amount_val = request.data.get("amount")
+        amount = Decimal(str(amount_val)) if amount_val is not None else None
+
+        updated_receipt = services.allocate_cash_receipt_to_invoice(
+            receipt, invoice, amount=amount, user=request.user
+        )
+        self.write_audit("allocate_invoice", updated_receipt, description=f"Allocated to {invoice.invoice_number}")
+        return Response(self.get_serializer(updated_receipt).data)
 
 
 # ---------------------------------------------------------------------------

@@ -344,6 +344,206 @@ class WithBillWithoutBillPaymentTests(TestCase):
         self.assertEqual(payment.allocated_amount, Decimal("40000.00"))
         self.assertEqual(payment.unallocated_amount, Decimal("10000.00"))
 
+    def test_payable_invoices_api_filter_excludes_zero_due_and_ineligible(self):
+        """API GET /sales/invoices/?payable=true&customerId=... returns only open payable invoices for customer."""
+        api_client = APIClient()
+        tokens = build_tokens(self.user)
+        api_client.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['access']}")
+
+        # 1. Open payable invoice for Acme Corp
+        open_inv = SalesInvoice.objects.create(
+            client=self.client_obj,
+            invoice_number="INV-PAYABLE-01",
+            party=self.party,
+            party_name="Acme Corp",
+            doc_date=date.today(),
+            due_date=date.today(),
+            subtotal=Decimal("50000.00"),
+            taxable_value=Decimal("50000.00"),
+            total_tax=Decimal("0.00"),
+            total=Decimal("50000.00"),
+            amount_paid=Decimal("30000.00"),
+            status="Partially Paid",
+            posted_at=timezone.now(),
+        )
+
+        # 2. Fully paid invoice for Acme Corp (zero due)
+        paid_inv = SalesInvoice.objects.create(
+            client=self.client_obj,
+            invoice_number="INV-PAID-01",
+            party=self.party,
+            party_name="Acme Corp",
+            doc_date=date.today(),
+            due_date=date.today(),
+            subtotal=Decimal("20000.00"),
+            taxable_value=Decimal("20000.00"),
+            total_tax=Decimal("0.00"),
+            total=Decimal("20000.00"),
+            amount_paid=Decimal("20000.00"),
+            status="Paid",
+            posted_at=timezone.now(),
+        )
+
+        # 3. Cancelled invoice for Acme Corp
+        cancelled_inv = SalesInvoice.objects.create(
+            client=self.client_obj,
+            invoice_number="INV-CANCELLED-01",
+            party=self.party,
+            party_name="Acme Corp",
+            doc_date=date.today(),
+            due_date=date.today(),
+            subtotal=Decimal("15000.00"),
+            taxable_value=Decimal("15000.00"),
+            total_tax=Decimal("0.00"),
+            total=Decimal("15000.00"),
+            amount_paid=Decimal("0.00"),
+            status="Cancelled",
+            posted_at=timezone.now(),
+        )
+
+        # 4. Draft invoice for Acme Corp
+        draft_inv = SalesInvoice.objects.create(
+            client=self.client_obj,
+            invoice_number="INV-DRAFT-01",
+            party=self.party,
+            party_name="Acme Corp",
+            doc_date=date.today(),
+            due_date=date.today(),
+            subtotal=Decimal("12000.00"),
+            taxable_value=Decimal("12000.00"),
+            total_tax=Decimal("0.00"),
+            total=Decimal("12000.00"),
+            amount_paid=Decimal("0.00"),
+            status="Draft",
+            posted_at=None,
+        )
+
+        # 5. Open invoice for a DIFFERENT customer (Beta Ltd)
+        other_party = Party.objects.create(
+            client=self.client_obj,
+            code="CUST-OTHER-01",
+            type="Customer",
+            name="Beta Ltd",
+        )
+        other_inv = SalesInvoice.objects.create(
+            client=self.client_obj,
+            invoice_number="INV-OTHER-01",
+            party=other_party,
+            party_name="Beta Ltd",
+            doc_date=date.today(),
+            due_date=date.today(),
+            subtotal=Decimal("30000.00"),
+            taxable_value=Decimal("30000.00"),
+            total_tax=Decimal("0.00"),
+            total=Decimal("30000.00"),
+            amount_paid=Decimal("0.00"),
+            status="Unpaid",
+            posted_at=timezone.now(),
+        )
+
+        # Query payable invoices for Acme Corp
+        resp = api_client.get(f"/api/v1/sales/invoices/?payable=true&customerId={self.party.id}")
+        self.assertEqual(resp.status_code, 200)
+        results = resp.json().get("results", resp.json())
+        returned_numbers = [item.get("invoiceNumber") or item.get("invoice_number") for item in results]
+
+        self.assertIn("INV-PAYABLE-01", returned_numbers)
+        self.assertNotIn("INV-PAID-01", returned_numbers)
+        self.assertNotIn("INV-CANCELLED-01", returned_numbers)
+        self.assertNotIn("INV-DRAFT-01", returned_numbers)
+        self.assertNotIn("INV-OTHER-01", returned_numbers)
+
+    def test_applied_credit_reduces_payable_balance_and_outstanding(self):
+        """Invoice worth ₹50,000 with ₹30,000 paid shows ₹20,000 due before credit, and ₹15,000 after ₹5,000 credit note."""
+        from apps.sales.models import SalesReturn
+        inv = SalesInvoice.objects.create(
+            client=self.client_obj,
+            invoice_number="INV-CREDIT-TEST-01",
+            party=self.party,
+            party_name="Acme Corp",
+            doc_date=date.today(),
+            due_date=date.today(),
+            subtotal=Decimal("50000.00"),
+            taxable_value=Decimal("50000.00"),
+            total_tax=Decimal("0.00"),
+            total=Decimal("50000.00"),
+            amount_paid=Decimal("0.00"),
+            status="Unpaid",
+            posted_at=timezone.now(),
+        )
+        # Allocate 30,000 payment
+        services.record_payment_in(
+            client=self.client_obj,
+            party=self.party,
+            amount=Decimal("30000.00"),
+            payment_date=date.today(),
+            mode="Cash",
+            payment_type="WITH_BILL",
+            invoice=inv,
+            user=self.user,
+        )
+        inv.refresh_from_db()
+        self.assertEqual(inv.amount_paid, Decimal("30000.00"))
+        self.assertEqual(inv.balance_due, Decimal("20000.00"))
+        out = services.invoice_outstanding(inv)
+        self.assertEqual(out["outstanding"], Decimal("20000.00"))
+        self.assertEqual(out["appliedCredit"], Decimal("0.00"))
+
+        # Issue 5,000 SalesReturn / Credit Note
+        ret = SalesReturn.objects.create(
+            client=self.client_obj,
+            return_number="RET-001",
+            credit_note_number="CRN-001",
+            party=self.party,
+            party_name="Acme Corp",
+            doc_date=date.today(),
+            sales_invoice=inv,
+            status="Posted",
+            total=Decimal("5000.00"),
+            subtotal=Decimal("5000.00"),
+            total_tax=Decimal("0.00"),
+            posted_at=timezone.now(),
+        )
+        inv.refresh_from_db()
+        self.assertEqual(inv.applied_credit, Decimal("5000.00"))
+        self.assertEqual(inv.balance_due, Decimal("15000.00"))
+
+        out_after = services.invoice_outstanding(inv)
+        self.assertEqual(out_after["paidAgainstInvoice"], Decimal("30000.00"))
+        self.assertEqual(out_after["appliedCredit"], Decimal("5000.00"))
+        self.assertEqual(out_after["outstanding"], Decimal("15000.00"))
+
+    def test_payment_against_zero_due_or_cancelled_invoice_rejected(self):
+        """API rejects payment against cancelled or fully paid invoice."""
+        api_client = APIClient()
+        tokens = build_tokens(self.user)
+        api_client.credentials(HTTP_AUTHORIZATION=f"Bearer {tokens['access']}")
+
+        cancelled_inv = SalesInvoice.objects.create(
+            client=self.client_obj,
+            invoice_number="INV-CANC-REJECT",
+            party=self.party,
+            party_name="Acme Corp",
+            doc_date=date.today(),
+            due_date=date.today(),
+            subtotal=Decimal("1000.00"),
+            taxable_value=Decimal("1000.00"),
+            total_tax=Decimal("0.00"),
+            total=Decimal("1000.00"),
+            amount_paid=Decimal("0.00"),
+            status="Cancelled",
+            posted_at=timezone.now(),
+        )
+        resp = api_client.post("/api/v1/sales/payments/", {
+            "partyId": str(self.party.id),
+            "invoiceId": str(cancelled_inv.id),
+            "amount": "500.00",
+            "paymentDate": str(date.today()),
+            "mode": "Cash",
+            "paymentType": "WITH_BILL",
+        }, format="json")
+        self.assertEqual(resp.status_code, 400)
+
 
 class SalesInvoiceCashAllocationTests(TestCase):
     def setUp(self):

@@ -3,8 +3,8 @@ import re
 
 from rest_framework import serializers
 
+from apps.core.models import File
 from apps.core.files import public_url
-
 from apps.core.serializers import (
     BaseModelSerializer,
     BaseSerializer,
@@ -45,76 +45,18 @@ def slug_code(name, fallback):
 class ItemTypeSerializer(BaseModelSerializer):
     categoryCount = serializers.SerializerMethodField()
     itemCount = serializers.SerializerMethodField()
-    image = serializers.SerializerMethodField()
-    imageUrl = serializers.SerializerMethodField()
-    imageFileId = TenantPrimaryKeyRelatedField(
-        source="image_file",
-        model="core.File",
-        required=False,
-        allow_null=True,
-        write_only=True,
-    )
-    imageUrlInput = serializers.CharField(
-        source="image_url",
-        required=False,
-        allow_null=True,
-        allow_blank=True,
-        write_only=True,
-    )
 
     class Meta:
         model = ItemType
         fields = [
             "id", "code", "name", "description", "shape_profile",
             "dimension_schema", "is_active", "categoryCount", "itemCount",
-            "image", "imageUrl", "imageFileId", "imageUrlInput",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["created_at", "updated_at", "image", "imageUrl"]
         extra_kwargs = {
             "code": {"required": False, "allow_blank": True},
             "is_active": {"required": False},
         }
-
-    def to_internal_value(self, data):
-        data = dict(data)
-        camel_map = {
-            "imageFileId": "imageFileId",
-            "imageUrlInput": "imageUrlInput",
-            "isActive": "is_active",
-            "shapeProfile": "shape_profile",
-            "dimensionSchema": "dimension_schema",
-        }
-        for c_key, s_key in camel_map.items():
-            if c_key in data and s_key not in data:
-                data[s_key] = data[c_key]
-
-        if "imageFileId" in data and not data["imageFileId"]:
-            data["imageFileId"] = None
-        if "imageUrl" in data and not data["imageUrl"] and "imageFileId" not in data:
-            data["imageFileId"] = None
-            data["imageUrlInput"] = ""
-
-        if "imageUrl" in data and "imageUrlInput" not in data:
-            val = data["imageUrl"]
-            if val and not (isinstance(val, str) and "/api/v1/files/" in val):
-                data["imageUrlInput"] = val
-
-        return super().to_internal_value(data)
-
-    def to_representation(self, instance):
-        data = super().to_representation(instance)
-        data["imageFileId"] = str(instance.image_file_id) if instance.image_file_id else None
-        data["isActive"] = bool(instance.is_active)
-        return data
-
-    def get_image(self, obj):
-        if getattr(obj, "image_file_id", None) and obj.image_file:
-            return public_url(obj.image_file, self.context.get("request"))
-        return obj.image_url or None
-
-    def get_imageUrl(self, obj):
-        return self.get_image(obj)
 
     def validate_name(self, value):
         client_id = self.context.get("client_id")
@@ -217,6 +159,7 @@ class PartySerializer(BaseModelSerializer):
     ledgerAccountId = TenantPrimaryKeyRelatedField(
         source="ledger_account", model="accounting.Account", required=False, allow_null=True
     )
+    availableCredit = serializers.SerializerMethodField()
 
     class Meta:
         model = Party
@@ -227,16 +170,20 @@ class PartySerializer(BaseModelSerializer):
             "tcs_applicable", "tcs_rate",
             "ledgerAccount", "ledgerAccountId", "credit_limit", "payment_terms",
             "bank_account_number", "ifsc_code", "bank_name", "account_holder_name",
-            "opening_balance", "balance",
+            "opening_balance", "balance", "availableCredit",
             "billing_address", "shipping_address", "contacts", "status",
             "weight_tolerance_pct",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["balance", "created_at", "updated_at"]
+        read_only_fields = ["balance", "availableCredit", "created_at", "updated_at"]
         # api.md 1.7: the server allocates the CUST-/VEND- code in
         # ``PartyViewSet.perform_create``; the client must never invent one, so
         # it is optional on the wire rather than required.
         extra_kwargs = {"code": {"required": False, "allow_blank": True}}
+
+    def get_availableCredit(self, party):
+        from apps.sales.services import get_party_available_credit
+        return get_party_available_credit(party.client_id, party.id)
 
     def validate_code(self, value):
         client_id = self.context.get("client_id")
@@ -299,22 +246,6 @@ class ItemCategorySerializer(BaseModelSerializer):
     defaultUnitId = TenantPrimaryKeyRelatedField(
         source="default_unit", queryset=Unit.objects.all(), required=False, allow_null=True
     )
-    image = serializers.SerializerMethodField()
-    imageUrl = serializers.SerializerMethodField()
-    imageFileId = TenantPrimaryKeyRelatedField(
-        source="image_file",
-        model="core.File",
-        required=False,
-        allow_null=True,
-        write_only=True,
-    )
-    imageUrlInput = serializers.CharField(
-        source="image_url",
-        required=False,
-        allow_null=True,
-        allow_blank=True,
-        write_only=True,
-    )
 
     class Meta:
         model = ItemCategory
@@ -323,10 +254,8 @@ class ItemCategorySerializer(BaseModelSerializer):
             "lead_time_days", "default_hsn_code", "itemType", "itemTypeCode",
             "itemTypeId", "defaultUnit", "defaultUnitId", "default_uom",
             "is_active", "customFields", "itemCount",
-            "image", "imageUrl", "imageFileId", "imageUrlInput",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["created_at", "updated_at", "image", "imageUrl"]
         extra_kwargs = {
             "code": {"required": False, "allow_blank": True},
             "is_active": {"required": False},
@@ -342,24 +271,10 @@ class ItemCategorySerializer(BaseModelSerializer):
             "leadTimeDays": "lead_time_days",
             "hasSubParts": "has_sub_parts",
             "isActive": "is_active",
-            "imageFileId": "imageFileId",
-            "imageUrlInput": "imageUrlInput",
         }
         for c_key, s_key in camel_map.items():
             if c_key in data and s_key not in data:
                 data[s_key] = data[c_key]
-
-        if "imageFileId" in data and not data["imageFileId"]:
-            data["imageFileId"] = None
-        if "imageUrl" in data and not data["imageUrl"] and "imageFileId" not in data:
-            data["imageFileId"] = None
-            data["imageUrlInput"] = ""
-
-        if "imageUrl" in data and "imageUrlInput" not in data:
-            val = data["imageUrl"]
-            if val and not (isinstance(val, str) and "/api/v1/files/" in val):
-                data["imageUrlInput"] = val
-
         return super().to_internal_value(data)
 
     def to_representation(self, instance):
@@ -371,16 +286,7 @@ class ItemCategorySerializer(BaseModelSerializer):
         data["hasSubParts"] = bool(instance.has_sub_parts)
         data["leadTimeDays"] = instance.lead_time_days
         data["defaultHsnCode"] = instance.default_hsn_code or ""
-        data["imageFileId"] = str(instance.image_file_id) if instance.image_file_id else None
         return data
-
-    def get_image(self, obj):
-        if getattr(obj, "image_file_id", None) and obj.image_file:
-            return public_url(obj.image_file, self.context.get("request"))
-        return obj.image_url or None
-
-    def get_imageUrl(self, obj):
-        return self.get_image(obj)
 
     def validate(self, attrs):
         """Derive code if missing, and prevent duplicate category names within item type."""
@@ -508,23 +414,11 @@ class ItemSerializer(BaseModelSerializer):
         source="unit_conversion_factor", max_digits=18, decimal_places=6,
         coerce_to_string=False, required=False,
     )
-
+    imageFileId = TenantPrimaryKeyRelatedField(
+        source="image_file", queryset=File.objects.all(), required=False, allow_null=True
+    )
     image = serializers.SerializerMethodField()
     imageUrl = serializers.SerializerMethodField()
-    imageFileId = TenantPrimaryKeyRelatedField(
-        source="image_file",
-        model="core.File",
-        required=False,
-        allow_null=True,
-        write_only=True,
-    )
-    imageUrlInput = serializers.CharField(
-        source="image_url",
-        required=False,
-        allow_null=True,
-        allow_blank=True,
-        write_only=True,
-    )
 
     # -- derived, read-only -------------------------------------------------
     availableQty = serializers.SerializerMethodField()
@@ -541,7 +435,7 @@ class ItemSerializer(BaseModelSerializer):
             "itemType", "itemTypeCode", "itemTypeId", "gradeName", "gradeId",
             "item_kind", "vendor", "vendorId",
             "uom", "purchase_unit", "sales_unit", "unitConversionFactor",
-            "image", "imageUrl", "imageFileId", "imageUrlInput",
+            "image", "imageUrl", "imageFileId",
             "availableQty", "reservedQty", "onHandQty", "damagedQty",
             "reorder_level", "location", "locationId", "status", "lifecycle_status",
             "cost_price", "selling_price", "hsn_code", "tax_pct",
@@ -558,7 +452,7 @@ class ItemSerializer(BaseModelSerializer):
             "custom_field_values",
             "created_at", "updated_at",
         ]
-        read_only_fields = ["created_at", "updated_at", "image", "imageUrl"]
+        read_only_fields = ["created_at", "updated_at"]
 
     def to_internal_value(self, data):
         data = dict(data)
@@ -604,29 +498,31 @@ class ItemSerializer(BaseModelSerializer):
             "trackingMode": "tracking_mode",
             "lifecycleStatus": "lifecycle_status",
             "itemKind": "item_kind",
+            "imageFileId": "imageFileId",
         }
         for c_key, s_key in camel_map.items():
             if c_key in data and s_key not in data:
                 data[s_key] = data[c_key]
-
-        if "imageFileId" in data:
-            if not data["imageFileId"]:
-                data["imageFileId"] = None
-                if not data.get("imageUrlInput"):
-                    data["imageUrlInput"] = ""
-        elif "image" in data and not data["image"]:
-            data["imageFileId"] = None
-            data["imageUrlInput"] = ""
-        elif "imageUrl" in data and not data["imageUrl"]:
-            data["imageFileId"] = None
-            data["imageUrlInput"] = ""
-
-        if "imageUrl" in data and "imageUrlInput" not in data:
-            val = data["imageUrl"]
-            if val and not (isinstance(val, str) and "/api/v1/files/" in val):
-                data["imageUrlInput"] = val
-
+        if "imageFileId" in data and not data["imageFileId"]:
+            data["image_file"] = None
+        if "image" in data and not data["image"]:
+            data["image_file"] = None
+            data["image_url"] = None
         return super().to_internal_value(data)
+
+    def _resolve_image_url(self, instance):
+        if instance.image_file:
+            request = self.context.get("request")
+            url = public_url(instance.image_file, request)
+            if url:
+                return url
+        return instance.image_url or None
+
+    def get_image(self, instance):
+        return self._resolve_image_url(instance)
+
+    def get_imageUrl(self, instance):
+        return self._resolve_image_url(instance)
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -663,14 +559,6 @@ class ItemSerializer(BaseModelSerializer):
         data["weightUnit"] = instance.weight_unit or "kg"
         data["tolerancePct"] = instance.tolerance_pct
         return data
-
-    def get_image(self, item):
-        if getattr(item, "image_file_id", None) and item.image_file:
-            return public_url(item.image_file, self.context.get("request"))
-        return item.image_url or None
-
-    def get_imageUrl(self, item):
-        return self.get_image(item)
 
     def get_availableQty(self, item):
         return getattr(item, "available_qty", None)

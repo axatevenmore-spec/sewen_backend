@@ -569,6 +569,51 @@ class SalesInvoice(DocumentHeader):
     def __str__(self):
         return self.invoice_number or f"Invoice {self.id}"
 
+    @property
+    def applied_credit(self):
+        from apps.core.money import ZERO, round2
+        from decimal import Decimal
+        from django.db.models import Sum, Value, DecimalField
+        from django.db.models.functions import Coalesce
+        if not self.pk:
+            return ZERO
+        alloc_val = self.credit_allocations.filter(
+            deleted_at__isnull=True
+        ).exclude(
+            payment__status="Cancelled"
+        ).exclude(
+            payment__deleted_at__isnull=False
+        ).exclude(
+            sales_return__status="Cancelled"
+        ).exclude(
+            sales_return__deleted_at__isnull=False
+        ).aggregate(
+            val=Coalesce(Sum("allocated_amount"), Value(Decimal("0.00")),
+                         output_field=DecimalField(max_digits=18, decimal_places=2))
+        )["val"]
+        direct_return_ids = list(
+            self.credit_allocations.filter(
+                deleted_at__isnull=True, sales_return__isnull=False
+            ).values_list("sales_return_id", flat=True)
+        )
+        returns_val = self.returns.filter(
+            deleted_at__isnull=True
+        ).exclude(status="Cancelled").exclude(id__in=direct_return_ids).aggregate(
+            val=Coalesce(Sum("total"), Value(Decimal("0.00")),
+                         output_field=DecimalField(max_digits=18, decimal_places=2))
+        )["val"]
+        return round2(alloc_val + returns_val)
+
+    @property
+    def balance_due(self):
+        from apps.core.money import ZERO, round2
+        rem = round2((self.total or ZERO) - (self.amount_paid or ZERO) - self.applied_credit)
+        return rem if rem > ZERO else ZERO
+
+    @property
+    def remaining_due(self):
+        return self.balance_due
+
 
 # Replaced (metal-industry sales): + MetalLineFields.
 # class SalesInvoiceLine(DocumentLine):
@@ -744,6 +789,61 @@ class PaymentAllocation(TenantModel):
             models.Index(fields=["document_type", "document_id"], name="ix_payment_alloc_doc"),
             models.Index(fields=["payment_side", "payment_id"], name="ix_payment_alloc_payment"),
         ]
+
+
+class CreditAllocation(TenantModel):
+    """Allocation of eligible party credit (advances, credit notes) to sales invoices.
+
+    Requirements:
+    - Never apply the same credit twice.
+    - Track original credit, allocated credit, and unused credit separately.
+    - Multiple invoices can consume credit from one or more credit sources.
+    - Excess credit remains available for future eligible invoices.
+    """
+    SOURCE_TYPES = [
+        ("PAYMENT_IN", "Advance Payment"),
+        ("SALES_RETURN", "Credit Note"),
+        ("PARTY_CREDIT", "Party Credit Balance"),
+    ]
+
+    party = models.ForeignKey(
+        "masters.Party", on_delete=models.CASCADE, related_name="credit_allocations"
+    )
+    invoice = models.ForeignKey(
+        "SalesInvoice", on_delete=models.CASCADE, related_name="credit_allocations"
+    )
+    payment = models.ForeignKey(
+        "PaymentIn", null=True, blank=True, on_delete=models.SET_NULL, related_name="credit_allocations"
+    )
+    sales_return = models.ForeignKey(
+        "SalesReturn", null=True, blank=True, on_delete=models.SET_NULL, related_name="credit_allocations"
+    )
+    source_type = models.TextField(choices=SOURCE_TYPES, default="PAYMENT_IN")
+    source_reference = models.TextField(null=True, blank=True)
+    original_credit = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    allocated_amount = models.DecimalField(max_digits=18, decimal_places=2)
+    allocated_at = models.DateTimeField(auto_now_add=True)
+    allocated_by = models.ForeignKey(
+        "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="+"
+    )
+    notes = models.TextField(null=True, blank=True)
+
+    class Meta:
+        db_table = "sales_credit_allocations"
+        ordering = ["-allocated_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(allocated_amount__gt=0), name="ck_credit_alloc_amount"
+            )
+        ]
+        indexes = [
+            models.Index(fields=["client", "party"], name="ix_credit_alloc_party"),
+            models.Index(fields=["client", "invoice"], name="ix_credit_alloc_inv"),
+            models.Index(fields=["client", "payment"], name="ix_credit_alloc_payment"),
+        ]
+
+    def __str__(self):
+        return f"Credit {self.allocated_amount} on {self.invoice}"
 
 
 class CashPaymentReceipt(TenantModel, LegacyIdMixin):
