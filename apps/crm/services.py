@@ -848,14 +848,16 @@ def sync_lead_after_deal_move(deal, previous, *, user=None):
     if lead is None or lead.deleted_at is not None:
         return []
     current = lead.stage
-    if deal.stage == "Lost" and not current.is_lost:
+    current_is_lost = bool(current and current.is_lost)
+    current_is_won = bool(current and current.is_won)
+    if deal.stage == "Lost" and not current_is_lost:
         target = closing_stage(lead.client_id, lost=True)
-    elif deal.stage == "Won" and not current.is_won:
+    elif deal.stage == "Won" and not current_is_won:
         target = closing_stage(lead.client_id, lost=False)
     elif (
         previous in CLOSED_DEAL_STAGES
         and deal.stage not in CLOSED_DEAL_STAGES
-        and (current.is_lost or current.is_won)
+        and (current_is_lost or current_is_won)
     ):
         target = reopen_target(lead)
     else:
@@ -864,7 +866,7 @@ def sync_lead_after_deal_move(deal, previous, *, user=None):
         return []
 
     if target.is_lost or target.is_won:
-        if not (current.is_lost or current.is_won):
+        if not (current_is_lost or current_is_won):
             lead.reopen_stage = current
         if target.is_lost and deal.lost_reason_id:
             lead.lost_reason = deal.lost_reason
@@ -881,7 +883,7 @@ def sync_lead_after_deal_move(deal, previous, *, user=None):
         entity_id=lead.id,
         entity_label=lead.lead_number,
         description=f"Stage changed to {target.name} (deal {deal.deal_number} moved to {deal.stage})",
-        from_value=current.name,
+        from_value=current.name if current else "",
         to_value=target.name,
     )
     # The lead's other deals follow it too.
@@ -897,10 +899,26 @@ def sync_lead_after_deal_move(deal, previous, *, user=None):
 
 #: A sales document's status -> where its lead's deal moves: an estimate or
 #: quotation sent to the lead puts a Draft deal in Sent; one the lead accepted
-#: (or a quotation turned into an order) wins the deal.
+#: (or a quotation turned into an order) wins the deal. A rejected/declined
+#: estimate puts the deal in Open.
 DOCUMENT_DEAL_STAGE = {
-    "estimate": {"Sent": "Sent", "Accepted": "Won"},
-    "quotation": {"Sent": "Sent", "Viewed": "Sent", "Accepted": "Won", "Converted": "Won"},
+    "estimate": {
+        "Draft": "Draft",
+        "Sent": "Sent",
+        "Accepted": "Won",
+        "Declined": "Open",
+        "Rejected": "Open",
+        "Need Improvement": "Open",
+    },
+    "quotation": {
+        "Draft": "Draft",
+        "Sent": "Sent",
+        "Viewed": "Sent",
+        "Accepted": "Won",
+        "Converted": "Won",
+        "Declined": "Open",
+        "Rejected": "Open",
+    },
 }
 
 
@@ -933,7 +951,12 @@ def sync_deal_from_document(document, kind, *, user=None):
         previous = deal.stage
         deal.stage = target
         deal.closed_at = timezone.now() if target in CLOSED_DEAL_STAGES else None
-        deal.save(update_fields=["stage", "closed_at", "updated_at"])
+        update_fields = ["stage", "closed_at", "updated_at"]
+        doc_total = getattr(document, "total_amount", None) or getattr(document, "total", None)
+        if doc_total is not None and (deal.value is None or deal.value == 0):
+            deal.value = doc_total
+            update_fields.append("value")
+        deal.save(update_fields=update_fields)
         DealActivity.objects.create(
             deal=deal, type="stage_change", actor=_actor(actor),
             description=f"Stage moved from {previous} to {target}{reason}",
