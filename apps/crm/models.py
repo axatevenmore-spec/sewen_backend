@@ -12,7 +12,7 @@ so they are persisted.
 """
 from django.db import models
 
-from apps.core.models import LegacyIdMixin, TenantModel
+from apps.core.models import AuditedModel, LegacyIdMixin, TenantModel
 
 PRIORITIES = [("Low", "Low"), ("Medium", "Medium"), ("High", "High"), ("Urgent", "Urgent")]
 #: api.md §9.3 -- CRM task status vocabulary.
@@ -184,6 +184,10 @@ class Lead(TenantModel, LegacyIdMixin):
         "accounts.User", null=True, blank=True, on_delete=models.SET_NULL, related_name="reassigned_leads"
     )
     reassignment_reason = models.TextField(blank=True, default="")
+    source_provider = models.TextField(null=True, blank=True)
+    external_lead_id = models.TextField(null=True, blank=True)
+    source_platform = models.TextField(null=True, blank=True)
+    source_meta = models.JSONField(default=dict, blank=True)
 
     class Meta:
         db_table = "crm_leads"
@@ -206,6 +210,11 @@ class Lead(TenantModel, LegacyIdMixin):
                 fields=["client", "latitude", "longitude"],
                 name="ix_crm_leads_geo",
                 condition=models.Q(latitude__isnull=False),
+            ),
+            models.Index(
+                fields=["source_provider", "external_lead_id"],
+                name="ix_crm_lead_source_ext",
+                condition=models.Q(external_lead_id__isnull=False),
             ),
         ]
 
@@ -799,3 +808,98 @@ class FormSubmission(TenantModel):
     class Meta:
         db_table = "crm_form_submissions"
         ordering = ["-submitted_at"]
+
+
+# ---------------------------------------------------------------------------
+# Lead Source Integrations & Webhooks (Meta, Google, LinkedIn, etc.)
+# ---------------------------------------------------------------------------
+class LeadSourceIntegration(TenantModel):
+    """
+    Connected lead source provider (Meta Lead Ads, Google Ads, LinkedIn, etc.).
+    Holds provider identifier, external account identifier (e.g. Meta Page ID),
+    encrypted credentials (access tokens), and tenant-level defaults/field mappings.
+    """
+
+    provider = models.TextField(help_text="Provider key, e.g. 'meta'")
+    name = models.TextField(help_text="Human-readable integration label")
+    external_account_id = models.TextField(
+        help_text="Provider external account or page ID (e.g. Meta Page ID)"
+    )
+    encrypted_credentials = models.TextField(
+        default="", blank=True, help_text="Encrypted credentials / access tokens"
+    )
+    settings = models.JSONField(
+        default=dict, blank=True, help_text="Default owner, stage, field mappings, etc."
+    )
+    is_active = models.BooleanField(default=True)
+    last_synced_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "crm_lead_source_integrations"
+        ordering = ["provider", "name"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["client", "provider", "external_account_id"],
+                condition=models.Q(deleted_at__isnull=True),
+                name="uq_crm_lead_source_integ",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.provider}: {self.name} ({self.external_account_id})"
+
+
+class LeadWebhookEvent(AuditedModel):
+    """
+    Raw inbound lead webhook event log for idempotency, audit trail, and async processing.
+    """
+
+    WEBHOOK_STATUSES = [
+        ("pending", "Pending"),
+        ("processing", "Processing"),
+        ("processed", "Processed"),
+        ("failed", "Failed"),
+        ("duplicate", "Duplicate"),
+    ]
+
+    client = models.ForeignKey(
+        "accounts.Client",
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name="+",
+    )
+    integration = models.ForeignKey(
+        LeadSourceIntegration,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="webhook_events",
+    )
+    provider = models.TextField(db_index=True)
+    external_lead_id = models.TextField(db_index=True)
+    payload = models.JSONField(default=dict)
+    status = models.TextField(choices=WEBHOOK_STATUSES, default="pending")
+    attempts = models.IntegerField(default=0)
+    error_message = models.TextField(blank=True, default="")
+    processed_at = models.DateTimeField(null=True, blank=True)
+    lead = models.ForeignKey(
+        Lead,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="webhook_events",
+    )
+
+    class Meta:
+        db_table = "crm_lead_webhook_events"
+        ordering = ["-created_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["provider", "external_lead_id"],
+                name="uq_crm_webhook_event_ext_id",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.provider} event {self.external_lead_id} ({self.status})"

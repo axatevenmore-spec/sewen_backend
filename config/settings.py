@@ -319,6 +319,14 @@ EXCHANGE_RATE_URL = env("EXCHANGE_RATE_URL", "https://open.er-api.com/v6/latest/
 EXCHANGE_RATE_CACHE_SECONDS = 24 * 60 * 60
 
 # --------------------------------------------------------------------------
+# Lead Ads Webhooks (Meta / Facebook / Instagram)
+# --------------------------------------------------------------------------
+META_APP_ID = env("META_APP_ID", "")
+META_APP_SECRET = env("META_APP_SECRET", "")
+META_WEBHOOK_VERIFY_TOKEN = env("META_WEBHOOK_VERIFY_TOKEN", "")
+META_GRAPH_API_VERSION = env("META_GRAPH_API_VERSION", "v21.0")
+
+# --------------------------------------------------------------------------
 # Email configuration
 # --------------------------------------------------------------------------
 EMAIL_BACKEND = env(
