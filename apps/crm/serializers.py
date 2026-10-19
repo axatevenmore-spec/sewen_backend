@@ -173,6 +173,18 @@ class LeadSerializer(BaseModelSerializer):
     formId = TenantPrimaryKeyRelatedField(
         model="crm.Form", write_only=True, required=False, allow_null=True
     )
+    sourceProvider = serializers.CharField(
+        source="source_provider", required=False, allow_null=True
+    )
+    externalLeadId = serializers.CharField(
+        source="external_lead_id", required=False, allow_null=True
+    )
+    sourcePlatform = serializers.CharField(
+        source="source_platform", required=False, allow_null=True
+    )
+    sourceMeta = serializers.JSONField(
+        source="source_meta", required=False
+    )
 
     class Meta:
         model = Lead
@@ -183,6 +195,7 @@ class LeadSerializer(BaseModelSerializer):
             "avatarColor", "latitude", "longitude", "is_pinned", "party", "customerName",
             "lost_reason", "custom_values", "formId",
             "balance", "displayName",
+            "sourceProvider", "externalLeadId", "sourcePlatform", "sourceMeta",
             "productsCount", "sourcesCount", "filesCount", "openTasksCount",
             "callsCount", "estimatesCount", "deliveryChallansCount",
             "salesInvoicesCount",

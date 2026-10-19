@@ -14,10 +14,13 @@ from drf_spectacular.views import (
 )
 
 from apps.accounts.urls import admin_urlpatterns, auth_urlpatterns
+from apps.crm.integrations.views import LeadWebhookView
 from apps.reports.urls import dashboard_urlpatterns, public_urlpatterns, report_urlpatterns
 from apps.sales.urls import portal_urlpatterns
 
 api_v1 = [
+    # Inbound lead webhooks (Meta, Google, etc.)
+    path("webhooks/leads/<str:provider>/", LeadWebhookView.as_view(), name="lead-webhook-api"),
     # Identity and administration (api.md §2, §3)
     path("auth/", include(auth_urlpatterns)),
     path("admin/", include(admin_urlpatterns)),
@@ -57,6 +60,7 @@ api_v1 = [
 ]
 
 urlpatterns = [
+    path("webhooks/leads/<str:provider>/", LeadWebhookView.as_view(), name="lead-webhook-root"),
     path("api/v1/", include(api_v1)),
     path("django-admin/", admin.site.urls),
 ]

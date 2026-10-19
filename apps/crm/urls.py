@@ -3,6 +3,7 @@ from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from . import views
+from .integrations.views import LeadWebhookView
 
 router = DefaultRouter(trailing_slash=True)
 router.register("leads", views.LeadViewSet, basename="crm-leads")
@@ -28,6 +29,7 @@ router.register("lost-reasons", views.LostReasonViewSet, basename="crm-lost-reas
 router.register("forms", views.FormViewSet, basename="crm-forms")
 
 urlpatterns = [
+    path("webhooks/<str:provider>/", LeadWebhookView.as_view(), name="crm-lead-webhook"),
     path("team-roster/", views.TeamRosterView.as_view(), name="crm-team-roster"),
     path("setup/", views.CrmSetupView.as_view(), name="crm-setup"),
     path("dashboard/", views.CrmDashboardView.as_view(), name="crm-dashboard"),
