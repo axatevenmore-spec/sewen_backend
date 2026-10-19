@@ -1297,7 +1297,8 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
 
         previous = stage.status
         stage.status = "In Progress"
-        stage.actual_start_datetime = timezone.now()
+        now = timezone.now()
+        stage.actual_start_datetime = now
         if stage.start_datetime is None:
             stage.start_datetime = stage.actual_start_datetime
             stage.expected_completion_datetime = services.stage_expected_completion(
@@ -1309,13 +1310,22 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
             project.status = "In Progress"
             project.save(update_fields=["status", "updated_at"])
 
+        services.recalculate_project(project)
+        project.refresh_from_db()
+
         record_audit(
             client=request.client_id, actor=request.user, action="STAGE_STARTED",
             entity_type="PmsStage", entity_id=stage.id, entity_label=stage.name,
             description=f"{stage.name} started", from_value=previous, to_value="In Progress",
         )
+        context = self._detail_context(project)
+        stage_data = ProjectStageSerializer(stage, context=context).data
         return Response(
-            ProjectStageSerializer(stage, context=self.get_serializer_context()).data
+            {
+                "stage": stage_data,
+                "project": ProjectDetailSerializer(project, context=context).data,
+                **stage_data,
+            }
         )
 
     @action(detail=True, methods=["post"], url_path=r"stages/(?P<stage_id>[^/.]+)/progress")
@@ -1366,9 +1376,25 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
             if not stage.actual_completion_datetime:
                 stage.actual_completion_datetime = now
                 update_fields.append("actual_completion_datetime")
+            if not stage.actual_start_datetime:
+                stage.actual_start_datetime = stage.start_datetime or now
+                update_fields.append("actual_start_datetime")
+            if not stage.start_datetime:
+                stage.start_datetime = stage.actual_start_datetime
+                update_fields.append("start_datetime")
+            if not stage.expected_completion_datetime:
+                stage.expected_completion_datetime = services.stage_expected_completion(
+                    stage.start_datetime, stage.planned_duration, stage.duration_unit
+                ) or stage.actual_completion_datetime
+                update_fields.append("expected_completion_datetime")
+
+            if project.status == "Draft":
+                project.status = "In Progress"
+                project.save(update_fields=["status", "updated_at"])
 
         stage.save(update_fields=update_fields)
         services.recalculate_project(project)
+        project.refresh_from_db()
 
         record_audit(
             client=request.client_id, actor=request.user, action="STAGE_STATUS_CHANGED",
@@ -1376,8 +1402,14 @@ class ProjectViewSet(ProjectChatMixin, TenantModelViewSet):
             description=f"Status changed to {stage.status}",
             from_value=previous, to_value=stage.status,
         )
+        context = self._detail_context(project)
+        stage_data = ProjectStageSerializer(stage, context=context).data
         return Response(
-            ProjectStageSerializer(stage, context=self._detail_context(project)).data
+            {
+                "stage": stage_data,
+                "project": ProjectDetailSerializer(project, context=context).data,
+                **stage_data,
+            }
         )
 
     @action(

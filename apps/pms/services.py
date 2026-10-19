@@ -174,7 +174,7 @@ def is_stage_at_risk(stage, threshold_pct, now=None):
     """api.md §10.1 -- ``atRiskThresholdPct`` of the planned window has elapsed
     **and** completion is under 50%. Both halves are required."""
     now = now or timezone.now()
-    if stage.status in CLOSED_STAGE_STATUSES:
+    if stage.status in CLOSED_STAGE_STATUSES or stage.status == "Submitted" or stage.actual_completion_datetime is not None:
         return False
     if not stage.start_datetime or not stage.expected_completion_datetime:
         return False
@@ -190,10 +190,11 @@ def is_stage_at_risk(stage, threshold_pct, now=None):
 
 def is_stage_overdue(stage, now=None):
     now = now or timezone.now()
+    if stage.status in CLOSED_STAGE_STATUSES or stage.status == "Submitted" or stage.actual_completion_datetime is not None:
+        return False
     return bool(
         stage.expected_completion_datetime
         and stage.expected_completion_datetime < now
-        and stage.status not in CLOSED_STAGE_STATUSES
     )
 
 
