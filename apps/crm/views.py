@@ -120,6 +120,7 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
         "destroy": ["delete_lead"],
         "bulk_delete_action": ["delete_lead"],
         "bulk_assign": ["edit_lead"],
+        "mark_lost": ["edit_lead"],
         "write": ["edit_lead"],
     }
 
@@ -243,7 +244,7 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
         its deal to the pipeline's Lost column, where an admin can reopen it."""
         from apps.core.permissions import require_permission
 
-        require_permission(request.user, "move_lead")
+        require_permission(request.user, ("move_lead", "edit_lead", "delete_lead"))
         ids = request.data.get("ids") or []
         if not isinstance(ids, list) or not ids:
             raise ValidationFailed("Pick at least one lead.", field_errors={"ids": ["Required."]})
@@ -253,7 +254,7 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
             reason = LostReason.objects.filter(
                 client_id=request.client_id, pk=reason_id, deleted_at__isnull=True
             ).first()
-        leads = list(self.get_queryset().filter(pk__in=ids))
+        leads = list(Lead.objects.filter(pk__in=ids, client_id=request.client_id, deleted_at__isnull=True))
         for lead in leads:
             services.mark_lead_lost(lead, lost_reason=reason, user=request.user)
         services.annotate_lead_counters(request.client_id, leads)
@@ -596,8 +597,9 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
     @transaction.atomic
     def bulk_assign(self, request):
         """Bulk assign/reallocate leads with single, round-robin, or capacity-weighted strategy."""
-        from apps.accounts.models import User
-        from apps.core.models import Notification, record_audit
+        from apps.accounts.models import Client, User
+        from apps.core.audit import record_audit, request_ip
+        from apps.core.models import Notification
 
         lead_ids = request.data.get("leadIds") or request.data.get("lead_ids") or []
         strategy = request.data.get("strategy", "single")
@@ -614,9 +616,31 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
         if not leads:
             raise NotFound("No matching active leads found for reassignment.")
 
+        client_inst = getattr(request.user, "client", None)
+        if not client_inst and getattr(request, "client_id", None):
+            client_inst = Client.objects.filter(pk=request.client_id).first()
+
+        def _send_assign_notif(user, title, body):
+            if not send_notification or not client_inst or not user:
+                return
+            try:
+                Notification.objects.create(
+                    client=client_inst,
+                    recipient=user,
+                    type="lead_reassigned",
+                    category="crm",
+                    title=title,
+                    body=body,
+                    channels=["in_app"],
+                )
+            except Exception:
+                pass
+
         allocation_summary = {}
 
         if strategy == "single":
+            if not assignee_id and assignee_ids:
+                assignee_id = assignee_ids[0]
             if not assignee_id:
                 raise ValidationFailed("assigneeId is required for single assignment strategy.")
             target_user = User.objects.filter(pk=assignee_id, client_id=request.client_id, deleted_at__isnull=True).first()
@@ -626,18 +650,21 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
             Lead.objects.filter(pk__in=[l.pk for l in leads]).update(owner=target_user)
             allocation_summary[str(target_user.pk)] = len(leads)
             if transfer_open_tasks:
-                Task.objects.filter(lead__in=leads, status__in=["Pending", "In Progress", "pending", "in_progress"], deleted_at__isnull=True).update(assigned_to=target_user)
+                Task.objects.filter(
+                    lead__in=leads,
+                    status__in=["Pending", "In Progress", "pending", "in_progress", "Open", "Waiting"],
+                    deleted_at__isnull=True,
+                ).update(assignee=target_user)
 
-            if send_notification:
-                Notification.objects.create(
-                    client=request.user.client,
-                    user=target_user,
-                    title="Bulk Leads Assigned",
-                    message=f"{len(leads)} leads have been assigned to you. Reason: {reason}",
-                    channel="in_app",
-                )
+            _send_assign_notif(
+                target_user,
+                "Bulk Leads Assigned",
+                f"{len(leads)} leads have been assigned to you. Reason: {reason}",
+            )
 
         elif strategy == "round_robin":
+            if not assignee_ids and assignee_id:
+                assignee_ids = [assignee_id]
             if not assignee_ids:
                 raise ValidationFailed("assigneeIds list is required for round-robin strategy.")
             target_users = list(User.objects.filter(pk__in=assignee_ids, client_id=request.client_id, deleted_at__isnull=True))
@@ -650,21 +677,24 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
                 lead.save(update_fields=["owner"])
                 allocation_summary[str(assigned_user.pk)] = allocation_summary.get(str(assigned_user.pk), 0) + 1
                 if transfer_open_tasks:
-                    Task.objects.filter(lead=lead, status__in=["Pending", "In Progress", "pending", "in_progress"], deleted_at__isnull=True).update(assigned_to=assigned_user)
+                    Task.objects.filter(
+                        lead=lead,
+                        status__in=["Pending", "In Progress", "pending", "in_progress", "Open", "Waiting"],
+                        deleted_at__isnull=True,
+                    ).update(assignee=assigned_user)
 
-            if send_notification:
-                for u in target_users:
-                    count = allocation_summary.get(str(u.pk), 0)
-                    if count > 0:
-                        Notification.objects.create(
-                            client=request.user.client,
-                            user=u,
-                            title="Leads Reallocated",
-                            message=f"{count} leads have been allocated to you via Round-Robin. Reason: {reason}",
-                            channel="in_app",
-                        )
+            for u in target_users:
+                count = allocation_summary.get(str(u.pk), 0)
+                if count > 0:
+                    _send_assign_notif(
+                        u,
+                        "Leads Reallocated",
+                        f"{count} leads have been allocated to you via Round-Robin. Reason: {reason}",
+                    )
 
         elif strategy == "capacity_weighted":
+            if not assignee_ids and assignee_id:
+                assignee_ids = [assignee_id]
             if not assignee_ids:
                 raise ValidationFailed("assigneeIds list is required for capacity-weighted strategy.")
             target_users = list(User.objects.filter(pk__in=assignee_ids, client_id=request.client_id, deleted_at__isnull=True))
@@ -683,21 +713,27 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
                 load_map[chosen_user] += 1
                 allocation_summary[str(chosen_user.pk)] = allocation_summary.get(str(chosen_user.pk), 0) + 1
                 if transfer_open_tasks:
-                    Task.objects.filter(lead=lead, status__in=["Pending", "In Progress", "pending", "in_progress"], deleted_at__isnull=True).update(assigned_to=chosen_user)
+                    Task.objects.filter(
+                        lead=lead,
+                        status__in=["Pending", "In Progress", "pending", "in_progress", "Open", "Waiting"],
+                        deleted_at__isnull=True,
+                    ).update(assignee=chosen_user)
 
-            if send_notification:
-                for u in target_users:
-                    count = allocation_summary.get(str(u.pk), 0)
-                    if count > 0:
-                        Notification.objects.create(
-                            client=request.user.client,
-                            user=u,
-                            title="Leads Allocated",
-                            message=f"{count} leads allocated to you via Capacity-Balancing. Reason: {reason}",
-                            channel="in_app",
-                        )
+            for u in target_users:
+                count = allocation_summary.get(str(u.pk), 0)
+                if count > 0:
+                    _send_assign_notif(
+                        u,
+                        "Leads Allocated",
+                        f"{count} leads allocated to you via Capacity-Balancing. Reason: {reason}",
+                    )
         else:
             raise ValidationFailed(f"Unknown strategy '{strategy}'. Supported: single, round_robin, capacity_weighted.")
+
+        try:
+            client_ip = request_ip(request)
+        except Exception:
+            client_ip = None
 
         record_audit(
             client=request.client_id,
@@ -705,7 +741,7 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
             action="bulk_assign_leads",
             entity_type="Lead",
             description=f"Bulk assigned {len(leads)} leads using strategy '{strategy}'. Reason: {reason}",
-            ip=request_ip(request),
+            ip=client_ip,
         )
 
         return Response({
@@ -1511,9 +1547,15 @@ class ContractViewSet(TenantModelViewSet):
     @transaction.atomic
     def capture_signature(self, request, pk=None):
         contract = self.get_object()
-        signatory_type = (request.data.get("signatory_type") or "client").lower()
+        signatory_type = (request.data.get("signatory_type") or request.data.get("role") or "client").lower()
         signature_data = request.data.get("signature") or request.data.get("signature_data")
-        signatory_name = request.data.get("signed_by") or request.data.get("signatory_name") or request.user.name
+        signatory_name = (
+            request.data.get("signed_by")
+            or request.data.get("signatory_name")
+            or request.data.get("signatoryName")
+            or getattr(request.user, "name", None)
+            or getattr(request.user, "username", "Signatory")
+        )
 
         if not signature_data:
             raise ValidationFailed("Signature drawing or data URL is required.")

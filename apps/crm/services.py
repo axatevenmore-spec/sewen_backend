@@ -1072,7 +1072,10 @@ def mark_lead_lost(lead, *, lost_reason=None, user=None):
         from_value=previous.name if previous else None,
         to_value=target.name,
     )
-    sync_deals_after_lead_move(lead, previous, user=user)
+    try:
+        sync_deals_after_lead_move(lead, previous, user=user)
+    except Exception:
+        pass
     return lead
 
 
