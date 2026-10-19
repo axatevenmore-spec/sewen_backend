@@ -9,6 +9,12 @@ from apps.core.serializers import (
     MoneyField,
     TenantPrimaryKeyRelatedField,
 )
+from apps.core.validators import (
+    validate_address_dict,
+    validate_email_format,
+    validate_phone_number,
+    validate_pincode_format,
+)
 from apps.accounts.models import User
 
 from . import services
@@ -182,7 +188,7 @@ class LocationAddressField(serializers.Field):
 
     def to_internal_value(self, data):
         if isinstance(data, dict):
-            return data
+            return validate_address_dict(data, "address")
         text = str(data or "").strip()
         return {"line": text} if text else {}
 
@@ -333,6 +339,18 @@ class EmployeeSerializer(BaseModelSerializer):
             if "noticePeriodDays" in data:
                 data["notice_period_days"] = data["noticePeriodDays"]
         return super().to_internal_value(data)
+
+    def validate_phone(self, value):
+        return validate_phone_number(value, "phone")
+
+    def validate_email(self, value):
+        return validate_email_format(value, "email")
+
+    def validate_personal_email(self, value):
+        return validate_email_format(value, "personal_email")
+
+    def validate_address(self, value):
+        return validate_address_dict(value, "address")
 
     def validate(self, attrs):
         # Setting someone's pay is a payroll action, not a staff-record edit.
@@ -1021,6 +1039,12 @@ class CandidateSerializer(BaseModelSerializer):
         if "appliedDate" in data:
             data.pop("appliedDate", None)
         return super().to_internal_value(data)
+
+    def validate_phone(self, value):
+        return validate_phone_number(value, "phone")
+
+    def validate_email(self, value):
+        return validate_email_format(value, "email")
 
     def create(self, validated_data):
         job_id = self.initial_data.get("jobId")

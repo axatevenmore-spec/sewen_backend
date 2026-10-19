@@ -15,6 +15,7 @@ from .files import public_url
 from .models import CompanyProfile, File
 from .permissions import HasModulePermission
 from .serializers import BaseModelSerializer, TenantPrimaryKeyRelatedField
+from .validators import validate_address_dict, validate_email_format, validate_phone_number
 
 
 class CompanyProfileSerializer(BaseModelSerializer):
@@ -54,6 +55,15 @@ class CompanyProfileSerializer(BaseModelSerializer):
 
     def get_signature(self, profile):
         return public_url(profile.signature_file, self.context.get("request"))
+
+    def validate_phone(self, value):
+        return validate_phone_number(value, "phone")
+
+    def validate_email(self, value):
+        return validate_email_format(value, "email")
+
+    def validate_address(self, value):
+        return validate_address_dict(value, "address")
 
 
 class CompanyProfileView(APIView):

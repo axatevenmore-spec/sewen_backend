@@ -12,6 +12,11 @@ from apps.core.serializers import (
     QuantityField,
     TenantPrimaryKeyRelatedField,
 )
+from apps.core.validators import (
+    validate_address_dict,
+    validate_email_format,
+    validate_phone_number,
+)
 
 from .models import (
     CategoryCustomField,
@@ -146,6 +151,12 @@ class PartyContactSerializer(BaseModelSerializer):
         model = PartyContact
         fields = ["id", "name", "role", "phone", "email", "is_primary"]
 
+    def validate_phone(self, value):
+        return validate_phone_number(value, "phone")
+
+    def validate_email(self, value):
+        return validate_email_format(value, "email")
+
 
 class PartySerializer(BaseModelSerializer):
     """The exact shape api.md §4.1 documents.
@@ -200,6 +211,18 @@ class PartySerializer(BaseModelSerializer):
         if value and not str(value).strip().isdigit():
             raise serializers.ValidationError("Bank account number must contain only digits.")
         return value.strip() if value else value
+
+    def validate_phone(self, value):
+        return validate_phone_number(value, "phone")
+
+    def validate_email(self, value):
+        return validate_email_format(value, "email")
+
+    def validate_billing_address(self, value):
+        return validate_address_dict(value, "billing_address")
+
+    def validate_shipping_address(self, value):
+        return validate_address_dict(value, "shipping_address")
 
 
 class PartySummarySerializer(BaseSerializer):

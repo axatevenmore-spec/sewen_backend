@@ -7,6 +7,7 @@ from apps.core.serializers import (
     MoneyField,
     TenantPrimaryKeyRelatedField,
 )
+from apps.core.validators import validate_email_format, validate_phone_number
 
 from .models import (
     Contract,
@@ -202,6 +203,12 @@ class LeadSerializer(BaseModelSerializer):
             self.lead_form = form
         return super().validate(attrs)
 
+    def validate_phone(self, value):
+        return validate_phone_number(value, "phone")
+
+    def validate_email(self, value):
+        return validate_email_format(value, "email")
+
     def get_balance(self, lead):
         party = lead.party
         return str(party.balance) if party is not None and party.balance is not None else "0"
@@ -324,6 +331,9 @@ class LeadCallSerializer(BaseModelSerializer):
         read_only_fields = ["called_by"]
         #: Defaults to now in ``LeadViewSet.calls`` -- the screen logs a call as it happens.
         extra_kwargs = {"called_at": {"required": False}}
+
+    def validate_phone(self, value):
+        return validate_phone_number(value, "phone")
 
 
 class LeadEmailSerializer(BaseModelSerializer):

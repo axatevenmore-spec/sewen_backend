@@ -9,6 +9,7 @@ recompute-on-write rule of api.md §5.7.
 from rest_framework import serializers
 
 from .serializers import BaseModelSerializer, TenantPrimaryKeyRelatedField
+from .validators import validate_address_dict, validate_email_format, validate_phone_number
 
 #: The frozen and computed line fields, in the order the UI renders them.
 LINE_FIELDS = [
@@ -135,6 +136,24 @@ class DocumentSerializer(BaseModelSerializer):
         if "partyGstin" in data and "party_gstin" not in data:
             data["party_gstin"] = data["partyGstin"]
         return super().to_internal_value(data)
+
+    def validate_partyPhone(self, value):
+        return validate_phone_number(value, "partyPhone")
+
+    def validate_party_phone(self, value):
+        return validate_phone_number(value, "partyPhone")
+
+    def validate_partyEmail(self, value):
+        return validate_email_format(value, "partyEmail")
+
+    def validate_party_email(self, value):
+        return validate_email_format(value, "partyEmail")
+
+    def validate_billing_address(self, value):
+        return validate_address_dict(value, "billingAddress")
+
+    def validate_shipping_address(self, value):
+        return validate_address_dict(value, "shippingAddress")
 
     def validate(self, attrs):
         attrs = super().validate(attrs)
