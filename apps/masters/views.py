@@ -82,6 +82,7 @@ class PartyViewSet(TenantModelViewSet):
         "summary": [PARTY_FINANCE],
         "documents": [PARTY_FINANCE],
         "available_credit": [PARTY_FINANCE],
+        "record_funds": [PARTY_MAINTAINERS],
         "write": [PARTY_MAINTAINERS],
     }
 
@@ -157,6 +158,18 @@ class PartyViewSet(TenantModelViewSet):
         invoice_rows = invoices.aggregate(
             lifetime=money_sum("total"), paid=money_sum("amount_paid"), count=Count("id")
         )
+        from apps.sales.models import CashPaymentReceipt
+
+        formal_received = PaymentIn.objects.filter(
+            client_id=request.client_id, party=party, status="Active", deleted_at__isnull=True
+        ).aggregate(s=money_sum("amount"))["s"] or Decimal("0")
+
+        cash_received = CashPaymentReceipt.objects.filter(
+            client_id=request.client_id, party=party, deleted_at__isnull=True
+        ).exclude(status__in=["CANCELLED", "VOIDED"]).aggregate(s=money_sum("amount"))["s"] or Decimal("0")
+
+        total_received = round2(formal_received + cash_received)
+
         invoice_list = list(invoices)
         total_outstanding = round2(sum((inv.balance_due for inv in invoice_list), ZERO))
         open_invoices_count = sum(1 for inv in invoice_list if inv.balance_due > Decimal("0.01"))
@@ -184,6 +197,9 @@ class PartyViewSet(TenantModelViewSet):
                 "creditLimit": round2(party.credit_limit) if party.credit_limit else None,
                 "outstanding": total_outstanding,
                 "lifetimeValue": round2(invoice_rows["lifetime"]),
+                "formalAmountReceived": round2(formal_received),
+                "cashAmountReceived": round2(cash_received),
+                "totalReceived": total_received,
                 "openOrders": orders.exclude(stage__in=["Invoiced", "Delivered"]).count(),
                 "openInvoices": open_invoices_count,
                 "totalInvoices": invoice_rows["count"],
@@ -192,6 +208,7 @@ class PartyViewSet(TenantModelViewSet):
                 "unallocatedAdvance": round2(
                     max(advance["amount"] - advance["allocated"], ZERO)
                 ),
+                "pmsAdvancePaymentPercentage": float(party.pms_advance_payment_percentage or 0),
             }
         )
 
@@ -221,6 +238,154 @@ class PartyViewSet(TenantModelViewSet):
             "sources": clean_sources,
         })
 
+    @action(detail=True, methods=["post"], url_path="record-funds")
+    @transaction.atomic
+    def record_funds(self, request, pk=None):
+        """Record dual-stream funds (Formal With-Bill and/or Cash Without-Bill)."""
+        from apps.sales.models import CashPaymentReceipt, PaymentIn, SalesInvoice
+        from apps.sales import services as sales_services
+        from apps.core.numbering import allocate_number
+        from apps.accounting.models import BankAccount
+        from apps.accounting import services as acct_services
+        from django.utils import timezone
+
+        party = self.get_object()
+
+        raw_formal = request.data.get("formalAmount")
+        raw_cash = request.data.get("cashAmount")
+
+        try:
+            formal_amount = Decimal(str(raw_formal or "0.00"))
+        except (ValueError, TypeError, Exception):
+            raise ValidationFailed("Invalid formal amount.", field_errors={"formalAmount": ["Must be a valid decimal number."]})
+
+        try:
+            cash_amount = Decimal(str(raw_cash or "0.00"))
+        except (ValueError, TypeError, Exception):
+            raise ValidationFailed("Invalid cash amount.", field_errors={"cashAmount": ["Must be a valid decimal number."]})
+
+        if formal_amount < Decimal("0.00"):
+            raise ValidationFailed("Formal amount cannot be negative.", field_errors={"formalAmount": ["Cannot be negative."]})
+
+        if cash_amount < Decimal("0.00"):
+            raise ValidationFailed("Cash amount cannot be negative.", field_errors={"cashAmount": ["Cannot be negative."]})
+
+        if formal_amount == Decimal("0.00") and cash_amount == Decimal("0.00"):
+            raise ValidationFailed(
+                "At least one amount (formal or cash) must be greater than zero.",
+                field_errors={"formalAmount": ["Either formal amount or cash amount is required."]}
+            )
+
+        from datetime import date as dt_date, datetime as dt_datetime
+        raw_date = request.data.get("paymentDate")
+        if raw_date:
+            if isinstance(raw_date, str):
+                try:
+                    payment_date = dt_datetime.strptime(raw_date, "%Y-%m-%d").date()
+                except ValueError:
+                    try:
+                        payment_date = dt_datetime.strptime(raw_date, "%d-%m-%Y").date()
+                    except ValueError:
+                        payment_date = timezone.localdate()
+            elif isinstance(raw_date, dt_date):
+                payment_date = raw_date
+            else:
+                payment_date = timezone.localdate()
+        else:
+            payment_date = timezone.localdate()
+        formal_mode = request.data.get("formalMode") or "Bank Transfer"
+        cash_mode = request.data.get("cashMode") or "Cash"
+        formal_ref = request.data.get("formalReference")
+        cash_ref = request.data.get("cashReference")
+        invoice_id = request.data.get("invoiceId")
+        description = request.data.get("description") or "Party funds deposit"
+        notes = request.data.get("notes") or ""
+
+        invoice = None
+        if invoice_id:
+            invoice = SalesInvoice.objects.filter(
+                pk=invoice_id, client_id=request.client_id, deleted_at__isnull=True
+            ).first()
+            if not invoice:
+                raise NotFound("That invoice no longer exists.")
+            if invoice.party_id != party.id:
+                raise ValidationFailed("Invoice does not belong to this party.")
+
+        formal_payment = None
+        if formal_amount > Decimal("0.00"):
+            bank_account = BankAccount.objects.filter(
+                client_id=request.client_id, is_default=True, deleted_at__isnull=True
+            ).first()
+
+            formal_payment = sales_services.record_payment_in(
+                client=request.user.client,
+                party=party,
+                amount=formal_amount,
+                payment_date=payment_date,
+                mode=formal_mode,
+                payment_type="WITH_BILL",
+                bank_account=bank_account,
+                reference_number=formal_ref,
+                description=description,
+                notes=notes,
+                invoice=invoice,
+                user=request.user,
+            )
+
+        cash_receipt = None
+        if cash_amount > Decimal("0.00"):
+            cpr_number = allocate_number(request.user.client, "CPR", payment_date)
+            cash_receipt = CashPaymentReceipt.objects.create(
+                client=request.user.client,
+                receipt_number=cpr_number,
+                party=party,
+                invoice=invoice,
+                amount=cash_amount,
+                payment_date=payment_date,
+                mode=cash_mode,
+                reference_number=cash_ref or cpr_number,
+                description=description,
+                notes=notes,
+                status="RECEIVED",
+                created_by=request.user if getattr(request.user, "is_authenticated", False) else None,
+            )
+            acct_services.recalculate_party_balance(request.client_id, party)
+
+        formal_data = None
+        if formal_payment:
+            formal_data = {
+                "id": str(formal_payment.id),
+                "paymentNumber": formal_payment.payment_number,
+                "amount": float(formal_payment.amount),
+                "mode": formal_payment.mode,
+                "referenceNumber": formal_payment.reference_number,
+                "paymentDate": str(formal_payment.payment_date),
+            }
+
+        cash_data = None
+        if cash_receipt:
+            cash_data = {
+                "id": str(cash_receipt.id),
+                "receiptNumber": cash_receipt.receipt_number,
+                "amount": float(cash_receipt.amount),
+                "mode": cash_receipt.mode,
+                "referenceNumber": cash_receipt.reference_number,
+                "paymentDate": str(cash_receipt.payment_date),
+            }
+
+        total_recorded = round2(formal_amount + cash_amount)
+
+        return Response(
+            {
+                "partyId": str(party.id),
+                "partyName": party.name,
+                "formalPayment": formal_data,
+                "cashPayment": cash_data,
+                "totalRecorded": float(total_recorded),
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
     @action(detail=True, methods=["get"])
     def documents(self, request, pk=None):
         """``GET /parties/{id}/documents/`` -- every document referencing the
@@ -228,7 +393,9 @@ class PartyViewSet(TenantModelViewSet):
         whole context (api-integration.md §9.1.3)."""
         from apps.purchase.models import PurchaseBill, PurchaseOrder
         from apps.sales.models import (
+            CashPaymentReceipt,
             DeliveryChallan,
+            PaymentIn,
             Quotation,
             SalesInvoice,
             SalesOrder,
@@ -237,25 +404,30 @@ class PartyViewSet(TenantModelViewSet):
         self.get_object()
         rows = []
         sources = [
-            ("Quotation", Quotation, "quotation_number", "status"),
-            ("SalesOrder", SalesOrder, "order_number", "stage"),
-            ("DeliveryChallan", DeliveryChallan, "challan_number", "status"),
-            ("SalesInvoice", SalesInvoice, "invoice_number", "status"),
-            ("PurchaseOrder", PurchaseOrder, "po_number", "status"),
-            ("PurchaseBill", PurchaseBill, "bill_number", "status"),
+            ("Quotation", Quotation, "quotation_number", "status", "doc_date"),
+            ("SalesOrder", SalesOrder, "order_number", "stage", "doc_date"),
+            ("DeliveryChallan", DeliveryChallan, "challan_number", "status", "doc_date"),
+            ("SalesInvoice", SalesInvoice, "invoice_number", "status", "doc_date"),
+            ("PurchaseOrder", PurchaseOrder, "po_number", "status", "doc_date"),
+            ("PurchaseBill", PurchaseBill, "bill_number", "status", "doc_date"),
+            ("PaymentIn", PaymentIn, "payment_number", "status", "payment_date"),
+            ("CashPaymentReceipt", CashPaymentReceipt, "receipt_number", "status", "payment_date"),
         ]
-        for label, model, number_field, status_field in sources:
+        for label, model, number_field, status_field, date_field in sources:
             for row in model.objects.filter(
                 client_id=request.client_id, party_id=pk, deleted_at__isnull=True
-            ).order_by("-doc_date")[:50]:
+            ).order_by(f"-{date_field}")[:50]:
+                amount_val = getattr(row, "total", None)
+                if amount_val is None:
+                    amount_val = getattr(row, "amount", Decimal("0"))
                 rows.append(
                     {
                         "documentType": label,
                         "id": str(row.id),
                         "number": getattr(row, number_field),
-                        "date": row.doc_date,
+                        "date": getattr(row, date_field),
                         "status": getattr(row, status_field),
-                        "total": round2(row.total),
+                        "total": round2(amount_val),
                     }
                 )
         rows.sort(key=lambda row: (row["date"] is None, row["date"]), reverse=True)

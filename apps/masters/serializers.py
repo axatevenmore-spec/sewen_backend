@@ -171,6 +171,13 @@ class PartySerializer(BaseModelSerializer):
         source="ledger_account", model="accounting.Account", required=False, allow_null=True
     )
     availableCredit = serializers.SerializerMethodField()
+    pmsAdvancePaymentPercentage = serializers.DecimalField(
+        source="pms_advance_payment_percentage",
+        required=False,
+        allow_null=True,
+        max_digits=5,
+        decimal_places=2,
+    )
 
     class Meta:
         model = Party
@@ -183,7 +190,7 @@ class PartySerializer(BaseModelSerializer):
             "bank_account_number", "ifsc_code", "bank_name", "account_holder_name",
             "opening_balance", "balance", "availableCredit",
             "billing_address", "shipping_address", "contacts", "status",
-            "weight_tolerance_pct",
+            "weight_tolerance_pct", "pms_advance_payment_percentage", "pmsAdvancePaymentPercentage",
             "created_at", "updated_at",
         ]
         read_only_fields = ["balance", "availableCredit", "created_at", "updated_at"]
@@ -244,6 +251,7 @@ class PartySummarySerializer(BaseSerializer):
     lastOrderDate = serializers.DateField(allow_null=True)
     lastInvoiceDate = serializers.DateField(allow_null=True)
     unallocatedAdvance = MoneyField()
+    pmsAdvancePaymentPercentage = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, allow_null=True)
 
 
 # ---------------------------------------------------------------------------

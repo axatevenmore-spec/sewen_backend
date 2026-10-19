@@ -321,6 +321,89 @@ class PmsSettingsView(APIView):
     patch = put
 
 
+def validate_order_pms_advance(order):
+    """
+    Validates that the sales order has satisfied the customer's mandatory
+    PMS project conversion advance payment percentage before starting/converting.
+    """
+    party = getattr(order, "party", None)
+    if not party:
+        return
+
+    req_pct = getattr(party, "pms_advance_payment_percentage", None) or Decimal("0")
+    if req_pct <= Decimal("0"):
+        return
+
+    order_total = Decimal(str(order.total or order.total_sales_value or 0))
+    if order_total <= Decimal("0"):
+        return
+
+    required_advance = round2((order_total * req_pct) / Decimal("100"))
+
+    from apps.sales.models import PaymentIn, CashPaymentReceipt
+
+    # 1. Direct active payments on this order
+    order_pmts = PaymentIn.objects.filter(
+        client_id=order.client_id, sales_order=order, status="Active", deleted_at__isnull=True
+    ).aggregate(s=Sum("amount"))["s"] or Decimal("0")
+
+    # 2. Active payments on linked proforma invoices
+    proforma_pmts = PaymentIn.objects.filter(
+        client_id=order.client_id, proforma_invoice__sales_order=order, status="Active", deleted_at__isnull=True
+    ).aggregate(s=Sum("amount"))["s"] or Decimal("0")
+
+    # 3. Active payments on linked sales invoices
+    invoice_pmts = PaymentIn.objects.filter(
+        client_id=order.client_id, invoice__sales_order=order, status="Active", deleted_at__isnull=True
+    ).aggregate(s=Sum("amount"))["s"] or Decimal("0")
+
+    # 4. Direct cash receipts linked to order
+    cash_pmts = CashPaymentReceipt.objects.filter(
+        client_id=order.client_id, payment__sales_order=order
+    ).exclude(status__in=["CANCELLED", "VOIDED"]).aggregate(s=Sum("amount"))["s"] or Decimal("0")
+
+    # 5. Direct amount_paid / cash_amount recorded on order
+    direct_order_paid = Decimal(str(order.amount_paid or 0))
+    if getattr(order, "payment_status", "") == "Paid" and getattr(order, "cash_amount", None):
+        direct_order_paid = max(direct_order_paid, Decimal(str(order.cash_amount)))
+
+    order_specific_paid = max(direct_order_paid, order_pmts + proforma_pmts + invoice_pmts + cash_pmts)
+
+    # 6. Customer account advance (negative balance in SEWEN represents customer advance)
+    customer_advance = Decimal("0")
+    if party.balance < Decimal("0"):
+        customer_advance = abs(party.balance)
+
+    unallocated_agg = PaymentIn.objects.filter(
+        client_id=order.client_id, party=party, status="Active", deleted_at__isnull=True
+    ).aggregate(amt=Sum("amount"), alloc=Sum("allocated_amount"))
+    unallocated_advance = max((unallocated_agg["amt"] or Decimal("0")) - (unallocated_agg["alloc"] or Decimal("0")), Decimal("0"))
+    customer_advance = max(customer_advance, unallocated_advance)
+
+    effective_received = max(order_specific_paid, customer_advance)
+
+    if effective_received < required_advance - Decimal("0.01"):
+        shortfall = round2(required_advance - effective_received)
+        raise BusinessRuleViolation(
+            f"Cannot convert Sales Order {order.order_number or order.id} to PMS Project: Customer '{party.name}' "
+            f"requires at least {req_pct}% advance payment (₹{required_advance:,.2f}) for order value ₹{order_total:,.2f}. "
+            f"Current advance/payment received is ₹{effective_received:,.2f}. "
+            f"Advance shortfall: ₹{shortfall:,.2f}.",
+            code="ADVANCE_PAYMENT_REQUIRED",
+            payload={
+                "orderId": str(order.id),
+                "orderNumber": order.order_number,
+                "partyId": str(party.id),
+                "partyName": party.name,
+                "requiredPercentage": float(req_pct),
+                "orderTotal": float(order_total),
+                "requiredAmount": float(required_advance),
+                "receivedAmount": float(effective_received),
+                "shortfall": float(shortfall),
+            },
+        )
+
+
 # ---------------------------------------------------------------------------
 # Projects (api.md §10.2)
 # ---------------------------------------------------------------------------
@@ -330,6 +413,7 @@ def create_project_from_order(order, *, project_manager_id=None, priority="Mediu
                               user=None, planned_duration=None, duration_unit="Days",
                               start_date=None, specifications=None):
     """``POST /pms/projects/from-order/`` -- pulls customer + product from the order."""
+    validate_order_pms_advance(order)
     first_line = order.line_items.filter(deleted_at__isnull=True).order_by("line_no").first()
 
     if start_date is None:

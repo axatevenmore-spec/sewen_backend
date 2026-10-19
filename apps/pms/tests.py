@@ -249,3 +249,69 @@ class ProofShareReviewTests(TestCase):
         self.assertFalse(body["canDecide"])
         self.document.refresh_from_db()
         self.assertEqual(self.document.approval_status, "Need Improvement")
+
+
+class SalesOrderPmsAdvanceValidationTests(TestCase):
+    def setUp(self):
+        from apps.masters.models import Party
+        from apps.sales.models import SalesOrder
+
+        self.client_obj, _ = Client.objects.get_or_create(
+            slug="test-tenant-advance", defaults={"name": "Test Tenant Advance"}
+        )
+        self.creator = User.objects.filter(email="advance_tester@example.com").first()
+        if not self.creator:
+            self.creator = User.objects.create_user(
+                email="advance_tester@example.com",
+                password="pass",
+                client=self.client_obj,
+            )
+        self.customer = Party.objects.create(
+            client=self.client_obj,
+            code="CUST-ALPHA-01",
+            name="Alpha Corp",
+            type="Customer",
+            pms_advance_payment_percentage=Decimal("20.00"),
+        )
+        self.order = SalesOrder.objects.create(
+            client=self.client_obj,
+            party=self.customer,
+            order_number="SO-TEST-ADV-001",
+            doc_date="2026-10-19",
+            subtotal=Decimal("100000.00"),
+            total=Decimal("100000.00"),
+            stage="Confirmed",
+            created_by=self.creator,
+        )
+
+    def test_advance_blocked_when_unpaid(self):
+        from apps.pms.views import validate_order_pms_advance
+        from apps.core.exceptions import BusinessRuleViolation
+
+        with self.assertRaises(BusinessRuleViolation) as ctx:
+            validate_order_pms_advance(self.order)
+        self.assertEqual(ctx.exception.code, "ADVANCE_PAYMENT_REQUIRED")
+
+    def test_advance_allowed_when_paid(self):
+        from apps.pms.views import validate_order_pms_advance
+        from apps.sales.models import PaymentIn
+
+        PaymentIn.objects.create(
+            client=self.client_obj,
+            party=self.customer,
+            sales_order=self.order,
+            payment_number="PAY-TEST-001",
+            payment_date="2026-10-19",
+            amount=Decimal("20000.00"),
+            mode="Bank",
+            created_by=self.creator,
+        )
+        # Should not raise exception
+        validate_order_pms_advance(self.order)
+
+    def test_zero_percentage_allows_conversion_immediately(self):
+        from apps.pms.views import validate_order_pms_advance
+
+        self.customer.pms_advance_payment_percentage = Decimal("0.00")
+        self.customer.save()
+        validate_order_pms_advance(self.order)
