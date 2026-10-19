@@ -140,16 +140,38 @@ class PurchaseBillSerializer(DocumentSerializer):
         source="project", model="pms.Project", required=False, allow_null=True
     )
 
+    purchase_order = TenantPrimaryKeyRelatedField(
+        model="purchase.PurchaseOrder", required=False, allow_null=True
+    )
+    purchaseOrderId = serializers.CharField(source="purchase_order_id", read_only=True, allow_null=True)
+    purchaseOrder = serializers.CharField(source="purchase_order_id", read_only=True, allow_null=True)
+    poNumber = serializers.CharField(source="purchase_order.po_number", read_only=True, allow_null=True)
+    poRef = serializers.CharField(source="purchase_order.po_number", read_only=True, allow_null=True)
+    linkedPo = serializers.CharField(source="purchase_order.po_number", read_only=True, allow_null=True)
+
     class Meta:
         model = PurchaseBill
         fields = HEADER_FIELDS + [
             "bill_number", "vendorBillNumber", "status", "due_date",
-            "purchase_order", "projectId", "location", "goodsReceived", "received_date",
+            "purchase_order", "purchaseOrderId", "purchaseOrder", "poNumber", "poRef", "linkedPo",
+            "projectId", "location", "goodsReceived", "received_date",
             "qcStatus", "qc_note", "vendorId", "vendorName",
         ]
         read_only_fields = READ_ONLY_HEADER_FIELDS + [
             "bill_number", "received_date", "qc_note",
+            "purchaseOrderId", "purchaseOrder", "poNumber", "poRef", "linkedPo",
         ]
+
+    def to_internal_value(self, data):
+        if hasattr(data, "copy"):
+            data = data.copy()
+        elif isinstance(data, dict):
+            data = dict(data)
+        if "purchaseOrderId" in data and "purchase_order" not in data:
+            data["purchase_order"] = data["purchaseOrderId"]
+        elif "purchaseOrder" in data and "purchase_order" not in data:
+            data["purchase_order"] = data["purchaseOrder"]
+        return super().to_internal_value(data)
 
 
 

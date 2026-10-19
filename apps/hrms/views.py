@@ -3099,7 +3099,7 @@ class WorkingDayView(APIView):
         from apps.core.models import Setting
 
         row = Setting.objects.filter(
-            client_id=request.client_id, key=self.SETTING_KEY, deleted_at__isnull=True
+            client_id=request.client_id, key=self.SETTING_KEY
         ).first()
         return row.value if row and isinstance(row.value, dict) else None
 

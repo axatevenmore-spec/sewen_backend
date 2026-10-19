@@ -9,6 +9,7 @@ from apps.core.serializers import (
     BaseSerializer,
     TenantPrimaryKeyRelatedField,
 )
+from apps.core.validators import validate_email_format, validate_phone_number
 
 from .invites import send_invite_on_commit
 from .models import Client, Permission, Role, RolePermission, User, UserPermission, UserSession
@@ -146,6 +147,9 @@ class UpdateMeSerializer(BaseModelSerializer):
     class Meta:
         model = User
         fields = ["name", "phone", "avatar"]
+
+    def validate_phone(self, value):
+        return validate_phone_number(value, "phone")
 
 
 class UserSessionSerializer(BaseModelSerializer):
@@ -310,7 +314,7 @@ class UserSerializer(BaseModelSerializer):
         return attrs
 
     def validate_email(self, value):
-        value = value.lower()
+        value = validate_email_format(value, "email", required=True)
         client_id = self.context.get("client_id")
         existing = User.objects.filter(client_id=client_id, email=value, deleted_at__isnull=True)
         if self.instance is not None:
@@ -318,6 +322,9 @@ class UserSerializer(BaseModelSerializer):
         if existing.exists():
             raise serializers.ValidationError("A user with this email already exists.")
         return value
+
+    def validate_phone(self, value):
+        return validate_phone_number(value, "phone")
 
     def create(self, validated_data):
         password = validated_data.pop("password", None)

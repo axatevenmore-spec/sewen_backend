@@ -254,20 +254,54 @@ class PurchaseOrderViewSet(SalesDocumentViewSet):
         if order.status == "Cancelled":
             raise Conflict("This order is cancelled.", code=Codes.ALREADY_CANCELLED)
 
+        status_info = services.po_billed_status(order)
+        if status_info["totalRemainingQty"] <= ZERO and status_info["totalOrderedQty"] > ZERO:
+            raise Conflict("This order is already fully billed.", code=Codes.OVER_INVOICE)
+
+        remaining_by_line = {
+            str(row["lineId"]): D(row["remainingQty"])
+            for row in status_info["lines"]
+            if row.get("lineId") and D(row["remainingQty"]) > ZERO
+        }
+
         bill = _clone_document(
             order,
             PurchaseBill,
-            {"purchase_order": order, "status": "Draft", "location": order.location},
+            {"purchase_order": order, "status": "Unpaid", "location": order.location},
             number_field="bill_number",
             series="BILL",
             line_model_name="PurchaseBillLine",
             line_fk="purchase_bill",
-            line_filter=lambda line: D(line.qty) > D(line.billed_qty),
+            line_filter=lambda line: (not remaining_by_line) or (str(line.id) in remaining_by_line),
             line_overrides=lambda line: {
-                "qty": D(line.qty) - D(line.billed_qty),
+                "qty": remaining_by_line.get(str(line.id), D(line.qty)),
                 "purchase_order_line": line,
             },
         )
+
+        # Update billed_qty on PO lines
+        for b_line in bill.line_items.all():
+            if b_line.purchase_order_line_id:
+                po_line = b_line.purchase_order_line
+                po_line.billed_qty = round4(D(po_line.billed_qty) + D(b_line.qty))
+                po_line.save(update_fields=["billed_qty", "updated_at"])
+
+        # Update order status
+        new_status_info = services.po_billed_status(order)
+        order.status = new_status_info["status"]
+        order.save(update_fields=["status", "updated_at"])
+
+        # Post ledger entry and recalculate vendor balance
+        try:
+            from apps.accounting import services as ledger
+            entry = ledger.post_purchase_bill(bill, user=request.user)
+            if entry is not None:
+                bill.journal_entry = entry
+                bill.save(update_fields=["journal_entry", "updated_at"])
+            ledger.recalculate_party_balance(bill.client_id, bill.party_id)
+        except Exception:
+            pass
+
         self.write_audit("convert", order, description=f"Bill {bill.bill_number} created")
         return Response(
             PurchaseBillSerializer(bill, context=self.get_serializer_context()).data,

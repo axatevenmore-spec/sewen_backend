@@ -99,19 +99,25 @@ def emit(event, data, *, room):
         except Exception:  # pragma: no cover - transport trouble
             logger.warning("realtime emit %s to %s failed", event, room, exc_info=True)
 
-    transaction.on_commit(send)
+    try:
+        transaction.on_commit(send)
+    except Exception:
+        send()
 
 
 def announce_project_change(project, action, actor=None):
-    emit(
-        "pms:project_changed",
-        {
-            "projectId": str(project.id),
-            "action": action,
-            "actorId": str(actor.id) if getattr(actor, "is_authenticated", False) else None,
-        },
-        room=tenant_pms_room(project.client_id),
-    )
+    try:
+        emit(
+            "pms:project_changed",
+            {
+                "projectId": str(project.id),
+                "action": action,
+                "actorId": str(actor.id) if getattr(actor, "is_authenticated", False) else None,
+            },
+            room=tenant_pms_room(project.client_id),
+        )
+    except Exception:
+        logger.warning("announce_project_change failed", exc_info=True)
 
 
 # ---------------------------------------------------------------------------

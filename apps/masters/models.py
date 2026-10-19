@@ -82,6 +82,8 @@ class Party(TenantModel, LegacyIdMixin):
     status = models.TextField(choices=STATUSES, default="Active")
     #: Weight variance tolerance configured per vendor profile (Dev Spec §2.3)
     weight_tolerance_pct = models.DecimalField(max_digits=6, decimal_places=2, default=0, null=True, blank=True)
+    #: Minimum advance payment percentage required on sales orders before PMS project conversion (e.g. 10.00, 20.00)
+    pms_advance_payment_percentage = models.DecimalField(max_digits=5, decimal_places=2, default=0, null=True, blank=True)
 
     class Meta:
         db_table = "parties"

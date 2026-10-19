@@ -12,6 +12,11 @@ from apps.core.serializers import (
     QuantityField,
     TenantPrimaryKeyRelatedField,
 )
+from apps.core.validators import (
+    validate_address_dict,
+    validate_email_format,
+    validate_phone_number,
+)
 
 from .models import (
     CategoryCustomField,
@@ -146,6 +151,12 @@ class PartyContactSerializer(BaseModelSerializer):
         model = PartyContact
         fields = ["id", "name", "role", "phone", "email", "is_primary"]
 
+    def validate_phone(self, value):
+        return validate_phone_number(value, "phone")
+
+    def validate_email(self, value):
+        return validate_email_format(value, "email")
+
 
 class PartySerializer(BaseModelSerializer):
     """The exact shape api.md §4.1 documents.
@@ -160,6 +171,13 @@ class PartySerializer(BaseModelSerializer):
         source="ledger_account", model="accounting.Account", required=False, allow_null=True
     )
     availableCredit = serializers.SerializerMethodField()
+    pmsAdvancePaymentPercentage = serializers.DecimalField(
+        source="pms_advance_payment_percentage",
+        required=False,
+        allow_null=True,
+        max_digits=5,
+        decimal_places=2,
+    )
 
     class Meta:
         model = Party
@@ -172,7 +190,7 @@ class PartySerializer(BaseModelSerializer):
             "bank_account_number", "ifsc_code", "bank_name", "account_holder_name",
             "opening_balance", "balance", "availableCredit",
             "billing_address", "shipping_address", "contacts", "status",
-            "weight_tolerance_pct",
+            "weight_tolerance_pct", "pms_advance_payment_percentage", "pmsAdvancePaymentPercentage",
             "created_at", "updated_at",
         ]
         read_only_fields = ["balance", "availableCredit", "created_at", "updated_at"]
@@ -201,6 +219,18 @@ class PartySerializer(BaseModelSerializer):
             raise serializers.ValidationError("Bank account number must contain only digits.")
         return value.strip() if value else value
 
+    def validate_phone(self, value):
+        return validate_phone_number(value, "phone")
+
+    def validate_email(self, value):
+        return validate_email_format(value, "email")
+
+    def validate_billing_address(self, value):
+        return validate_address_dict(value, "billing_address")
+
+    def validate_shipping_address(self, value):
+        return validate_address_dict(value, "shipping_address")
+
 
 class PartySummarySerializer(BaseSerializer):
     """``GET /parties/{id}/summary/`` -- the Customer 360 drawer.
@@ -221,6 +251,7 @@ class PartySummarySerializer(BaseSerializer):
     lastOrderDate = serializers.DateField(allow_null=True)
     lastInvoiceDate = serializers.DateField(allow_null=True)
     unallocatedAdvance = MoneyField()
+    pmsAdvancePaymentPercentage = serializers.DecimalField(max_digits=5, decimal_places=2, required=False, allow_null=True)
 
 
 # ---------------------------------------------------------------------------

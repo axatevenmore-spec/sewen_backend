@@ -42,7 +42,7 @@ class UserEmployeeLinkTests(TestCase):
     # -- creating on either side ---------------------------------------------
     def test_new_user_gets_an_employee_record(self):
         row = self._create_user(
-            name="Ravi", email="Ravi@link.test", phone="98765", department="Sales",
+            name="Ravi", email="Ravi@link.test", phone="9876543210", department="Sales",
             location="Pune", joinedDate="2026-09-01",
         )
         employee = Employee.objects.get(pk=row["employeeRecordId"])
@@ -50,7 +50,7 @@ class UserEmployeeLinkTests(TestCase):
         self.assertEqual(
             (employee.name, employee.email, employee.phone, employee.department.name,
              employee.location.name, str(employee.joining_date)),
-            ("Ravi", "ravi@link.test", "98765", "Sales", "Pune", "2026-09-01"),
+            ("Ravi", "ravi@link.test", "9876543210", "Sales", "Pune", "2026-09-01"),
         )
 
     def test_opting_out_of_the_employee_record(self):
@@ -60,12 +60,12 @@ class UserEmployeeLinkTests(TestCase):
 
     def test_new_user_links_the_employee_with_their_email(self):
         employee = self._create_employee(
-            name="Meera", email="meera@link.test", phone="111", createUserAccount=False,
+            name="Meera", email="meera@link.test", phone="9876543111", createUserAccount=False,
         )
         row = self._create_user(name="Meera K", email="meera@link.test")
         self.assertEqual(row["employeeRecordId"], employee["id"])
         # HR's record wins on a fresh link.
-        self.assertEqual((row["name"], row["phone"]), ("Meera", "111"))
+        self.assertEqual((row["name"], row["phone"]), ("Meera", "9876543111"))
         self.assertEqual(Employee.objects.filter(email="meera@link.test").count(), 1)
 
     def test_new_employee_gets_a_login_with_the_hr_fields(self):
@@ -98,24 +98,24 @@ class UserEmployeeLinkTests(TestCase):
     def test_editing_the_employee_updates_the_user(self):
         row = self._create_employee(name="Asha", email="asha@link.test", department="Accounts")
         resp = self.api.patch(f"{EMPLOYEES}/{row['id']}/", {
-            "name": "Asha Rao", "phone": "222", "department": "Finance",
+            "name": "Asha Rao", "phone": "9876543222", "department": "Finance",
         }, format="json")
         self.assertEqual(resp.status_code, 200, resp.content)
         user = User.objects.get(pk=row["login"]["id"])
-        self.assertEqual((user.name, user.phone, user.department), ("Asha Rao", "222", "Finance"))
+        self.assertEqual((user.name, user.phone, user.department), ("Asha Rao", "9876543222", "Finance"))
         self.assertTrue(Department.objects.filter(client=self.tenant, name="Finance").exists())
 
     def test_an_unchanged_field_never_overwrites_the_other_side(self):
-        row = self._create_employee(name="Asha", email="asha@link.test", phone="111")
-        User.objects.filter(pk=row["login"]["id"]).update(phone="999")
+        row = self._create_employee(name="Asha", email="asha@link.test", phone="9876543111")
+        User.objects.filter(pk=row["login"]["id"]).update(phone="9876543999")
         self.api.patch(f"{EMPLOYEES}/{row['id']}/", {"name": "Asha R"}, format="json")
-        self.assertEqual(User.objects.get(pk=row["login"]["id"]).phone, "999")
+        self.assertEqual(User.objects.get(pk=row["login"]["id"]).phone, "9876543999")
 
     def test_own_profile_edit_reaches_hr(self):
         row = self._create_employee(name="Asha", email="asha@link.test")
         me = self._as(User.objects.get(pk=row["login"]["id"]))
-        self.assertEqual(me.patch("/api/v1/auth/me/", {"phone": "555"}, format="json").status_code, 200)
-        self.assertEqual(Employee.objects.get(pk=row["id"]).phone, "555")
+        self.assertEqual(me.patch("/api/v1/auth/me/", {"phone": "9876543555"}, format="json").status_code, 200)
+        self.assertEqual(Employee.objects.get(pk=row["id"]).phone, "9876543555")
 
     def test_employee_leaving_deactivates_the_login(self):
         row = self._create_employee(name="Asha", email="asha@link.test")
