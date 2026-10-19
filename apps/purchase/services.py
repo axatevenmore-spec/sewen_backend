@@ -580,21 +580,26 @@ def po_billed_status(order):
 
     billed_by_line = {}
     if active_bill_ids:
-        rows = (
+        bill_lines = list(
             PurchaseBillLine.objects.filter(
                 purchase_bill_id__in=active_bill_ids,
-                purchase_order_line__isnull=False,
                 deleted_at__isnull=True,
             )
-            .values("purchase_order_line_id")
-            .annotate(
-                billed=Coalesce(
-                    Sum("qty"), Value(Decimal("0.0000")),
-                    output_field=DecimalField(max_digits=18, decimal_places=4),
-                )
-            )
         )
-        billed_by_line = {row["purchase_order_line_id"]: row["billed"] for row in rows}
+        for bl in bill_lines:
+            if bl.purchase_order_line_id:
+                billed_by_line[bl.purchase_order_line_id] = (
+                    billed_by_line.get(bl.purchase_order_line_id, ZERO) + D(bl.qty)
+                )
+            else:
+                matched = next(
+                    (l for l in lines if (bl.item_id and l.item_id == bl.item_id) or (bl.sku and l.sku == bl.sku)),
+                    None
+                )
+                if matched:
+                    billed_by_line[matched.id] = (
+                        billed_by_line.get(matched.id, ZERO) + D(bl.qty)
+                    )
 
     line_rows = []
     total_ordered = total_billed = ZERO
@@ -622,6 +627,10 @@ def po_billed_status(order):
         status = "Partially Billed"
     else:
         status = order.status
+
+    if order.status != "Cancelled" and status in ("Billed", "Partially Billed") and order.status != status:
+        order.status = status
+        order.save(update_fields=["status", "updated_at"])
 
     return {
         "status": status,

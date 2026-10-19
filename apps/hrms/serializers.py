@@ -1099,6 +1099,15 @@ class CandidateSerializer(BaseModelSerializer):
         ret["isOnboarded"] = instance.is_onboarded or (instance.employee_id is not None)
         ret["documentsVerified"] = instance.documents_verified
         ret["appliedDate"] = instance.created_at.strftime("%d %b %Y") if instance.created_at else ""
+        if instance.resume_file_id:
+            try:
+                rf = instance.resume_file
+                if rf:
+                    ret["resumeFileName"] = rf.file_name
+                    ret["resumeFileSize"] = f"{round(rf.file_size / 1024, 1)} KB" if rf.file_size < 1048576 else f"{round(rf.file_size / 1048576, 1)} MB"
+                    ret["resumeFileUrl"] = f"/api/v1/files/{rf.id}/download/"
+            except Exception:
+                pass
         return ret
 
 
