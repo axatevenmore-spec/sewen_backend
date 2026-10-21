@@ -901,12 +901,16 @@ class AttendanceViewSet(OwnEmployeeScopeMixin, TenantModelViewSet):
             if employee is None:
                 continue
             day = _as_date(record.get("date")) or work_date
+            cin = _as_moment(record.get("checkIn"), day)
+            cout = _as_moment(record.get("checkOut"), day)
+            if cin and cout and cout < cin:
+                cout = None
             services.mark_attendance(
                 client=request.user.client,
                 employee=employee,
                 work_date=day,
-                check_in=_as_moment(record.get("checkIn"), day),
-                check_out=_as_moment(record.get("checkOut"), day),
+                check_in=cin,
+                check_out=cout,
                 status=record.get("status"),
                 remark=record.get("remark"),
                 source="bulk",
