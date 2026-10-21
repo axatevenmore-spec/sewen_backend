@@ -339,7 +339,10 @@ EMAIL_USE_TLS = env_bool("EMAIL_USE_TLS", True)
 EMAIL_USE_SSL = env_bool("EMAIL_USE_SSL", False)
 EMAIL_HOST_USER = env("EMAIL_HOST_USER", "")
 EMAIL_HOST_PASSWORD = env("EMAIL_HOST_PASSWORD", "")
-DEFAULT_FROM_EMAIL = env("DEFAULT_FROM_EMAIL", "Evenmore ERP <noreply@evenmore.io>")
+DEFAULT_FROM_EMAIL = env(
+    "DEFAULT_FROM_EMAIL",
+    f"Evenmore ERP <{EMAIL_HOST_USER}>" if EMAIL_HOST_USER else "Evenmore ERP <noreply@evenmore.io>",
+)
 EMAIL_TIMEOUT = int(env("EMAIL_TIMEOUT", "10"))
 
 # --------------------------------------------------------------------------

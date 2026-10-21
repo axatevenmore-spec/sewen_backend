@@ -479,7 +479,7 @@ class ImpersonateCustomerView(APIView):
 
 
 class ForgotPasswordView(APIView):
-    """Sends a 6-digit OTP code to the user's email if an active account exists."""
+    """Sends a 6-digit OTP code to the user's registered email if an active account exists."""
 
     authentication_classes = []
     permission_classes = [AllowPublic]
@@ -488,51 +488,72 @@ class ForgotPasswordView(APIView):
     def post(self, request):
         serializer = ForgotPasswordSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        email = serializer.validated_data["email"].lower()
+        email = serializer.validated_data["email"].lower().strip()
 
         user = User.objects.filter(
-            email=email, deleted_at__isnull=True, status="Active"
+            email__iexact=email, deleted_at__isnull=True
         ).first()
-        if user is not None:
-            # 6-digit numeric OTP (100000 - 999999)
-            otp = f"{secrets.randbelow(900000) + 100000:06d}"
 
-            # Invalidate any previously pending OTPs for this user
-            PasswordResetOTP.objects.filter(user=user, used_at__isnull=True).update(
-                used_at=timezone.now()
+        if user is None:
+            raise ValidationFailed(
+                "This email address is not registered in our system. Please check your email or contact your administrator.",
+                code="EMAIL_NOT_REGISTERED",
+                field_errors={"email": ["This email address is not registered."]},
             )
 
-            # Store fresh OTP valid for 15 minutes
-            PasswordResetOTP.objects.create(
-                user=user,
-                email=email,
-                otp_hash=_hash_otp(user.id, otp),
-                expires_at=timezone.now() + timedelta(minutes=15),
+        if user.status not in ("Active", "Invited"):
+            raise ValidationFailed(
+                f"This account is currently {user.status.lower()}. Please contact your workspace administrator.",
+                code="ACCOUNT_INACTIVE",
+                field_errors={"email": [f"Account is {user.status.lower()}."]},
             )
 
-            # Also store reset token for fallback / backward compatibility
-            token = secrets.token_urlsafe(48)
-            PasswordResetToken.objects.create(
-                user=user,
-                token_hash=_hash(token),
-                expires_at=timezone.now() + timedelta(minutes=15),
+        # 6-digit numeric OTP (100000 - 999999)
+        otp = f"{secrets.randbelow(900000) + 100000:06d}"
+
+        # Invalidate any previously pending OTPs for this user
+        PasswordResetOTP.objects.filter(user=user, used_at__isnull=True).update(
+            used_at=timezone.now()
+        )
+
+        # Store fresh OTP valid for 15 minutes
+        PasswordResetOTP.objects.create(
+            user=user,
+            email=user.email,
+            otp_hash=_hash_otp(user.id, otp),
+            expires_at=timezone.now() + timedelta(minutes=15),
+        )
+
+        # Also store reset token for fallback / backward compatibility
+        token = secrets.token_urlsafe(48)
+        PasswordResetToken.objects.create(
+            user=user,
+            token_hash=_hash(token),
+            expires_at=timezone.now() + timedelta(minutes=15),
+        )
+
+        # Send OTP email to registered email
+        email_sent = send_password_reset_otp_email(
+            email=user.email,
+            otp=otp,
+            user_name=user.name or "",
+            expiry_minutes=15,
+        )
+
+        if not email_sent:
+            raise ValidationFailed(
+                "Failed to dispatch verification email. Please check your mail server configuration or try again.",
+                code="EMAIL_SEND_FAILED",
+                field_errors={"email": ["Failed to send email to this address."]},
             )
 
-            # Send OTP email
-            send_password_reset_otp_email(
-                email=email,
-                otp=otp,
-                user_name=user.name or "",
-                expiry_minutes=15,
-            )
-
-            import logging
-            logging.getLogger(__name__).info("Password reset OTP requested for %s", email)
+        import logging
+        logging.getLogger(__name__).info("Password reset OTP sent to registered email %s", user.email)
 
         return Response(
             {
-                "message": "If that email address is registered with an active account, a 6-digit verification code has been sent.",
-                "email": email,
+                "message": f"A 6-digit verification code has been sent to your registered email ({user.email}).",
+                "email": user.email,
             },
             status=status.HTTP_200_OK,
         )
@@ -552,7 +573,7 @@ class VerifyOTPView(APIView):
         otp = serializer.validated_data["otp"].strip()
 
         user = User.objects.filter(
-            email=email, deleted_at__isnull=True, status="Active"
+            email__iexact=email, deleted_at__isnull=True, status__in=["Active", "Invited"]
         ).first()
 
         if user is None:
@@ -652,7 +673,7 @@ class ResetPasswordView(APIView):
             email = email.lower().strip()
             otp = otp.strip()
             user = User.objects.filter(
-                email=email, deleted_at__isnull=True, status="Active"
+                email__iexact=email, deleted_at__isnull=True, status__in=["Active", "Invited"]
             ).first()
 
             if user is None:
@@ -698,7 +719,11 @@ class ResetPasswordView(APIView):
             user.set_password(new_password)
             user.failed_login_count = 0
             user.locked_until = None
-            user.save(update_fields=["password", "failed_login_count", "locked_until"])
+            if user.status == "Invited":
+                user.status = "Active"
+                user.save(update_fields=["password", "failed_login_count", "locked_until", "status"])
+            else:
+                user.save(update_fields=["password", "failed_login_count", "locked_until"])
 
             if token_record:
                 token_record.used_at = timezone.now()

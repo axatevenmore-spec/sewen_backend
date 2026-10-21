@@ -48,7 +48,7 @@ class PasswordResetOTPTests(TestCase):
             self.assertIsNotNone(otp_record)
             self.assertTrue(otp_record.is_usable)
 
-    def test_forgot_password_unknown_email_returns_success_without_leak(self):
+    def test_forgot_password_unknown_email_rejected_only_registered_allowed(self):
         with self.settings(EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend"):
             mail.outbox = []
             resp = self.client.post(
@@ -56,7 +56,8 @@ class PasswordResetOTPTests(TestCase):
                 {"email": "unknown@nowhere.com"},
                 format="json",
             )
-            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.status_code, 400)
+            self.assertIn("not registered", resp.json().get("message", "").lower())
             self.assertEqual(len(mail.outbox), 0)
 
     def test_verify_otp_success_returns_reset_token(self):
