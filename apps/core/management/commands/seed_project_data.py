@@ -75,7 +75,7 @@ class Command(BaseCommand):
             with transaction.atomic():
                 self.stdout.write("1. Bootstrapping configuration & permissions...")
                 sync_permissions()
-                seed_roles(client)
+                seed_roles(client, sync_existing=True)
                 bootstrap_configuration(client)
 
                 self.stdout.write("2. Configuring Company Profile...")
@@ -148,40 +148,8 @@ class Command(BaseCommand):
         profile.save()
 
     def _seed_roles_and_permissions(self, client):
-        roles = {r.code: r for r in Role.objects.filter(client=client)}
-
-        # Ensure Sales Executive (SE) role exists
-        if "SE" not in roles:
-            se_role, _ = Role.objects.get_or_create(
-                client=client,
-                code="SE",
-                defaults={
-                    "name": "Sales Executive",
-                    "description": "Field sales, enquiry handling, lead management and quotations.",
-                    "is_system": False,
-                },
-            )
-            se_perms = [
-                "menu_sales", "menu_crm", "menu_inventory",
-                "view_sales", "create_quotation", "create_sales_order",
-                "view_lead", "create_lead", "edit_lead", "move_lead",
-                "view_task", "create_task", "edit_task",
-                "view_inventory", "show_crm_dashboard", "export_excel",
-            ]
-            all_p = set(Permission.objects.values_list("id", flat=True))
-            for pid in se_perms:
-                if pid in all_p:
-                    RolePermission.objects.get_or_create(role=se_role, permission_id=pid)
-            roles["SE"] = se_role
-
-        # Ensure Customer (CU) has project viewing permissions
-        if "CU" in roles:
-            cu_role = roles["CU"]
-            for pid in ["view_projects", "view_pms"]:
-                if Permission.objects.filter(id=pid).exists():
-                    RolePermission.objects.get_or_create(role=cu_role, permission_id=pid)
-
-        return roles
+        seed_roles(client, sync_existing=True)
+        return {r.code: r for r in Role.objects.filter(client=client)}
 
     def _seed_hrms_structure(self, client):
         departments_data = [

@@ -320,39 +320,133 @@ def grouped_catalogue():
 #: Seed roles for a fresh tenant. ``"*"`` means every permission in the
 #: catalogue -- the Administrator role.
 DEFAULT_ROLES = [
-    ("AD", "Administrator", "Full access to every module.", ["*"]),
+    ("AD", "Administrator", "Full access to every module and system configuration.", ["*"]),
+    (
+        "GM",
+        "General Manager",
+        "Operational supervision and approval access across sales, projects, inventory, purchase, accounts, HR, and CRM.",
+        [
+            "menu_crm", "menu_sales", "menu_purchase", "menu_inventory", "menu_accounts", "menu_hrms", "menu_pms", "menu_organization", "menu_masters",
+            "show_crm_dashboard", "show_hrm_dashboard", "show_account_dashboard", "show_templates_menu",
+            "view_lead", "create_lead", "edit_lead", "move_lead", "manage_pipeline",
+            "view_task", "create_task", "edit_task", "assign_task", "manage_task_allocation",
+            "manage_deals",
+            "view_sales", "create_quotation", "create_sales_order", "create_invoice", "finalize_invoice", "cancel_invoice", "record_payment_in", "override_credit_limit", "create_credit_note",
+            "view_purchase", "create_purchase_order", "receive_goods", "approve_qc", "create_bill", "record_payment_out", "create_payment", "edit_purchase", "create_debit_note", "cancel_purchase_document",
+            "view_inventory", "adjust_stock", "create_transfer", "approve_zone_request", "perform_audit", "edit_inventory",
+            "view_projects", "create_project", "edit_project", "manage_milestones", "assign_members",
+            "view_pms", "create_pms_project", "assign_stage", "handoff_stage", "approve_document", "share_client_proof", "log_delay", "complete_project",
+            "view_bank_accounts", "manage_bank_accounts", "manage_journal_entries", "view_ledger", "view_financial_reports", "reconcile_bank", "close_financial_period", "manage_chart_of_accounts", "manage_taxes",
+            "view_staff", "mark_attendance", "view_team_attendance", "apply_leave", "approve_leave", "regularize_attendance", "view_own_payslip", "approve_payroll",
+            "view_masters", "manage_items", "manage_parties", "manage_warehouses", "manage_price_lists",
+            "view_pos_orders", "create_pos_invoice", "apply_discounts", "process_returns", "print_receipts",
+            "export_excel", "view_audit_logs",
+        ],
+    ),
+    (
+        "PM",
+        "Project Manager",
+        "Full access to all project related work: PMS projects, stages, milestones, tasks, team allocation, and customer tracking.",
+        [
+            "menu_pms", "menu_sales", "menu_masters",
+            "view_pms", "create_pms_project", "assign_stage", "handoff_stage",
+            "approve_document", "share_client_proof", "log_delay", "complete_project",
+            "view_projects", "create_project", "edit_project", "delete_project",
+            "manage_milestones", "assign_members",
+            "view_task", "create_task", "edit_task", "delete_task", "assign_task", "manage_task_allocation",
+            "view_sales", "view_masters", "manage_parties", "export_excel",
+        ],
+    ),
+    (
+        "EM",
+        "Project Employee",
+        "View and edit assigned project tasks, punch attendance, view own payslips, and apply for leave.",
+        [
+            "menu_pms", "view_pms", "view_projects", "view_task", "edit_task",
+            "mark_attendance", "apply_leave", "view_own_payslip",
+        ],
+    ),
+    (
+        "TC",
+        "Telecaller",
+        "Access to view and manage CRM leads, tasks, calls, and export activity reports.",
+        [
+            "menu_crm", "show_crm_dashboard",
+            "view_lead", "create_lead", "edit_lead", "move_lead", "manage_deals",
+            "view_task", "create_task", "edit_task", "export_excel",
+        ],
+    ),
+    (
+        "SE",
+        "Sales Person",
+        "Full sales permissions: leads, pipeline, deals, quotations, sales orders, invoices, payments, and clients.",
+        [
+            "menu_sales", "menu_crm", "menu_inventory", "menu_masters",
+            "show_crm_dashboard", "view_lead", "create_lead", "edit_lead", "delete_lead", "move_lead",
+            "manage_pipeline", "create_pipeline", "edit_pipeline", "delete_pipeline", "manage_deals",
+            "view_task", "create_task", "edit_task", "delete_task", "assign_task", "manage_task_allocation",
+            "view_sales", "create_quotation", "create_sales_order", "create_invoice", "finalize_invoice", "cancel_invoice",
+            "record_payment_in", "override_credit_limit", "create_credit_note",
+            "view_masters", "manage_parties", "manage_price_lists", "view_inventory",
+            "create_pos_invoice", "view_pos_orders", "apply_discounts", "process_returns", "print_receipts",
+            "export_excel",
+        ],
+    ),
     (
         "SM",
         "Sales Manager",
-        "Owns the sales pipeline and the CRM.",
+        "Sales leadership: pipeline oversight, quotation approvals, customer credit, and order confirmation.",
         [
             "menu_sales", "menu_crm", "menu_inventory", "menu_masters",
-            "view_sales", "create_quotation", "create_sales_order", "create_invoice",
-            "finalize_invoice", "cancel_invoice", "record_payment_in", "override_credit_limit",
-            "process_returns", "create_credit_note", "view_masters", "manage_parties",
-            "view_lead", "create_lead", "edit_lead", "move_lead", "manage_pipeline",
-            "view_task", "create_task", "edit_task", "assign_task", "manage_deals",
-            "view_inventory", "show_crm_dashboard", "export_excel",
+            "show_crm_dashboard", "view_lead", "create_lead", "edit_lead", "delete_lead", "move_lead",
+            "manage_pipeline", "create_pipeline", "edit_pipeline", "delete_pipeline", "manage_deals",
+            "view_task", "create_task", "edit_task", "delete_task", "assign_task", "manage_task_allocation",
+            "view_sales", "create_quotation", "create_sales_order", "create_invoice", "finalize_invoice", "cancel_invoice",
+            "record_payment_in", "override_credit_limit", "create_credit_note",
+            "view_masters", "manage_parties", "manage_price_lists", "view_inventory",
+            "create_pos_invoice", "view_pos_orders", "apply_discounts", "process_returns", "print_receipts",
+            "export_excel",
+        ],
+    ),
+    (
+        "HR",
+        "HR Manager",
+        "Full HR permissions: employee profiles, attendance, leave approvals, payroll, and organization.",
+        [
+            "menu_hrms", "menu_organization", "show_hrm_dashboard",
+            "view_staff", "create_staff", "edit_staff", "delete_staff", "reset_staff_password",
+            "mark_attendance", "view_team_attendance", "regularize_attendance",
+            "apply_leave", "approve_leave",
+            "view_own_payslip", "generate_payroll", "edit_salary_structure", "approve_payroll",
+            "export_excel",
+        ],
+    ),
+    (
+        "CU",
+        "Customer",
+        "Full access to customer project tracking, stage progress, milestones, and client portal ordering.",
+        [
+            "menu_pms", "menu_sales",
+            "view_projects", "view_pms", "view_sales", "place_portal_order",
         ],
     ),
     (
         "AC",
         "Accountant",
-        "Ledgers, payments and financial reporting.",
+        "General ledger, bank accounts, journal entries, payments, invoicing, and financial statements.",
         [
-            "menu_accounts", "menu_sales", "menu_purchase",
-            "view_bank_accounts", "manage_bank_accounts", "manage_journal_entries", "view_ledger",
-            "view_financial_reports", "reconcile_bank", "close_financial_period",
+            "menu_accounts", "menu_sales", "menu_purchase", "menu_masters",
+            "show_account_dashboard", "view_bank_accounts", "manage_bank_accounts", "manage_journal_entries",
+            "view_ledger", "view_financial_reports", "reconcile_bank", "close_financial_period",
             "manage_chart_of_accounts", "manage_taxes",
-            "view_sales", "view_purchase", "record_payment_in", "record_payment_out",
-            "create_credit_note", "create_debit_note", "view_masters",
-            "finalize_invoice", "show_account_dashboard", "export_excel",
+            "view_sales", "view_purchase", "record_payment_in", "record_payment_out", "finalize_invoice",
+            "create_credit_note", "create_debit_note", "view_masters", "export_excel",
         ],
     ),
     (
         "PU",
         "Purchase Officer",
-        "Procurement, goods receipt and QC.",
+        "Procurement, purchase orders, goods receipt notes, steel weight tolerance, and QC approvals.",
         [
             "menu_purchase", "menu_inventory", "menu_masters",
             "view_purchase", "create_purchase_order", "create_bill", "receive_goods",
@@ -364,77 +458,47 @@ DEFAULT_ROLES = [
     (
         "ST",
         "Store Keeper",
-        "Stock position, transfers and audits.",
+        "Stock movements, warehouse transfers, physical audits, raw material yard, and scrap management.",
         [
-            "menu_inventory", "menu_masters", "view_inventory", "adjust_stock", "create_transfer",
+            "menu_inventory", "menu_masters",
+            "view_inventory", "adjust_stock", "create_transfer",
             "approve_zone_request", "perform_audit", "receive_goods", "edit_inventory",
             "view_masters", "manage_items", "manage_warehouses",
         ],
     ),
-    (
-        "PM",
-        "Project Manager",
-        "PMS projects, stages and client approvals.",
-        [
-            "menu_pms", "menu_sales",
-            "view_pms", "create_pms_project", "assign_stage", "handoff_stage",
-            "approve_document", "share_client_proof", "log_delay", "complete_project",
-            "view_projects", "create_project", "edit_project", "manage_milestones",
-            "assign_members", "view_sales",
-        ],
-    ),
-    (
-        "HR",
-        "HR Manager",
-        "Employees, attendance, leave and payroll.",
-        [
-            "menu_hrms", "menu_organization",
-            "mark_attendance", "view_team_attendance", "approve_leave",
-            "regularize_attendance", "generate_payroll", "approve_payroll",
-            "edit_salary_structure", "view_staff", "create_staff", "edit_staff",
-            "show_hrm_dashboard", "export_excel",
-        ],
-    ),
-    (
-        "EM",
-        "Employee",
-        "Self-service access only.",
-        ["apply_leave", "view_own_payslip", "mark_attendance", "view_pms"],
-    ),
-    (
-        "CU",
-        "Customer",
-        "Customer portal access to track projects.",
-        # Replaced (client portal reorder): customers may also reorder items
-        # they have bought before.
-        # ["view_projects"],
-        ["view_projects", "place_portal_order"],
-    ),
 ]
 
 
-def seed_roles(client):
-    """Create the default roles for a tenant. Idempotent."""
+def seed_roles(client, sync_existing=False):
+    """Create or synchronize the default roles for a tenant. Idempotent."""
     from .models import Permission, Role, RolePermission
 
+    client_id = getattr(client, "id", client)
     every_permission = list(Permission.objects.values_list("id", flat=True))
-    created_roles = []
+    synced_roles = []
     for code, name, description, permission_ids in DEFAULT_ROLES:
         role, created = Role.objects.get_or_create(
-            client=client,
+            client_id=client_id,
             code=code,
             defaults={"name": name, "description": description, "is_system": True},
         )
-        if not created:
-            continue
-        created_roles.append(role)
         wanted = every_permission if permission_ids == ["*"] else permission_ids
-        RolePermission.objects.bulk_create(
-            [
-                RolePermission(role=role, permission_id=permission_id)
-                for permission_id in wanted
-                if permission_id in set(every_permission)
-            ],
-            ignore_conflicts=True,
-        )
-    return created_roles
+        valid_perms = [pid for pid in wanted if pid in set(every_permission)]
+
+        if created or sync_existing:
+            if not created:
+                role.name = name
+                role.description = description
+                role.is_system = True
+                role.save(update_fields=["name", "description", "is_system"])
+                RolePermission.objects.filter(role=role).delete()
+
+            RolePermission.objects.bulk_create(
+                [
+                    RolePermission(role=role, permission_id=permission_id)
+                    for permission_id in valid_perms
+                ],
+                ignore_conflicts=True,
+            )
+        synced_roles.append(role)
+    return synced_roles
