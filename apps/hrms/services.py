@@ -258,7 +258,7 @@ def derive_attendance(client_id, *, check_in, check_out, submitted_status=None, 
                 field_errors={"checkOut": ["Must be after check-in."]},
             )
 
-    if submitted_status in ("WFH", "On Leave", "Absent", "Half Day"):
+    if submitted_status in ("Present", "Late", "WFH", "On Leave", "Absent", "Half Day"):
         return submitted_status, hours
 
     shift_start = (schedule.shift_start if schedule else None) or _parse_time(policy.get("shiftStart"), time(9, 30))

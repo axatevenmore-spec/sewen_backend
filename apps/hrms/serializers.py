@@ -3082,7 +3082,7 @@ class CompanyMeetingSerializer(BaseModelSerializer):
     hostUserId = TenantPrimaryKeyRelatedField(
         source="host_user", model="accounts.User", required=False, allow_null=True
     )
-    hostUserName = serializers.CharField(source="host_user.get_full_name", read_only=True)
+    hostUserName = serializers.CharField(source="host_user.name", read_only=True)
     attendeeIds = serializers.PrimaryKeyRelatedField(
         source="attendees", many=True, read_only=False, queryset=User.objects.all(), required=False
     )
@@ -3107,7 +3107,7 @@ class CompanyMeetingSerializer(BaseModelSerializer):
 
     def get_attendeesDetail(self, obj):
         return [
-            {"id": str(u.id), "name": u.get_full_name() or u.username, "email": u.email}
+            {"id": str(u.id), "name": getattr(u, "name", "") or getattr(u, "email", ""), "email": u.email}
             for u in obj.attendees.all()
         ]
 
