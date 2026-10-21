@@ -223,7 +223,11 @@ def create_employee_for(user, *, actor=None):
     """HR record for a login made in Administration (the reverse of HRMS's
     "Create Administration Login Account")."""
     from apps.core.numbering import allocate_number
-    from apps.hrms.models import Department, Employee, Location
+    from apps.hrms.models import Department, Designation, Employee, Location
+
+    designation = None
+    if user.role:
+        designation = _named(Designation, user.client_id, user.role.name)
 
     employee = Employee.objects.create(
         client_id=user.client_id,
@@ -234,6 +238,7 @@ def create_employee_for(user, *, actor=None):
         avatar_url=user.avatar_url,
         joining_date=user.joined_date or timezone.localdate(),
         department=_named(Department, user.client_id, user.department),
+        designation=designation,
         location=_named(Location, user.client_id, user.location),
         manager=linked_employee(user.reporting_manager) if user.reporting_manager_id else None,
         status="Active",
