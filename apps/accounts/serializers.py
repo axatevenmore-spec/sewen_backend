@@ -39,14 +39,19 @@ class MeUserSerializer(BaseModelSerializer):
     partyId = serializers.CharField(source="party_id", read_only=True, allow_null=True)
     partyName = serializers.SerializerMethodField()
     isCustomer = serializers.SerializerMethodField()
+    isSuperuser = serializers.BooleanField(source="is_superuser", read_only=True)
+    isAdmin = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = [
             "id", "name", "email", "phone", "avatar", "employeeId", "employeeRecordId",
             "managesTeam", "role", "department", "location", "reportingManager", "status", "lastLogin",
-            "partyId", "partyName", "isCustomer",
+            "partyId", "partyName", "isCustomer", "isSuperuser", "isAdmin",
         ]
+
+    def get_isAdmin(self, user):
+        return bool(user.is_superuser or (user.role and user.role.code == "AD"))
 
     def get_employeeId(self, user):
         return user.employee.employee_code if user.employee_id else None
@@ -413,6 +418,12 @@ class RoleSerializer(BaseModelSerializer):
         if existing.exists():
             raise serializers.ValidationError("A role with this code already exists.")
         return value
+
+    def to_internal_value(self, data):
+        data = data.copy() if hasattr(data, "copy") else dict(data)
+        if "permissions" in data and "selectedPermissions" not in data:
+            data["selectedPermissions"] = data["permissions"]
+        return super().to_internal_value(data)
 
     def validate(self, attrs):
         attrs = super().validate(attrs)

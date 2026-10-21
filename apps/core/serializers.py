@@ -197,7 +197,22 @@ class TenantPrimaryKeyRelatedField(serializers.PrimaryKeyRelatedField):
             queryset = queryset.filter(deleted_at__isnull=True)
         return queryset
 
+    def run_validation(self, data=serializers.empty):
+        if data in ("", None, "null", "undefined"):
+            if self.allow_null:
+                return None
+            instance = getattr(self.root, "instance", None)
+            if instance is not None and getattr(instance, self.source, None) is not None:
+                return getattr(instance, self.source)
+        return super().run_validation(data)
+
     def to_internal_value(self, data):
+        if data in ("", "null", "undefined"):
+            if self.allow_null:
+                return None
+            instance = getattr(self.root, "instance", None)
+            if instance is not None and getattr(instance, self.source, None) is not None:
+                return getattr(instance, self.source)
         if self.pk_field is not None:
             data = self.pk_field.to_internal_value(data)
         qs = self.get_queryset()

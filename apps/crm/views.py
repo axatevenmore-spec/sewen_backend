@@ -464,6 +464,8 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
 
         if request.method == "GET":
             rows = manager.filter(deleted_at__isnull=True)
+            if related_name == "products":
+                rows = rows.select_related("item", "item__image_file")
             return Response(
                 envelope(
                     serializer_class(rows, many=True, context=self.get_serializer_context()).data
@@ -530,7 +532,10 @@ class LeadViewSet(BulkDeleteMixin, TenantModelViewSet):
         """Edit or remove one row of a lead's sub-collection (api.md §9.2)."""
         related_name, serializer_class = self.SUB_ROWS[section]
         lead = self.get_object()
-        row = getattr(lead, related_name).filter(pk=row_id, deleted_at__isnull=True).first()
+        query = getattr(lead, related_name).filter(pk=row_id, deleted_at__isnull=True)
+        if related_name == "products":
+            query = query.select_related("item", "item__image_file")
+        row = query.first()
         if row is None:
             raise NotFound("That entry no longer exists.")
         if request.method == "DELETE":

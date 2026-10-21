@@ -252,6 +252,8 @@ class User(AbstractBaseUser, PermissionsMixin, AuditedModel):
     # -- permissions -------------------------------------------------------
     def effective_permissions(self):
         """Role grants union user grants minus user denies (db.md §2.2)."""
+        if self.is_superuser:
+            return set(Permission.objects.values_list("id", flat=True))
         granted = set()
         if self.role_id:
             granted |= set(
@@ -275,7 +277,7 @@ class User(AbstractBaseUser, PermissionsMixin, AuditedModel):
 
     @property
     def is_customer(self):
-        if self.role and (self.role.code == "CU" or str(self.role.name).lower() == "customer"):
+        if self.role and (self.role.code == "CU" or "customer" in str(self.role.name).lower()):
             return True
         return self.party_id is not None
 
