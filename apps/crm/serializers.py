@@ -138,9 +138,10 @@ class LeadSerializer(BaseModelSerializer):
     #: The customer the lead was converted to (``party``), for the lead's
     #: estimate / quotation forms.
     customerName = serializers.CharField(source="party.name", read_only=True, default=None)
-    #: JSON ``status`` maps to the stage *name* -- stages are configurable.
     status = serializers.CharField(source="stage.name", read_only=True)
-    stageId = TenantPrimaryKeyRelatedField(source="stage", model="crm.Stage")
+    stageId = TenantPrimaryKeyRelatedField(
+        source="stage", model="crm.Stage", required=False, allow_null=False
+    )
     source = serializers.CharField(source="source.name", read_only=True)
     sourceId = TenantPrimaryKeyRelatedField(
         source="source", model="crm.Source", required=False, allow_null=True
@@ -181,6 +182,12 @@ class LeadSerializer(BaseModelSerializer):
     )
     sourcePlatform = serializers.CharField(
         source="source_platform", required=False, allow_null=True
+    )
+    party = TenantPrimaryKeyRelatedField(
+        model="masters.Party", required=False, allow_null=True
+    )
+    lost_reason = TenantPrimaryKeyRelatedField(
+        model="crm.LostReason", required=False, allow_null=True
     )
     sourceMeta = serializers.JSONField(
         source="source_meta", required=False
@@ -286,6 +293,10 @@ class LeadProductSerializer(BaseModelSerializer):
         data = super().to_representation(instance)
         if not data.get("sku") and instance.item_id:
             data["sku"] = instance.item.sku
+        if instance.item_id and instance.item:
+            from apps.masters.serializers import ItemSerializer
+            data["image"] = ItemSerializer(context=self.context)._resolve_image_url(instance.item)
+            data["imageUrl"] = data["image"]
         return data
 
 
